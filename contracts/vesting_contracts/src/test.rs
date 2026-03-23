@@ -1,21 +1,157 @@
-#![cfg(test)]
+use crate::{
+    BatchCreateData, Milestone, VestingContract, VestingContractClient,
+};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    token, vec, Address, Env, IntoVal, Symbol, String, Map,
+};
 
-use super::*;
-use soroban_sdk::{vec, Env, String};
+fn setup() -> (Env, Address, VestingContractClient<'static>, Address, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VestingContract, ());
+    let client = VestingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &1_000_000_000i128);
+
+    let token_admin = Address::generate(&env);
+    let token_addr = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    client.set_token(&token_addr);
+    client.add_to_whitelist(&token_addr);
+
+    // Mint initial supply to contract
+    let stellar = token::StellarAssetClient::new(&env, &token_addr);
+    stellar.mint(&contract_id, &1_000_000_000i128);
+
+    (env, contract_id, client, admin, token_addr)
+}
 
 #[test]
-fn test() {
-    let env = Env::default();
-    let contract_id = env.register(Contract, ());
-    let client = ContractClient::new(&env, &contract_id);
+fn test_initialize() {
+    let (env, _, client, admin, _) = setup();
+    assert_eq!(client.get_admin(), admin);
+}
 
-    let words = client.hello(&String::from_str(&env, "Dev"));
-    assert_eq!(
-        words,
-        vec![
-            &env,
-            String::from_str(&env, "Hello"),
-            String::from_str(&env, "Dev"),
-        ]
+#[test]
+fn test_create_vault_full_and_claim() {
+    let (env, _, client, admin, token) = setup();
+    let beneficiary = Address::generate(&env);
+    let now = env.ledger().timestamp();
+    
+    let vault_id = client.create_vault_full(
+        &beneficiary,
+        &1000i128,
+        &now,
+        &(now + 1000),
+        &0i128,
+        &false, // irrevocable
+        &false,
+        &0u64,
     );
+
+    assert_eq!(vault_id, 1);
+    
+    // Fast forward
+    env.ledger().set_timestamp(now + 500);
+    assert_eq!(client.get_claimable_amount(&vault_id), 500);
+
+    // Claim
+    client.claim_tokens(&vault_id, &100i128);
+    assert_eq!(client.get_claimable_amount(&vault_id), 400);
+    
+    let token_client = token::Client::new(&env, &token);
+    assert_eq!(token_client.balance(&beneficiary), 100);
+}
+
+#[test]
+fn test_periodic_vesting() {
+    let (env, _, client, _, _) = setup();
+    let beneficiary = Address::generate(&env);
+    let now = env.ledger().timestamp();
+    
+    // 1000 tokens over 1000 seconds, with 100 second steps
+    let vault_id = client.create_vault_full(
+        &beneficiary,
+        &1000i128,
+        &now,
+        &(now + 1000),
+        &0i128,
+        &true,
+        &false,
+        &100u64,
+    );
+
+    env.ledger().set_timestamp(now + 150);
+    // 1 step completed (100 tokens)
+    assert_eq!(client.get_claimable_amount(&vault_id), 100);
+
+    env.ledger().set_timestamp(now + 250);
+    // 2 steps completed (200 tokens)
+    assert_eq!(client.get_claimable_amount(&vault_id), 200);
+}
+
+#[test]
+fn test_milestones() {
+    let (env, _, client, admin, _) = setup();
+    let beneficiary = Address::generate(&env);
+    let now = env.ledger().timestamp();
+    
+    let vault_id = client.create_vault_full(
+        &beneficiary,
+        &1000i128,
+        &now,
+        &(now + 1000),
+        &0i128,
+        &true,
+        &false,
+        &0u64,
+    );
+
+    let milestones = vec![&env, 
+        Milestone { id: 1, percentage: 30, is_unlocked: false },
+        Milestone { id: 2, percentage: 70, is_unlocked: false }
+    ];
+    
+    client.set_milestones(&vault_id, &milestones);
+    
+    assert_eq!(client.get_claimable_amount(&vault_id), 0);
+    
+    client.unlock_milestone(&vault_id, &1);
+    assert_eq!(client.get_claimable_amount(&vault_id), 300);
+    
+    client.unlock_milestone(&vault_id, &2);
+    assert_eq!(client.get_claimable_amount(&vault_id), 1000);
+}
+
+#[test]
+fn test_global_pause() {
+    let (env, _, client, admin, _) = setup();
+    
+    client.toggle_pause();
+    assert!(client.is_paused());
+    
+    let beneficiary = Address::generate(&env);
+    // Logic that depends on paused should fail
+}
+
+#[test]
+fn test_batch_operations() {
+    let (env, _, client, _, _) = setup();
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let now = env.ledger().timestamp();
+    
+    let batch = BatchCreateData {
+        recipients: vec![&env, r1, r2],
+        amounts: vec![&env, 500i128, 500i128],
+        start_times: vec![&env, now, now],
+        end_times: vec![&env, now + 1000, now + 1000],
+        keeper_fees: vec![&env, 0i128, 0i128],
+        step_durations: vec![&env, 0u64, 0u64],
+    };
+    
+    let ids = client.batch_create_vaults_full(&batch);
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids.get(0).unwrap(), 1);
+    assert_eq!(ids.get(1).unwrap(), 2);
 }

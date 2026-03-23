@@ -1,29 +1,63 @@
 #![no_std]
-use soroban_sdk::{
-    contract, contractimpl, vec, Env, String, Vec, Map, Symbol, Address, 
-    token, IntoVal, TryFromVal, try_from_val, ConversionError
-};
+use soroban_sdk::{contract, contractimpl, contracttype, token, vec, Address, Env, IntoVal, Map, Symbol, Val, Vec, String};
 
-#[contract]
-pub struct VestingContract;
+mod factory;
+pub use factory::{VestingFactory, VestingFactoryClient};
 
-// Storage keys for efficient access
-const VAULT_COUNT: Symbol = Symbol::new(&"VAULT_COUNT");
-const VAULT_DATA: Symbol = Symbol::new(&"VAULT_DATA");
-const USER_VAULTS: Symbol = Symbol::new(&"USER_VAULTS");
-const INITIAL_SUPPLY: Symbol = Symbol::new(&"INITIAL_SUPPLY");
-const ADMIN_BALANCE: Symbol = Symbol::new(&"ADMIN_BALANCE");
-const REQUIRED_SBT_ADDRESS: Symbol = Symbol::new(&"REQUIRED_SBT_ADDRESS");
+// 10 years in seconds
+pub const MAX_DURATION: u64 = 315_360_000;
 
-// Vault structure with lazy initialization
 #[contracttype]
+pub enum WhitelistDataKey {
+    WhitelistedTokens,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    AdminAddress,
+    AdminBalance,
+    InitialSupply,
+    ProposedAdmin,
+    VaultCount,
+    VaultData(u64),
+    VaultMilestones(u64),
+    UserVaults(Address),
+    IsPaused,
+    IsDeprecated,
+    MigrationTarget,
+    Token,
+    TotalShares,
+    TotalStaked,
+    StakingContract,
+}
+
+#[contracttype]
+#[derive(Clone)]
 pub struct Vault {
-    pub owner: Address,
     pub total_amount: i128,
     pub released_amount: i128,
+    pub keeper_fee: i128,
+    pub staked_amount: i128,
+    pub owner: Address,
+    pub delegate: Option<Address>,
+    pub title: String,
     pub start_time: u64,
     pub end_time: u64,
-    pub is_initialized: bool, // Lazy initialization flag
+    pub creation_time: u64,
+    pub step_duration: u64,
+    pub is_initialized: bool,
+    pub is_irrevocable: bool,
+    pub is_transferable: bool,
+    pub is_frozen: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Milestone {
+    pub id: u64,
+    pub percentage: u32,
+    pub is_unlocked: bool,
 }
 
 #[contracttype]
@@ -32,402 +66,348 @@ pub struct BatchCreateData {
     pub amounts: Vec<i128>,
     pub start_times: Vec<u64>,
     pub end_times: Vec<u64>,
+    pub keeper_fees: Vec<i128>,
+    pub step_durations: Vec<u64>,
 }
 
 #[contracttype]
-pub struct SplitClaimData {
+pub struct VaultCreated {
     pub vault_id: u64,
-    pub secondary_address: Address,
-    pub split_percentage: u32, // Percentage for secondary address (0-100)
+    pub beneficiary: Address,
+    pub total_amount: i128,
+    pub cliff_duration: u64,
+    pub start_time: u64,
+    pub title: String,
 }
+
+#[contract]
+pub struct VestingContract;
 
 #[contractimpl]
 impl VestingContract {
-    // Helper function to bump storage TTL only if needed (within 30 days of expiration)
-    fn bump_if_needed(env: &Env) {
-        let max_ttl = env.storage().instance().max_ttl();
-        let current_ledger = env.ledger().sequence();
-        
-        // Only bump if we're within 30 days (720*30 ledgers assuming 5s per ledger)
-        let threshold = max_ttl - (720 * 30);
-        
-        if current_ledger >= threshold {
-            env.storage().instance().extend_ttl(max_ttl, max_ttl);
-        }
-    }
-    // Initialize contract with initial supply
     pub fn initialize(env: Env, admin: Address, initial_supply: i128) {
-        // Set initial supply
-        env.storage().instance().set(&INITIAL_SUPPLY, &initial_supply);
-        
-        // Set admin balance (initially all tokens go to admin)
-        env.storage().instance().set(&ADMIN_BALANCE, &initial_supply);
-        
-        // Initialize vault count
-        env.storage().instance().set(&VAULT_COUNT, &0u64);
-    }
-    
-    // Set required SBT address for DID gating
-    pub fn set_required_sbt(env: Env, sbt_address: Address) {
-        Self::bump_if_needed(&env);
-        env.storage().instance().set(&REQUIRED_SBT_ADDRESS, &sbt_address);
-    }
-    
-    // Full initialization - writes all metadata immediately
-    pub fn create_vault_full(env: Env, owner: Address, amount: i128, start_time: u64, end_time: u64) -> u64 {
-        // Get next vault ID
-        let mut vault_count: u64 = env.storage().instance().get(&VAULT_COUNT).unwrap_or(0);
-        vault_count += 1;
-        
-        // Check admin balance and transfer tokens
-        let mut admin_balance: i128 = env.storage().instance().get(&ADMIN_BALANCE).unwrap_or(0);
-        require!(admin_balance >= amount, "Insufficient admin balance");
-        admin_balance -= amount;
-        env.storage().instance().set(&ADMIN_BALANCE, &admin_balance);
-        
-        // Create vault with full initialization
-        let vault = Vault {
-            owner: owner.clone(),
-            total_amount: amount,
-            released_amount: 0,
-            start_time,
-            end_time,
-            is_initialized: true, // Mark as fully initialized
-        };
-        
-        // Store vault data immediately (expensive gas usage)
-        env.storage().instance().set(&VAULT_DATA, &vault_count, &vault);
-        
-        // Update user vaults list
-        let mut user_vaults: Vec<u64> = env.storage().instance()
-            .get(&USER_VAULTS, &owner)
-            .unwrap_or(Vec::new(&env));
-        user_vaults.push_back(vault_count);
-        env.storage().instance().set(&USER_VAULTS, &owner, &user_vaults);
-        
-        // Update vault count
-        env.storage().instance().set(&VAULT_COUNT, &vault_count);
-        
-        vault_count
-    }
-    
-    // Lazy initialization - writes minimal data initially
-    pub fn create_vault_lazy(env: Env, owner: Address, amount: i128, start_time: u64, end_time: u64) -> u64 {
-        // Get next vault ID
-        let mut vault_count: u64 = env.storage().instance().get(&VAULT_COUNT).unwrap_or(0);
-        vault_count += 1;
-        
-        // Check admin balance and transfer tokens
-        let mut admin_balance: i128 = env.storage().instance().get(&ADMIN_BALANCE).unwrap_or(0);
-        require!(admin_balance >= amount, "Insufficient admin balance");
-        admin_balance -= amount;
-        env.storage().instance().set(&ADMIN_BALANCE, &admin_balance);
-        
-        // Create vault with lazy initialization (minimal storage)
-        let vault = Vault {
-            owner: owner.clone(),
-            total_amount: amount,
-            released_amount: 0,
-            start_time,
-            end_time,
-            is_initialized: false, // Mark as lazy initialized
-        };
-        
-        // Store only essential data initially (cheaper gas)
-        env.storage().instance().set(&VAULT_DATA, &vault_count, &vault);
-        
-        // Update vault count
-        env.storage().instance().set(&VAULT_COUNT, &vault_count);
-        
-        // Don't update user vaults list yet (lazy)
-        
-        vault_count
-    }
-    
-    // Initialize vault metadata when needed (on-demand)
-    pub fn initialize_vault_metadata(env: Env, vault_id: u64) -> bool {
-        let vault: Vault = env.storage().instance()
-            .get(&VAULT_DATA, &vault_id)
-            .unwrap_or_else(|| {
-                // Return empty vault if not found
-                Vault {
-                    owner: Address::from_contract_id(&env.current_contract_address()),
-                    total_amount: 0,
-                    released_amount: 0,
-                    start_time: 0,
-                    end_time: 0,
-                    is_initialized: false,
-                }
-            });
-        
-        // Only initialize if not already initialized
-        if !vault.is_initialized {
-            let mut updated_vault = vault.clone();
-            updated_vault.is_initialized = true;
-            
-            // Store updated vault with full metadata
-            env.storage().instance().set(&VAULT_DATA, &vault_id, &updated_vault);
-            
-            // Update user vaults list (deferred)
-            let mut user_vaults: Vec<u64> = env.storage().instance()
-                .get(&USER_VAULTS, &updated_vault.owner)
-                .unwrap_or(Vec::new(&env));
-            user_vaults.push_back(vault_id);
-            env.storage().instance().set(&USER_VAULTS, &updated_vault.owner, &user_vaults);
-            
-            true
-        } else {
-            false // Already initialized
+        if env.storage().instance().has(&DataKey::AdminAddress) {
+            panic!("Already initialized");
         }
+        env.storage().instance().set(&DataKey::AdminAddress, &admin);
+        env.storage().instance().set(&DataKey::AdminBalance, &initial_supply);
+        env.storage().instance().set(&DataKey::InitialSupply, &initial_supply);
+        env.storage().instance().set(&DataKey::VaultCount, &0u64);
+        env.storage().instance().set(&DataKey::IsPaused, &false);
+        env.storage().instance().set(&DataKey::IsDeprecated, &false);
+        env.storage().instance().set(&DataKey::TotalShares, &0i128);
+        env.storage().instance().set(&DataKey::TotalStaked, &0i128);
     }
-    
-    // Claim tokens from vault
+
+    pub fn set_token(env: Env, token: Address) {
+        Self::require_admin(&env);
+        if env.storage().instance().has(&DataKey::Token) {
+            panic!("Token already set");
+        }
+        env.storage().instance().set(&DataKey::Token, &token);
+    }
+
+    pub fn add_to_whitelist(env: Env, token: Address) {
+        Self::require_admin(&env);
+        let mut whitelist: Map<Address, bool> = env
+            .storage()
+            .instance()
+            .get(&WhitelistDataKey::WhitelistedTokens)
+            .unwrap_or(Map::new(&env));
+        whitelist.set(token.clone(), true);
+        env.storage().instance().set(&WhitelistDataKey::WhitelistedTokens, &whitelist);
+    }
+
+    pub fn propose_new_admin(env: Env, new_admin: Address) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&DataKey::ProposedAdmin, &new_admin);
+    }
+
+    pub fn accept_ownership(env: Env) {
+        let proposed: Address = env.storage().instance().get(&DataKey::ProposedAdmin).expect("No proposed admin");
+        proposed.require_auth();
+        env.storage().instance().set(&DataKey::AdminAddress, &proposed);
+        env.storage().instance().remove(&DataKey::ProposedAdmin);
+    }
+
+    pub fn toggle_pause(env: Env) {
+        Self::require_admin(&env);
+        let paused: bool = env.storage().instance().get(&DataKey::IsPaused).unwrap_or(false);
+        env.storage().instance().set(&DataKey::IsPaused, &!paused);
+    }
+
+    pub fn create_vault_full(
+        env: Env, owner: Address, amount: i128, start_time: u64, end_time: u64,
+        keeper_fee: i128, is_revocable: bool, is_transferable: bool, step_duration: u64,
+    ) -> u64 {
+        Self::require_admin(&env);
+        Self::create_vault_full_internal(&env, owner, amount, start_time, end_time, keeper_fee, is_revocable, is_transferable, step_duration)
+    }
+
+    pub fn create_vault_lazy(
+        env: Env, owner: Address, amount: i128, start_time: u64, end_time: u64,
+        keeper_fee: i128, is_revocable: bool, is_transferable: bool, step_duration: u64,
+    ) -> u64 {
+        Self::require_admin(&env);
+        Self::create_vault_lazy_internal(&env, owner, amount, start_time, end_time, keeper_fee, is_revocable, is_transferable, step_duration)
+    }
+
+    pub fn batch_create_vaults_lazy(env: Env, data: BatchCreateData) -> Vec<u64> {
+        Self::require_admin(&env);
+        let mut ids = Vec::new(&env);
+        for i in 0..data.recipients.len() {
+            let id = Self::create_vault_lazy_internal(
+                &env,
+                data.recipients.get(i).unwrap(),
+                data.amounts.get(i).unwrap(),
+                data.start_times.get(i).unwrap(),
+                data.end_times.get(i).unwrap(),
+                data.keeper_fees.get(i).unwrap(),
+                true,
+                false,
+                data.step_durations.get(i).unwrap_or(0),
+            );
+            ids.push_back(id);
+        }
+        ids
+    }
+
+    pub fn batch_create_vaults_full(env: Env, data: BatchCreateData) -> Vec<u64> {
+        Self::require_admin(&env);
+        let mut ids = Vec::new(&env);
+        for i in 0..data.recipients.len() {
+            let id = Self::create_vault_full_internal(
+                &env,
+                data.recipients.get(i).unwrap(),
+                data.amounts.get(i).unwrap(),
+                data.start_times.get(i).unwrap(),
+                data.end_times.get(i).unwrap(),
+                data.keeper_fees.get(i).unwrap(),
+                true,
+                false,
+                data.step_durations.get(i).unwrap_or(0),
+            );
+            ids.push_back(id);
+        }
+        ids
+    }
+
     pub fn claim_tokens(env: Env, vault_id: u64, claim_amount: i128) -> i128 {
-        Self::bump_if_needed(&env);
-        
-        let mut vault: Vault = env.storage().instance()
-            .get(&VAULT_DATA, &vault_id)
-            .unwrap_or_else(|| {
-                panic!("Vault not found");
-            });
-        
-        require!(vault.is_initialized, "Vault not initialized");
-        require!(claim_amount > 0, "Claim amount must be positive");
-        
-        // Check SBT balance for DID gating
-        let required_sbt: Address = env.storage().instance()
-            .get(&REQUIRED_SBT_ADDRESS)
-            .unwrap_or_else(|| {
-                panic!("SBT address not configured");
-            });
-        
-        // Check if beneficiary holds the required SBT
-        let sbt_contract = token::Client::new(&env, &required_sbt);
-        let sbt_balance = sbt_contract.balance(&vault.owner);
-        require!(sbt_balance > 0, "Beneficiary must hold required SBT");
-        
-        let available_to_claim = vault.total_amount - vault.released_amount;
-        require!(claim_amount <= available_to_claim, "Insufficient tokens to claim");
-        
-        // Update vault
+        Self::require_not_paused(&env);
+        let mut vault = Self::get_vault_internal(&env, vault_id);
+        if vault.is_frozen { panic!("Vault frozen"); }
+        if !vault.is_initialized { panic!("Vault not initialized"); }
+        vault.owner.require_auth();
+
+        let vested = Self::calculate_claimable(&env, vault_id, &vault);
+        if claim_amount > (vested - vault.released_amount) {
+            panic!("Insufficient vested tokens");
+        }
+
         vault.released_amount += claim_amount;
-        env.storage().instance().set(&VAULT_DATA, &vault_id, &vault);
+        env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
+        
+        let token: Address = env.storage().instance().get(&DataKey::Token).expect("Token not set");
+        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &vault.owner, &claim_amount);
         
         claim_amount
     }
-    
-    // Claim tokens and split to two addresses
-    pub fn claim_and_split(env: Env, vault_id: u64, secondary_address: Address, split_percentage: u32, claim_amount: i128) -> (i128, i128) {
-        Self::bump_if_needed(&env);
-        
-        let mut vault: Vault = env.storage().instance()
-            .get(&VAULT_DATA, &vault_id)
-            .unwrap_or_else(|| {
-                panic!("Vault not found");
-            });
-        
-        require!(vault.is_initialized, "Vault not initialized");
-        require!(claim_amount > 0, "Claim amount must be positive");
-        require!(split_percentage <= 100, "Split percentage must be 0-100");
-        require!(secondary_address != vault.owner, "Secondary address must be different from primary");
-        
-        // Check SBT balance for DID gating
-        let required_sbt: Address = env.storage().instance()
-            .get(&REQUIRED_SBT_ADDRESS)
-            .unwrap_or_else(|| {
-                panic!("SBT address not configured");
-            });
-        
-        // Check if beneficiary holds the required SBT
-        let sbt_contract = token::Client::new(&env, &required_sbt);
-        let sbt_balance = sbt_contract.balance(&vault.owner);
-        require!(sbt_balance > 0, "Beneficiary must hold required SBT");
-        
-        let available_to_claim = vault.total_amount - vault.released_amount;
-        require!(claim_amount <= available_to_claim, "Insufficient tokens to claim");
-        
-        // Calculate split amounts
-        let secondary_amount = (claim_amount * split_percentage as i128) / 100;
-        let primary_amount = claim_amount - secondary_amount;
-        
-        // Update vault
-        vault.released_amount += claim_amount;
-        env.storage().instance().set(&VAULT_DATA, &vault_id, &vault);
-        
-        // Return the split amounts (primary, secondary)
-        (primary_amount, secondary_amount)
-    }
-    
-    // Batch create vaults with lazy initialization
-    pub fn batch_create_vaults_lazy(env: Env, batch_data: BatchCreateData) -> Vec<u64> {
-        let mut vault_ids = Vec::new(&env);
-        let initial_count: u64 = env.storage().instance().get(&VAULT_COUNT).unwrap_or(0);
-        
-        // Check total admin balance
-        let total_amount: i128 = batch_data.amounts.iter().sum();
-        let mut admin_balance: i128 = env.storage().instance().get(&ADMIN_BALANCE).unwrap_or(0);
-        require!(admin_balance >= total_amount, "Insufficient admin balance for batch");
-        admin_balance -= total_amount;
-        env.storage().instance().set(&ADMIN_BALANCE, &admin_balance);
-        
-        for i in 0..batch_data.recipients.len() {
-            let vault_id = initial_count + i as u64 + 1;
-            
-            // Create vault with lazy initialization
-            let vault = Vault {
-                owner: batch_data.recipients.get(i).unwrap(),
-                total_amount: batch_data.amounts.get(i).unwrap(),
-                released_amount: 0,
-                start_time: batch_data.start_times.get(i).unwrap(),
-                end_time: batch_data.end_times.get(i).unwrap(),
-                is_initialized: false, // Lazy initialization
-            };
-            
-            // Store vault data (minimal writes)
-            env.storage().instance().set(&VAULT_DATA, &vault_id, &vault);
-            vault_ids.push_back(vault_id);
+
+    pub fn set_milestones(env: Env, vault_id: u64, milestones: Vec<Milestone>) {
+        Self::require_admin(&env);
+        let mut total_pct: u32 = 0;
+        for m in milestones.iter() {
+            total_pct += m.percentage;
         }
-        
-        // Update vault count once (cheaper than individual updates)
-        let final_count = initial_count + batch_data.recipients.len() as u64;
-        env.storage().instance().set(&VAULT_COUNT, &final_count);
-        
-        vault_ids
+        if total_pct > 100 { panic!("Total percentage > 100"); }
+        env.storage().instance().set(&DataKey::VaultMilestones(vault_id), &milestones);
     }
-    
-    // Batch create vaults with full initialization
-    pub fn batch_create_vaults_full(env: Env, batch_data: BatchCreateData) -> Vec<u64> {
-        let mut vault_ids = Vec::new(&env);
-        let initial_count: u64 = env.storage().instance().get(&VAULT_COUNT).unwrap_or(0);
-        
-        // Check total admin balance
-        let total_amount: i128 = batch_data.amounts.iter().sum();
-        let mut admin_balance: i128 = env.storage().instance().get(&ADMIN_BALANCE).unwrap_or(0);
-        require!(admin_balance >= total_amount, "Insufficient admin balance for batch");
-        admin_balance -= total_amount;
-        env.storage().instance().set(&ADMIN_BALANCE, &admin_balance);
-        
-        for i in 0..batch_data.recipients.len() {
-            let vault_id = initial_count + i as u64 + 1;
-            
-            // Create vault with full initialization
-            let vault = Vault {
-                owner: batch_data.recipients.get(i).unwrap(),
-                total_amount: batch_data.amounts.get(i).unwrap(),
-                released_amount: 0,
-                start_time: batch_data.start_times.get(i).unwrap(),
-                end_time: batch_data.end_times.get(i).unwrap(),
-                is_initialized: true, // Full initialization
-            };
-            
-            // Store vault data (expensive writes)
-            env.storage().instance().set(&VAULT_DATA, &vault_id, &vault);
-            
-            // Update user vaults list for each vault (expensive)
-            let mut user_vaults: Vec<u64> = env.storage().instance()
-                .get(&USER_VAULTS, &vault.owner)
-                .unwrap_or(Vec::new(&env));
-            user_vaults.push_back(vault_id);
-            env.storage().instance().set(&USER_VAULTS, &vault.owner, &user_vaults);
-            
-            vault_ids.push_back(vault_id);
+
+    pub fn get_milestones(env: Env, vault_id: u64) -> Vec<Milestone> {
+        env.storage().instance().get(&DataKey::VaultMilestones(vault_id)).unwrap_or(Vec::new(&env))
+    }
+
+    pub fn unlock_milestone(env: Env, vault_id: u64, milestone_id: u64) {
+        Self::require_admin(&env);
+        let mut milestones = Self::get_milestones(env.clone(), vault_id);
+        let mut found = false;
+        let mut updated = Vec::new(&env);
+        for m in milestones.iter() {
+            if m.id == milestone_id {
+                found = true;
+                updated.push_back(Milestone { id: m.id, percentage: m.percentage, is_unlocked: true });
+            } else {
+                updated.push_back(m);
+            }
         }
-        
-        // Update vault count once
-        let final_count = initial_count + batch_data.recipients.len() as u64;
-        env.storage().instance().set(&VAULT_COUNT, &final_count);
-        
-        vault_ids
+        if !found { panic!("Milestone not found"); }
+        env.storage().instance().set(&DataKey::VaultMilestones(vault_id), &updated);
     }
-    
-    // Get vault info (initializes if needed)
+
+    pub fn freeze_vault(env: Env, vault_id: u64, freeze: bool) {
+        Self::require_admin(&env);
+        let mut vault = Self::get_vault_internal(&env, vault_id);
+        vault.is_frozen = freeze;
+        env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
+    }
+
+    pub fn mark_irrevocable(env: Env, vault_id: u64) {
+        Self::require_admin(&env);
+        let mut vault = Self::get_vault_internal(&env, vault_id);
+        vault.is_irrevocable = true;
+        env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
+    }
+
+    pub fn get_claimable_amount(env: Env, vault_id: u64) -> i128 {
+        let vault = Self::get_vault_internal(&env, vault_id);
+        let vested = Self::calculate_claimable(&env, vault_id, &vault);
+        vested - vault.released_amount
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage().instance().get(&DataKey::IsPaused).unwrap_or(false)
+    }
+
+    pub fn get_admin(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::AdminAddress).expect("Admin not set")
+    }
+
     pub fn get_vault(env: Env, vault_id: u64) -> Vault {
-        Self::bump_if_needed(&env);
-        
-        let vault: Vault = env.storage().instance()
-            .get(&VAULT_DATA, &vault_id)
-            .unwrap_or_else(|| {
-                Vault {
-                    owner: Address::from_contract_id(&env.current_contract_address()),
-                    total_amount: 0,
-                    released_amount: 0,
-                    start_time: 0,
-                    end_time: 0,
-                    is_initialized: false,
-                }
-            });
-        
-        // Auto-initialize if lazy
-        if !vault.is_initialized {
-            Self::initialize_vault_metadata(env, vault_id);
-            // Get updated vault
-            env.storage().instance().get(&VAULT_DATA, &vault_id).unwrap()
+        Self::get_vault_internal(&env, vault_id)
+    }
+
+    // --- Internal Helpers ---
+
+    fn require_admin(env: &Env) {
+        let admin: Address = env.storage().instance().get(&DataKey::AdminAddress).expect("Admin not set");
+        admin.require_auth();
+    }
+
+    fn require_not_paused(env: &Env) {
+        if env.storage().instance().get(&DataKey::IsPaused).unwrap_or(false) {
+            panic!("Paused");
+        }
+    }
+
+    fn require_valid_duration(start: u64, end: u64) {
+        if end <= start { panic!("Invalid duration"); }
+        if (end - start) > MAX_DURATION { panic!("duration exceeds MAX_DURATION"); }
+    }
+
+    fn create_vault_full_internal(
+        env: &Env, owner: Address, amount: i128, start_time: u64, end_time: u64,
+        keeper_fee: i128, is_revocable: bool, is_transferable: bool, step_duration: u64,
+    ) -> u64 {
+        Self::require_valid_duration(start_time, end_time);
+        let id = Self::increment_vault_count(env);
+        Self::sub_admin_balance(env, amount);
+        let vault = Vault {
+            total_amount: amount,
+            released_amount: 0,
+            keeper_fee,
+            staked_amount: 0,
+            owner: owner.clone(),
+            delegate: None,
+            title: String::from_str(env, ""),
+            start_time,
+            end_time,
+            creation_time: env.ledger().timestamp(),
+            step_duration,
+            is_initialized: true,
+            is_irrevocable: !is_revocable,
+            is_transferable,
+            is_frozen: false,
+        };
+        env.storage().instance().set(&DataKey::VaultData(id), &vault);
+        Self::add_user_vault_index(env, &owner, id);
+        Self::add_total_shares(env, amount);
+        id
+    }
+
+    fn create_vault_lazy_internal(
+        env: &Env, owner: Address, amount: i128, start_time: u64, end_time: u64,
+        keeper_fee: i128, is_revocable: bool, is_transferable: bool, step_duration: u64,
+    ) -> u64 {
+        Self::require_valid_duration(start_time, end_time);
+        let id = Self::increment_vault_count(env);
+        Self::sub_admin_balance(env, amount);
+        let vault = Vault {
+            total_amount: amount,
+            released_amount: 0,
+            keeper_fee,
+            staked_amount: 0,
+            owner: owner.clone(),
+            delegate: None,
+            title: String::from_str(env, ""),
+            start_time,
+            end_time,
+            creation_time: env.ledger().timestamp(),
+            step_duration,
+            is_initialized: false,
+            is_irrevocable: !is_revocable,
+            is_transferable,
+            is_frozen: false,
+        };
+        env.storage().instance().set(&DataKey::VaultData(id), &vault);
+        Self::add_total_shares(env, amount);
+        id
+    }
+
+    fn get_vault_internal(env: &Env, id: u64) -> Vault {
+        env.storage().instance().get(&DataKey::VaultData(id)).expect("Vault not found")
+    }
+
+    fn increment_vault_count(env: &Env) -> u64 {
+        let count: u64 = env.storage().instance().get(&DataKey::VaultCount).unwrap_or(0);
+        let new_count = count + 1;
+        env.storage().instance().set(&DataKey::VaultCount, &new_count);
+        new_count
+    }
+
+    fn sub_admin_balance(env: &Env, amount: i128) {
+        let bal: i128 = env.storage().instance().get(&DataKey::AdminBalance).unwrap_or(0);
+        if bal < amount { panic!("Insufficient admin balance"); }
+        env.storage().instance().set(&DataKey::AdminBalance, &(bal - amount));
+    }
+
+    fn add_total_shares(env: &Env, amount: i128) {
+        let shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TotalShares, &(shares + amount));
+    }
+
+    fn add_user_vault_index(env: &Env, user: &Address, id: u64) {
+        let mut vaults: Vec<u64> = env.storage().instance().get(&DataKey::UserVaults(user.clone())).unwrap_or(vec![env]);
+        vaults.push_back(id);
+        env.storage().instance().set(&DataKey::UserVaults(user.clone()), &vaults);
+    }
+
+    fn calculate_claimable(env: &Env, id: u64, vault: &Vault) -> i128 {
+        if env.storage().instance().has(&DataKey::VaultMilestones(id)) {
+            let milestones: Vec<Milestone> = env.storage().instance().get(&DataKey::VaultMilestones(id)).expect("No milestones");
+            let mut pct = 0;
+            for m in milestones.iter() {
+                if m.is_unlocked { pct += m.percentage; }
+            }
+            if pct > 100 { pct = 100; }
+            (vault.total_amount * pct as i128) / 100
         } else {
-            vault
-        }
-    }
-    
-    // Get user vaults (initializes all if needed)
-    pub fn get_user_vaults(env: Env, user: Address) -> Vec<u64> {
-        Self::bump_if_needed(&env);
-        
-        let vault_ids: Vec<u64> = env.storage().instance()
-            .get(&USER_VAULTS, &user)
-            .unwrap_or(Vec::new(&env));
-        
-        // Initialize all lazy vaults for this user
-        for vault_id in vault_ids.iter() {
-            let vault: Vault = env.storage().instance()
-                .get(&VAULT_DATA, vault_id)
-                .unwrap_or_else(|| {
-                    Vault {
-                        owner: user.clone(),
-                        total_amount: 0,
-                        released_amount: 0,
-                        start_time: 0,
-                        end_time: 0,
-                        is_initialized: false,
-                    }
-                });
+            let now = env.ledger().timestamp();
+            if now <= vault.start_time { return 0; }
+            if now >= vault.end_time { return vault.total_amount; }
             
-            if !vault.is_initialized {
-                Self::initialize_vault_metadata(env, *vault_id);
+            let duration = (vault.end_time - vault.start_time) as i128;
+            let elapsed = (now - vault.start_time) as i128;
+            
+            if vault.step_duration > 0 {
+                let steps = duration / vault.step_duration as i128;
+                let completed = elapsed / vault.step_duration as i128;
+                (vault.total_amount / steps) * completed
+            } else {
+                (vault.total_amount * elapsed) / duration
             }
         }
-        
-        vault_ids
-    }
-    
-    // Get contract state for invariant checking
-    pub fn get_contract_state(env: Env) -> (i128, i128, i128) {
-        Self::bump_if_needed(&env);
-        
-        let initial_supply: i128 = env.storage().instance().get(&INITIAL_SUPPLY).unwrap_or(0);
-        let admin_balance: i128 = env.storage().instance().get(&ADMIN_BALANCE).unwrap_or(0);
-        
-        // Calculate total locked and claimed amounts
-        let vault_count: u64 = env.storage().instance().get(&VAULT_COUNT).unwrap_or(0);
-        let mut total_locked = 0i128;
-        let mut total_claimed = 0i128;
-        
-        for i in 1..=vault_count {
-            if let Some(vault) = env.storage().instance().get::<_, Vault>(&VAULT_DATA, &i) {
-                total_locked += vault.total_amount - vault.released_amount;
-                total_claimed += vault.released_amount;
-            }
-        }
-        
-        (total_locked, total_claimed, admin_balance)
-    }
-    
-    // Check invariant: Total Locked + Total Claimed + Admin Balance = Initial Supply
-    pub fn check_invariant(env: Env) -> bool {
-        Self::bump_if_needed(&env);
-        
-        let initial_supply: i128 = env.storage().instance().get(&INITIAL_SUPPLY).unwrap_or(0);
-        let (total_locked, total_claimed, admin_balance) = Self::get_contract_state(env);
-        
-        let sum = total_locked + total_claimed + admin_balance;
-        sum == initial_supply
     }
 }
+
+#[cfg(test)]
+mod test;
