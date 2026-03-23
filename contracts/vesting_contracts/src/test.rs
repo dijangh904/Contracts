@@ -155,3 +155,19 @@ fn test_batch_operations() {
     assert_eq!(ids.get(0).unwrap(), 1);
     assert_eq!(ids.get(1).unwrap(), 2);
 }
+
+#[test]
+fn test_metadata_anchor() {
+    let (env, _, client, _, _) = setup();
+
+    // Should return empty string before anything is set
+    let empty = client.get_metadata_anchor();
+    assert_eq!(empty, String::from_str(&env, ""));
+
+    // Set a CID and retrieve it
+    let cid = String::from_str(&env, "ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+    client.set_metadata_anchor(&cid);
+
+    let retrieved = client.get_metadata_anchor();
+    assert_eq!(retrieved, cid);
+}

@@ -30,6 +30,7 @@ pub enum DataKey {
     TotalShares,
     TotalStaked,
     StakingContract,
+    MetadataAnchor,
 }
 
 #[contracttype]
@@ -274,6 +275,17 @@ impl VestingContract {
 
     pub fn get_vault(env: Env, vault_id: u64) -> Vault {
         Self::get_vault_internal(&env, vault_id)
+    }
+
+
+    pub fn set_metadata_anchor(env: Env, cid: String) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&DataKey::MetadataAnchor, &cid);
+    }
+
+    pub fn get_metadata_anchor(env: Env) -> String {
+        env.storage().instance().get(&DataKey::MetadataAnchor)
+            .unwrap_or(String::from_str(&env, ""))
     }
 
     // --- Internal Helpers ---
