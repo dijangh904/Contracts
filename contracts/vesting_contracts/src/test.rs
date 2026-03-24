@@ -1,5 +1,5 @@
 use crate::{
-    BatchCreateData, Milestone, VestingContract, VestingContractClient,
+    BatchCreateData, Milestone, ScheduleConfig, VestingContract, VestingContractClient,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -154,6 +154,78 @@ fn test_batch_operations() {
     assert_eq!(ids.len(), 2);
     assert_eq!(ids.get(0).unwrap(), 1);
     assert_eq!(ids.get(1).unwrap(), 2);
+}
+
+#[test]
+fn test_batch_add_schedules_large_tge_batch() {
+    let (env, _, client, _, _) = setup();
+    let now = env.ledger().timestamp();
+
+    let mut schedules = vec![&env];
+    for _ in 0..60 {
+        schedules.push_back(ScheduleConfig {
+            owner: Address::generate(&env),
+            amount: 10_000i128,
+            start_time: now,
+            end_time: now + 1_000,
+            keeper_fee: 0i128,
+            is_revocable: true,
+            is_transferable: false,
+            step_duration: 0u64,
+        });
+    }
+
+    let ids = client.batch_add_schedules(&schedules);
+    assert_eq!(ids.len(), 60);
+    assert_eq!(ids.get(0).unwrap(), 1u64);
+    assert_eq!(ids.get(59).unwrap(), 60u64);
+}
+
+#[test]
+#[should_panic(expected = "Insufficient deposited tokens for batch")]
+fn test_batch_add_schedules_requires_deposited_token_coverage() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VestingContract, ());
+    let client = VestingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &1_000_000_000i128);
+
+    let token_admin = Address::generate(&env);
+    let token_addr = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    client.set_token(&token_addr);
+    client.add_to_whitelist(&token_addr);
+
+    // Deliberately under-fund the contract balance relative to the batch total.
+    let stellar = token::StellarAssetClient::new(&env, &token_addr);
+    stellar.mint(&contract_id, &1_000i128);
+
+    let now = env.ledger().timestamp();
+    let schedules = vec![
+        &env,
+        ScheduleConfig {
+            owner: Address::generate(&env),
+            amount: 700i128,
+            start_time: now,
+            end_time: now + 1_000,
+            keeper_fee: 0i128,
+            is_revocable: true,
+            is_transferable: false,
+            step_duration: 0u64,
+        },
+        ScheduleConfig {
+            owner: Address::generate(&env),
+            amount: 700i128,
+            start_time: now,
+            end_time: now + 1_000,
+            keeper_fee: 0i128,
+            is_revocable: true,
+            is_transferable: false,
+            step_duration: 0u64,
+        },
+    ];
+
+    client.batch_add_schedules(&schedules);
 }
 
 #[test]

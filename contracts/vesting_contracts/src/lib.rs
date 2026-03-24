@@ -1,4 +1,5 @@
 #![no_std]
+use soroban_sdk::{contract, contractimpl, contracttype, token, vec, Address, Env, Map, Symbol, Vec, String};
 use soroban_sdk::{
     contract,
     contractimpl,
@@ -90,6 +91,19 @@ pub struct BatchCreateData {
     pub end_times: Vec<u64>,
     pub keeper_fees: Vec<i128>,
     pub step_durations: Vec<u64>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ScheduleConfig {
+    pub owner: Address,
+    pub amount: i128,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub keeper_fee: i128,
+    pub is_revocable: bool,
+    pub is_transferable: bool,
+    pub step_duration: u64,
 }
 
 #[contracttype]
@@ -219,9 +233,13 @@ impl VestingContract {
 
     pub fn batch_create_vaults_lazy(env: Env, data: BatchCreateData) -> Vec<u64> {
         Self::require_admin(&env);
+        let total_amount = Self::validate_batch_data(&data);
+        Self::require_deposited_tokens_for_batch(&env, total_amount);
+        Self::reserve_admin_balance_for_batch(&env, total_amount);
+
         let mut ids = Vec::new(&env);
         for i in 0..data.recipients.len() {
-            let id = Self::create_vault_lazy_internal(
+            let id = Self::create_vault_prefunded_internal(
                 &env,
                 data.recipients.get(i).unwrap(),
                 data.amounts.get(i).unwrap(),
@@ -229,6 +247,8 @@ impl VestingContract {
                 data.end_times.get(i).unwrap(),
                 data.keeper_fees.get(i).unwrap(),
                 true,
+                false,
+                data.step_durations.get(i).unwrap_or(0),
                 false,
                 data.step_durations.get(i).unwrap_or(0)
             );
@@ -239,9 +259,13 @@ impl VestingContract {
 
     pub fn batch_create_vaults_full(env: Env, data: BatchCreateData) -> Vec<u64> {
         Self::require_admin(&env);
+        let total_amount = Self::validate_batch_data(&data);
+        Self::require_deposited_tokens_for_batch(&env, total_amount);
+        Self::reserve_admin_balance_for_batch(&env, total_amount);
+
         let mut ids = Vec::new(&env);
         for i in 0..data.recipients.len() {
-            let id = Self::create_vault_full_internal(
+            let id = Self::create_vault_prefunded_internal(
                 &env,
                 data.recipients.get(i).unwrap(),
                 data.amounts.get(i).unwrap(),
@@ -250,6 +274,34 @@ impl VestingContract {
                 data.keeper_fees.get(i).unwrap(),
                 true,
                 false,
+                data.step_durations.get(i).unwrap_or(0),
+                true,
+            );
+            ids.push_back(id);
+        }
+        ids
+    }
+
+    pub fn batch_add_schedules(env: Env, schedules: Vec<ScheduleConfig>) -> Vec<u64> {
+        Self::require_admin(&env);
+        let total_amount = Self::validate_schedule_configs(&schedules);
+        Self::require_deposited_tokens_for_batch(&env, total_amount);
+        Self::reserve_admin_balance_for_batch(&env, total_amount);
+
+        let mut ids = Vec::new(&env);
+        for i in 0..schedules.len() {
+            let schedule = schedules.get(i).unwrap();
+            let id = Self::create_vault_prefunded_internal(
+                &env,
+                schedule.owner,
+                schedule.amount,
+                schedule.start_time,
+                schedule.end_time,
+                schedule.keeper_fee,
+                schedule.is_revocable,
+                schedule.is_transferable,
+                schedule.step_duration,
+                true,
                 data.step_durations.get(i).unwrap_or(0)
             );
             ids.push_back(id);
@@ -557,30 +609,19 @@ impl VestingContract {
         is_transferable: bool,
         step_duration: u64
     ) -> u64 {
-        Self::require_valid_duration(start_time, end_time);
-        let id = Self::increment_vault_count(env);
         Self::sub_admin_balance(env, amount);
-        let vault = Vault {
-            total_amount: amount,
-            released_amount: 0,
-            keeper_fee,
-            staked_amount: 0,
-            owner: owner.clone(),
-            delegate: None,
-            title: String::from_str(env, ""),
+        Self::create_vault_prefunded_internal(
+            env,
+            owner,
+            amount,
             start_time,
             end_time,
-            creation_time: env.ledger().timestamp(),
-            step_duration,
-            is_initialized: true,
-            is_irrevocable: !is_revocable,
+            keeper_fee,
+            is_revocable,
             is_transferable,
-            is_frozen: false,
-        };
-        env.storage().instance().set(&DataKey::VaultData(id), &vault);
-        Self::add_user_vault_index(env, &owner, id);
-        Self::add_total_shares(env, amount);
-        id
+            step_duration,
+            true,
+        )
     }
 
     fn create_vault_lazy_internal(
@@ -594,9 +635,28 @@ impl VestingContract {
         is_transferable: bool,
         step_duration: u64
     ) -> u64 {
+        Self::sub_admin_balance(env, amount);
+        Self::create_vault_prefunded_internal(
+            env,
+            owner,
+            amount,
+            start_time,
+            end_time,
+            keeper_fee,
+            is_revocable,
+            is_transferable,
+            step_duration,
+            false,
+        )
+    }
+
+    fn create_vault_prefunded_internal(
+        env: &Env, owner: Address, amount: i128, start_time: u64, end_time: u64,
+        keeper_fee: i128, is_revocable: bool, is_transferable: bool, step_duration: u64,
+        is_initialized: bool,
+    ) -> u64 {
         Self::require_valid_duration(start_time, end_time);
         let id = Self::increment_vault_count(env);
-        Self::sub_admin_balance(env, amount);
         let vault = Vault {
             total_amount: amount,
             released_amount: 0,
@@ -609,12 +669,15 @@ impl VestingContract {
             end_time,
             creation_time: env.ledger().timestamp(),
             step_duration,
-            is_initialized: false,
+            is_initialized,
             is_irrevocable: !is_revocable,
             is_transferable,
             is_frozen: false,
         };
         env.storage().instance().set(&DataKey::VaultData(id), &vault);
+        if is_initialized {
+            Self::add_user_vault_index(env, &owner, id);
+        }
         Self::add_total_shares(env, amount);
         id
     }
@@ -640,11 +703,78 @@ impl VestingContract {
             .set(&DataKey::AdminBalance, &(bal - amount));
     }
 
+    fn reserve_admin_balance_for_batch(env: &Env, amount: i128) {
+        let bal: i128 = env.storage().instance().get(&DataKey::AdminBalance).unwrap_or(0);
+        if bal < amount { panic!("Insufficient admin balance for batch"); }
+        env.storage().instance().set(&DataKey::AdminBalance, &(bal - amount));
+    }
+
     fn add_total_shares(env: &Env, amount: i128) {
         let shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
         env.storage()
             .instance()
             .set(&DataKey::TotalShares, &(shares + amount));
+    }
+
+    fn require_deposited_tokens_for_batch(env: &Env, amount: i128) {
+        let token: Address = env.storage().instance().get(&DataKey::Token).expect("Token not set");
+        let contract_address = env.current_contract_address();
+        let onchain_balance = token::Client::new(env, &token).balance(&contract_address);
+        if onchain_balance < amount {
+            panic!("Insufficient deposited tokens for batch");
+        }
+    }
+
+    fn validate_batch_data(data: &BatchCreateData) -> i128 {
+        let count = data.recipients.len();
+        if count == 0 {
+            panic!("Empty batch");
+        }
+        if data.amounts.len() != count
+            || data.start_times.len() != count
+            || data.end_times.len() != count
+            || data.keeper_fees.len() != count
+            || !(data.step_durations.len() == count || data.step_durations.is_empty())
+        {
+            panic!("Invalid batch data");
+        }
+
+        let mut total_amount: i128 = 0;
+        for i in 0..count {
+            let amount = data.amounts.get(i).unwrap();
+            if amount < 0 {
+                panic!("Invalid amount");
+            }
+
+            let start_time = data.start_times.get(i).unwrap();
+            let end_time = data.end_times.get(i).unwrap();
+            Self::require_valid_duration(start_time, end_time);
+
+            total_amount = total_amount
+                .checked_add(amount)
+                .expect("Batch amount overflow");
+        }
+        total_amount
+    }
+
+    fn validate_schedule_configs(schedules: &Vec<ScheduleConfig>) -> i128 {
+        if schedules.is_empty() {
+            panic!("Empty batch");
+        }
+
+        let mut total_amount: i128 = 0;
+        for i in 0..schedules.len() {
+            let schedule = schedules.get(i).unwrap();
+            if schedule.amount < 0 {
+                panic!("Invalid amount");
+            }
+
+            Self::require_valid_duration(schedule.start_time, schedule.end_time);
+            total_amount = total_amount
+                .checked_add(schedule.amount)
+                .expect("Batch amount overflow");
+        }
+        total_amount
     }
 
     fn add_user_vault_index(env: &Env, user: &Address, id: u64) {
