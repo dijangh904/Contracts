@@ -1,8 +1,24 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, vec, Address, Env, IntoVal, Map, Symbol, Val, Vec, String};
+use soroban_sdk::{
+    contract,
+    contractimpl,
+    contracttype,
+    token,
+    vec,
+    Address,
+    Env,
+    IntoVal,
+    Map,
+    Symbol,
+    Val,
+    Vec,
+    String,
+};
 
 mod factory;
-pub use factory::{VestingFactory, VestingFactoryClient};
+mod oracle;
+pub use factory::{ VestingFactory, VestingFactoryClient };
+pub use oracle::{ OracleClient, OracleCondition, OracleType, ComparisonOperator, PerformanceCliff };
 
 // 10 years in seconds
 pub const MAX_DURATION: u64 = 315_360_000;
@@ -22,6 +38,7 @@ pub enum DataKey {
     VaultCount,
     VaultData(u64),
     VaultMilestones(u64),
+    VaultPerformanceCliff(u64),
     UserVaults(Address),
     IsPaused,
     IsDeprecated,
@@ -134,7 +151,11 @@ impl VestingContract {
     }
 
     pub fn accept_ownership(env: Env) {
-        let proposed: Address = env.storage().instance().get(&DataKey::ProposedAdmin).expect("No proposed admin");
+        let proposed: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposedAdmin)
+            .expect("No proposed admin");
         proposed.require_auth();
         env.storage().instance().set(&DataKey::AdminAddress, &proposed);
         env.storage().instance().remove(&DataKey::ProposedAdmin);
@@ -147,19 +168,53 @@ impl VestingContract {
     }
 
     pub fn create_vault_full(
-        env: Env, owner: Address, amount: i128, start_time: u64, end_time: u64,
-        keeper_fee: i128, is_revocable: bool, is_transferable: bool, step_duration: u64,
+        env: Env,
+        owner: Address,
+        amount: i128,
+        start_time: u64,
+        end_time: u64,
+        keeper_fee: i128,
+        is_revocable: bool,
+        is_transferable: bool,
+        step_duration: u64
     ) -> u64 {
         Self::require_admin(&env);
-        Self::create_vault_full_internal(&env, owner, amount, start_time, end_time, keeper_fee, is_revocable, is_transferable, step_duration)
+        Self::create_vault_full_internal(
+            &env,
+            owner,
+            amount,
+            start_time,
+            end_time,
+            keeper_fee,
+            is_revocable,
+            is_transferable,
+            step_duration
+        )
     }
 
     pub fn create_vault_lazy(
-        env: Env, owner: Address, amount: i128, start_time: u64, end_time: u64,
-        keeper_fee: i128, is_revocable: bool, is_transferable: bool, step_duration: u64,
+        env: Env,
+        owner: Address,
+        amount: i128,
+        start_time: u64,
+        end_time: u64,
+        keeper_fee: i128,
+        is_revocable: bool,
+        is_transferable: bool,
+        step_duration: u64
     ) -> u64 {
         Self::require_admin(&env);
-        Self::create_vault_lazy_internal(&env, owner, amount, start_time, end_time, keeper_fee, is_revocable, is_transferable, step_duration)
+        Self::create_vault_lazy_internal(
+            &env,
+            owner,
+            amount,
+            start_time,
+            end_time,
+            keeper_fee,
+            is_revocable,
+            is_transferable,
+            step_duration
+        )
     }
 
     pub fn batch_create_vaults_lazy(env: Env, data: BatchCreateData) -> Vec<u64> {
@@ -175,7 +230,7 @@ impl VestingContract {
                 data.keeper_fees.get(i).unwrap(),
                 true,
                 false,
-                data.step_durations.get(i).unwrap_or(0),
+                data.step_durations.get(i).unwrap_or(0)
             );
             ids.push_back(id);
         }
@@ -195,7 +250,7 @@ impl VestingContract {
                 data.keeper_fees.get(i).unwrap(),
                 true,
                 false,
-                data.step_durations.get(i).unwrap_or(0),
+                data.step_durations.get(i).unwrap_or(0)
             );
             ids.push_back(id);
         }
@@ -205,19 +260,26 @@ impl VestingContract {
     pub fn claim_tokens(env: Env, vault_id: u64, claim_amount: i128) -> i128 {
         Self::require_not_paused(&env);
         let mut vault = Self::get_vault_internal(&env, vault_id);
-        if vault.is_frozen { panic!("Vault frozen"); }
-        if !vault.is_initialized { panic!("Vault not initialized"); }
+        if vault.is_frozen {
+            panic!("Vault frozen");
+        }
+        if !vault.is_initialized {
+            panic!("Vault not initialized");
+        }
         vault.owner.require_auth();
 
         let vested = Self::calculate_claimable(&env, vault_id, &vault);
-        if claim_amount > (vested - vault.released_amount) {
+        if claim_amount > vested - vault.released_amount {
             panic!("Insufficient vested tokens");
         }
 
         vault.released_amount += claim_amount;
         env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
-        
+
         let token: Address = env.storage().instance().get(&DataKey::Token).expect("Token not set");
+        token::Client
+            ::new(&env, &token)
+            .transfer(&env.current_contract_address(), &vault.owner, &claim_amount);
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &vault.owner, &claim_amount);
         
         if let Some(nft_minter) = env.storage().instance().get::<_, Address>(&DataKey::NFTMinter) {
@@ -237,7 +299,9 @@ impl VestingContract {
         for m in milestones.iter() {
             total_pct += m.percentage;
         }
-        if total_pct > 100 { panic!("Total percentage > 100"); }
+        if total_pct > 100 {
+            panic!("Total percentage > 100");
+        }
         env.storage().instance().set(&DataKey::VaultMilestones(vault_id), &milestones);
     }
 
@@ -253,12 +317,18 @@ impl VestingContract {
         for m in milestones.iter() {
             if m.id == milestone_id {
                 found = true;
-                updated.push_back(Milestone { id: m.id, percentage: m.percentage, is_unlocked: true });
+                updated.push_back(Milestone {
+                    id: m.id,
+                    percentage: m.percentage,
+                    is_unlocked: true,
+                });
             } else {
                 updated.push_back(m);
             }
         }
-        if !found { panic!("Milestone not found"); }
+        if !found {
+            panic!("Milestone not found");
+        }
         env.storage().instance().set(&DataKey::VaultMilestones(vault_id), &updated);
     }
 
@@ -274,6 +344,56 @@ impl VestingContract {
         let mut vault = Self::get_vault_internal(&env, vault_id);
         vault.is_irrevocable = true;
         env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
+    }
+
+    pub fn set_performance_cliff(env: Env, vault_id: u64, cliff: PerformanceCliff) {
+        Self::require_admin(&env);
+        // Verify vault exists
+        Self::get_vault_internal(&env, vault_id);
+        env.storage().instance().set(&DataKey::VaultPerformanceCliff(vault_id), &cliff);
+    }
+
+    pub fn get_performance_cliff(env: Env, vault_id: u64) -> Option<PerformanceCliff> {
+        env.storage().instance().get(&DataKey::VaultPerformanceCliff(vault_id))
+    }
+
+    pub fn is_cliff_passed(env: Env, vault_id: u64) -> bool {
+        if let Some(cliff) = Self::get_performance_cliff(env.clone(), vault_id) {
+            OracleClient::is_cliff_passed(&env, &cliff, vault_id)
+        } else {
+            // No performance cliff set, use time-based cliff check
+            let vault = Self::get_vault_internal(&env, vault_id);
+            let now = env.ledger().timestamp();
+            now > vault.start_time
+        }
+    }
+
+    pub fn create_vault_with_cliff(
+        env: Env,
+        owner: Address,
+        amount: i128,
+        start_time: u64,
+        end_time: u64,
+        keeper_fee: i128,
+        is_revocable: bool,
+        is_transferable: bool,
+        step_duration: u64,
+        cliff: PerformanceCliff
+    ) -> u64 {
+        Self::require_admin(&env);
+        let vault_id = Self::create_vault_full_internal(
+            &env,
+            owner,
+            amount,
+            start_time,
+            end_time,
+            keeper_fee,
+            is_revocable,
+            is_transferable,
+            step_duration
+        );
+        Self::set_performance_cliff(env, vault_id, cliff);
+        vault_id
     }
 
     pub fn get_claimable_amount(env: Env, vault_id: u64) -> i128 {
@@ -403,7 +523,11 @@ impl VestingContract {
     // --- Internal Helpers ---
 
     fn require_admin(env: &Env) {
-        let admin: Address = env.storage().instance().get(&DataKey::AdminAddress).expect("Admin not set");
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminAddress)
+            .expect("Admin not set");
         admin.require_auth();
     }
 
@@ -414,13 +538,24 @@ impl VestingContract {
     }
 
     fn require_valid_duration(start: u64, end: u64) {
-        if end <= start { panic!("Invalid duration"); }
-        if (end - start) > MAX_DURATION { panic!("duration exceeds MAX_DURATION"); }
+        if end <= start {
+            panic!("Invalid duration");
+        }
+        if end - start > MAX_DURATION {
+            panic!("duration exceeds MAX_DURATION");
+        }
     }
 
     fn create_vault_full_internal(
-        env: &Env, owner: Address, amount: i128, start_time: u64, end_time: u64,
-        keeper_fee: i128, is_revocable: bool, is_transferable: bool, step_duration: u64,
+        env: &Env,
+        owner: Address,
+        amount: i128,
+        start_time: u64,
+        end_time: u64,
+        keeper_fee: i128,
+        is_revocable: bool,
+        is_transferable: bool,
+        step_duration: u64
     ) -> u64 {
         Self::require_valid_duration(start_time, end_time);
         let id = Self::increment_vault_count(env);
@@ -449,8 +584,15 @@ impl VestingContract {
     }
 
     fn create_vault_lazy_internal(
-        env: &Env, owner: Address, amount: i128, start_time: u64, end_time: u64,
-        keeper_fee: i128, is_revocable: bool, is_transferable: bool, step_duration: u64,
+        env: &Env,
+        owner: Address,
+        amount: i128,
+        start_time: u64,
+        end_time: u64,
+        keeper_fee: i128,
+        is_revocable: bool,
+        is_transferable: bool,
+        step_duration: u64
     ) -> u64 {
         Self::require_valid_duration(start_time, end_time);
         let id = Self::increment_vault_count(env);
@@ -490,17 +632,27 @@ impl VestingContract {
 
     fn sub_admin_balance(env: &Env, amount: i128) {
         let bal: i128 = env.storage().instance().get(&DataKey::AdminBalance).unwrap_or(0);
-        if bal < amount { panic!("Insufficient admin balance"); }
-        env.storage().instance().set(&DataKey::AdminBalance, &(bal - amount));
+        if bal < amount {
+            panic!("Insufficient admin balance");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminBalance, &(bal - amount));
     }
 
     fn add_total_shares(env: &Env, amount: i128) {
         let shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
-        env.storage().instance().set(&DataKey::TotalShares, &(shares + amount));
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalShares, &(shares + amount));
     }
 
     fn add_user_vault_index(env: &Env, user: &Address, id: u64) {
-        let mut vaults: Vec<u64> = env.storage().instance().get(&DataKey::UserVaults(user.clone())).unwrap_or(vec![env]);
+        let mut vaults: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::UserVaults(user.clone()))
+            .unwrap_or(vec![env]);
         vaults.push_back(id);
         env.storage().instance().set(&DataKey::UserVaults(user.clone()), &vaults);
     }
@@ -518,15 +670,40 @@ impl VestingContract {
     }
 
     fn calculate_claimable(env: &Env, id: u64, vault: &Vault) -> i128 {
+        // Check if performance cliff is set and if it's passed
+        if let Some(cliff) = env.storage().instance().get(&DataKey::VaultPerformanceCliff(id)) {
+            if !OracleClient::is_cliff_passed(env, &cliff, id) {
+                // Cliff not passed, no vesting yet
+                return 0;
+            }
+        }
+
         if env.storage().instance().has(&DataKey::VaultMilestones(id)) {
-            let milestones: Vec<Milestone> = env.storage().instance().get(&DataKey::VaultMilestones(id)).expect("No milestones");
+            let milestones: Vec<Milestone> = env
+                .storage()
+                .instance()
+                .get(&DataKey::VaultMilestones(id))
+                .expect("No milestones");
             let mut pct = 0;
             for m in milestones.iter() {
-                if m.is_unlocked { pct += m.percentage; }
+                if m.is_unlocked {
+                    pct += m.percentage;
+                }
             }
-            if pct > 100 { pct = 100; }
-            (vault.total_amount * pct as i128) / 100
+            if pct > 100 {
+                pct = 100;
+            }
+            (vault.total_amount * (pct as i128)) / 100
         } else {
+            let now = env.ledger().timestamp();
+            if now <= vault.start_time {
+                return 0;
+            }
+            if now >= vault.end_time {
+                return vault.total_amount;
+            }
+
+            let duration = (vault.end_time - vault.start_time) as i128;
             let mut now = env.ledger().timestamp();
             let accel_pct: u32 = env.storage().instance().get(&DataKey::GlobalAccelerationPct).unwrap_or(0);
             
@@ -540,8 +717,11 @@ impl VestingContract {
             if now >= vault.end_time { return vault.total_amount; }
             
             let elapsed = (now - vault.start_time) as i128;
-            
+
             if vault.step_duration > 0 {
+                let steps = duration / (vault.step_duration as i128);
+                let completed = elapsed / (vault.step_duration as i128);
+                (vault.total_amount / steps) * completed
                 let steps = duration / vault.step_duration as i128;
                 if steps == 0 { return 0; }
                 let completed = elapsed / vault.step_duration as i128;
