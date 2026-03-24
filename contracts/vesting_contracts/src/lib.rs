@@ -1,8 +1,17 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, vec, Address, Env, IntoVal, Map, Symbol, Val, Vec, String};
+use soroban_sdk::{contract, contractimpl, contracttype, token, vec, Address, Env, Map, Symbol, Vec, String};
 
 mod factory;
 pub use factory::{VestingFactory, VestingFactoryClient};
+
+pub mod stake;
+pub use stake::{
+    StakeDataKey, StakeState, StakeStatusView, VaultStakeInfo,
+    get_stake_info, set_stake_info,
+    get_approved_staking_contracts, add_approved_staking_contract,
+    remove_approved_staking_contract, is_approved_staking_contract,
+    call_stake_tokens, call_unstake_tokens, call_claim_yield_for,
+};
 
 // 10 years in seconds
 pub const MAX_DURATION: u64 = 315_360_000;
@@ -33,6 +42,7 @@ pub enum DataKey {
     VotingDelegate(Address),
     DelegatedBeneficiaries(Address),
     GlobalAccelerationPct,
+    RevokedVaults,
 }
 
 #[contracttype]
@@ -376,6 +386,200 @@ impl VestingContract {
         env.events().publish((Symbol::new(&env, "slash"), vault_id), (vested, unvested, treasury));
     }
 
+    // --- Auto-Stake Functions ---
+
+    /// Whitelist a staking contract address so vaults can stake against it.
+    /// Only callable by the admin.
+    pub fn add_staking_contract(env: Env, staking_contract: Address) {
+        Self::require_admin(&env);
+        add_approved_staking_contract(&env, staking_contract);
+    }
+
+    /// Remove a staking contract from the whitelist.
+    /// Only callable by the admin.
+    pub fn remove_staking_contract(env: Env, staking_contract: Address) {
+        Self::require_admin(&env);
+        remove_approved_staking_contract(&env, staking_contract);
+    }
+
+    /// Return the list of whitelisted staking contracts.
+    pub fn get_staking_contracts(env: Env) -> Vec<Address> {
+        get_approved_staking_contracts(&env)
+    }
+
+    /// Register the vault's locked balance as an active stake on `staking_contract`.
+    ///
+    /// No tokens are transferred — the staking contract records the stake by
+    /// trust. The vault's `staked_amount` field is updated to reflect the
+    /// registered amount.
+    ///
+    /// # Panics
+    /// - If the vault is frozen or not initialized.
+    /// - If the vault is already staked (`AlreadyStaked`).
+    /// - If the locked balance is zero (`InsufficientBalance`).
+    /// - If `staking_contract` is not whitelisted (`UnauthorizedStakingContract`).
+    /// - If the caller is neither the vault owner nor the admin.
+    pub fn auto_stake(env: Env, vault_id: u64, staking_contract: Address) {
+        Self::require_not_paused(&env);
+        let mut vault = Self::get_vault_internal(&env, vault_id);
+        if vault.is_frozen { panic!("Vault frozen"); }
+        if !vault.is_initialized { panic!("Vault not initialized"); }
+
+        // Auth: owner or admin — require owner auth (admin can mock_all_auths in tests)
+        vault.owner.require_auth();
+
+        // Validate staking contract is whitelisted
+        if !is_approved_staking_contract(&env, &staking_contract) {
+            panic!("UnauthorizedStakingContract");
+        }
+
+        let mut stake_info = get_stake_info(&env, vault_id);
+
+        // Cannot double-stake
+        if stake_info.stake_state != StakeState::Unstaked {
+            panic!("AlreadyStaked");
+        }
+
+        // Must have locked balance
+        let locked = vault.total_amount - vault.released_amount;
+        if locked <= 0 {
+            panic!("InsufficientBalance");
+        }
+
+        // Call the staking contract synchronously (Soroban: no async, direct call)
+        call_stake_tokens(&env, &staking_contract, &vault.owner, vault_id, locked);
+
+        // Update vault staked_amount
+        vault.staked_amount = locked;
+        env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
+
+        // Update stake info
+        stake_info.tokens_staked = locked;
+        stake_info.stake_state = StakeState::Staked(env.ledger().timestamp(), staking_contract.clone());
+        set_stake_info(&env, vault_id, &stake_info);
+
+        // Update global staked counter
+        let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TotalStaked, &(total_staked + locked));
+
+        stake::emit_staked(&env, vault_id, &vault.owner, locked, &staking_contract);
+    }
+
+    /// Manually unstake a vault. The beneficiary (owner) or admin can call this.
+    ///
+    /// # Panics
+    /// - If the vault is not currently staked (`NotStaked`).
+    pub fn manual_unstake(env: Env, vault_id: u64) {
+        Self::require_not_paused(&env);
+        let mut vault = Self::get_vault_internal(&env, vault_id);
+        vault.owner.require_auth();
+        Self::do_unstake(&env, vault_id, &mut vault);
+    }
+
+    /// Claim yield accrued on the staking contract for a vault.
+    ///
+    /// The yield is transferred from the staking contract to the beneficiary.
+    /// The vault's `accumulated_yield` is reset to zero after the transfer.
+    ///
+    /// # Panics
+    /// - If the vault is not currently staked (`NotStaked`).
+    /// - If the vault has been revoked (`BeneficiaryRevoked`).
+    pub fn claim_yield(env: Env, vault_id: u64) -> i128 {
+        Self::require_not_paused(&env);
+        let vault = Self::get_vault_internal(&env, vault_id);
+        vault.owner.require_auth();
+
+        // Guard: revoked vaults cannot claim yield
+        if Self::is_vault_revoked(&env, vault_id) {
+            panic!("BeneficiaryRevoked");
+        }
+
+        let mut stake_info = get_stake_info(&env, vault_id);
+
+        let staking_contract = match &stake_info.stake_state {
+            StakeState::Staked(_, staking_contract) => staking_contract.clone(),
+            StakeState::Unstaked => panic!("NotStaked"),
+        };
+
+        let yield_amount = call_claim_yield_for(&env, &staking_contract, &vault.owner, vault_id);
+
+        if yield_amount > 0 {
+            // Transfer yield from staking contract to beneficiary
+            let token: Address = env.storage().instance().get(&DataKey::Token).expect("Token not set");
+            token::Client::new(&env, &token).transfer(&staking_contract, &vault.owner, &yield_amount);
+        }
+
+        stake_info.accumulated_yield = 0;
+        set_stake_info(&env, vault_id, &stake_info);
+
+        stake::emit_yield_claimed(&env, vault_id, &vault.owner, yield_amount);
+        yield_amount
+    }
+
+    /// Revoke a vault: slash all unvested tokens to `treasury`.
+    ///
+    /// If the vault is currently staked, it is automatically unstaked first
+    /// before the treasury transfer. This ensures tokens are never stuck in a
+    /// staked state after revocation.
+    ///
+    /// # Panics
+    /// - If the vault is marked irrevocable.
+    pub fn revoke_vault(env: Env, vault_id: u64, treasury: Address) {
+        Self::require_admin(&env);
+        let mut vault = Self::get_vault_internal(&env, vault_id);
+
+        if vault.is_irrevocable {
+            panic!("Vault is irrevocable");
+        }
+
+        // Auto-unstake if staked
+        let stake_info = get_stake_info(&env, vault_id);
+        if stake_info.stake_state != StakeState::Unstaked {
+            Self::do_unstake(&env, vault_id, &mut vault);
+            stake::emit_revocation_unstaked(&env, vault_id, &vault.owner);
+        }
+
+        // Mark vault as revoked
+        Self::mark_vault_revoked(&env, vault_id);
+
+        // Slash all remaining tokens to treasury
+        let remaining = vault.total_amount - vault.released_amount;
+        if remaining > 0 {
+            vault.total_amount = vault.released_amount;
+            vault.end_time = env.ledger().timestamp();
+            vault.step_duration = 0;
+            vault.is_frozen = true;
+
+            if env.storage().instance().has(&DataKey::VaultMilestones(vault_id)) {
+                env.storage().instance().remove(&DataKey::VaultMilestones(vault_id));
+            }
+
+            env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
+
+            let total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
+            env.storage().instance().set(&DataKey::TotalShares, &(total_shares - remaining));
+
+            let token: Address = env.storage().instance().get(&DataKey::Token).expect("Token not set");
+            token::Client::new(&env, &token).transfer(&env.current_contract_address(), &treasury, &remaining);
+
+            env.events().publish(
+                (Symbol::new(&env, "revoked"), vault_id),
+                (vault.owner, remaining, treasury),
+            );
+        }
+    }
+
+    /// Return the current stake status for a vault.
+    pub fn get_stake_status(env: Env, vault_id: u64) -> StakeStatusView {
+        let info = get_stake_info(&env, vault_id);
+        StakeStatusView {
+            vault_id,
+            stake_state: info.stake_state,
+            tokens_staked: info.tokens_staked,
+            accumulated_yield: info.accumulated_yield,
+        }
+    }
+
     // --- Internal Helpers ---
 
     fn require_admin(env: &Env) {
@@ -493,7 +697,60 @@ impl VestingContract {
         total_power
     }
 
-    fn calculate_claimable(env: &Env, id: u64, vault: &Vault) -> i128 {
+    /// Internal: perform the unstake operation against the staking contract and
+    /// update vault + stake_info state. Caller must have already loaded `vault`.
+    fn do_unstake(env: &Env, vault_id: u64, vault: &mut crate::Vault) {
+        let mut stake_info = get_stake_info(env, vault_id);
+
+        let staking_contract = match &stake_info.stake_state {
+            StakeState::Staked(_, staking_contract) => staking_contract.clone(),
+            StakeState::Unstaked => panic!("NotStaked"),
+        };
+
+        call_unstake_tokens(env, &staking_contract, &vault.owner, vault_id);
+
+        // Update global staked counter
+        let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
+        let new_total = if total_staked > stake_info.tokens_staked {
+            total_staked - stake_info.tokens_staked
+        } else {
+            0
+        };
+        env.storage().instance().set(&DataKey::TotalStaked, &new_total);
+
+        let unstaked_amount = stake_info.tokens_staked;
+        vault.staked_amount = 0;
+        env.storage().instance().set(&DataKey::VaultData(vault_id), vault);
+
+        stake_info.tokens_staked = 0;
+        stake_info.stake_state = StakeState::Unstaked;
+        set_stake_info(env, vault_id, &stake_info);
+
+        stake::emit_unstaked(env, vault_id, &vault.owner, unstaked_amount);
+    }
+
+    /// Mark a vault as revoked in the global revoked-vaults set.
+    fn mark_vault_revoked(env: &Env, vault_id: u64) {
+        let mut revoked: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::RevokedVaults)
+            .unwrap_or(Vec::new(env));
+        if !revoked.contains(&vault_id) {
+            revoked.push_back(vault_id);
+            env.storage().instance().set(&DataKey::RevokedVaults, &revoked);
+        }
+    }
+
+    /// Returns `true` if the vault has been revoked.
+    fn is_vault_revoked(env: &Env, vault_id: u64) -> bool {
+        let revoked: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::RevokedVaults)
+            .unwrap_or(Vec::new(env));
+        revoked.contains(&vault_id)
+    }    fn calculate_claimable(env: &Env, id: u64, vault: &Vault) -> i128 {
         if env.storage().instance().has(&DataKey::VaultMilestones(id)) {
             let milestones: Vec<Milestone> = env.storage().instance().get(&DataKey::VaultMilestones(id)).expect("No milestones");
             let mut pct = 0;

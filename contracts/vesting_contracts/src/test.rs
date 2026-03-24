@@ -1,9 +1,10 @@
 use crate::{
-    BatchCreateData, Milestone, VestingContract, VestingContractClient,
+    BatchCreateData, Milestone, VestingContract, VestingContractClient, StakeState,
 };
 use soroban_sdk::{
+    contract, contractimpl, contracttype,
     testutils::{Address as _, Ledger},
-    token, vec, Address, Env, IntoVal, Symbol, String, Map,
+    token, vec, Address, Env, String,
 };
 
 fn setup() -> (Env, Address, VestingContractClient<'static>, Address, Address) {
@@ -26,6 +27,10 @@ fn setup() -> (Env, Address, VestingContractClient<'static>, Address, Address) {
     (env, contract_id, client, admin, token_addr)
 }
 
+// =============================================================================
+// Existing tests
+// =============================================================================
+
 #[test]
 fn test_initialize() {
     let (env, _, client, admin, _) = setup();
@@ -34,10 +39,10 @@ fn test_initialize() {
 
 #[test]
 fn test_create_vault_full_and_claim() {
-    let (env, _, client, admin, token) = setup();
+    let (env, _, client, _admin, token) = setup();
     let beneficiary = Address::generate(&env);
     let now = env.ledger().timestamp();
-    
+
     let vault_id = client.create_vault_full(
         &beneficiary,
         &1000i128,
@@ -50,7 +55,7 @@ fn test_create_vault_full_and_claim() {
     );
 
     assert_eq!(vault_id, 1);
-    
+
     // Fast forward
     env.ledger().set_timestamp(now + 500);
     assert_eq!(client.get_claimable_amount(&vault_id), 500);
@@ -58,7 +63,7 @@ fn test_create_vault_full_and_claim() {
     // Claim
     client.claim_tokens(&vault_id, &100i128);
     assert_eq!(client.get_claimable_amount(&vault_id), 400);
-    
+
     let token_client = token::Client::new(&env, &token);
     assert_eq!(token_client.balance(&beneficiary), 100);
 }
@@ -68,7 +73,7 @@ fn test_periodic_vesting() {
     let (env, _, client, _, _) = setup();
     let beneficiary = Address::generate(&env);
     let now = env.ledger().timestamp();
-    
+
     // 1000 tokens over 1000 seconds, with 100 second steps
     let vault_id = client.create_vault_full(
         &beneficiary,
@@ -92,10 +97,10 @@ fn test_periodic_vesting() {
 
 #[test]
 fn test_milestones() {
-    let (env, _, client, admin, _) = setup();
+    let (env, _, client, _admin, _) = setup();
     let beneficiary = Address::generate(&env);
     let now = env.ledger().timestamp();
-    
+
     let vault_id = client.create_vault_full(
         &beneficiary,
         &1000i128,
@@ -107,31 +112,28 @@ fn test_milestones() {
         &0u64,
     );
 
-    let milestones = vec![&env, 
+    let milestones = vec![&env,
         Milestone { id: 1, percentage: 30, is_unlocked: false },
         Milestone { id: 2, percentage: 70, is_unlocked: false }
     ];
-    
+
     client.set_milestones(&vault_id, &milestones);
-    
+
     assert_eq!(client.get_claimable_amount(&vault_id), 0);
-    
+
     client.unlock_milestone(&vault_id, &1);
     assert_eq!(client.get_claimable_amount(&vault_id), 300);
-    
+
     client.unlock_milestone(&vault_id, &2);
     assert_eq!(client.get_claimable_amount(&vault_id), 1000);
 }
 
 #[test]
 fn test_global_pause() {
-    let (env, _, client, admin, _) = setup();
-    
+    let (_, _, client, _, _) = setup();
+
     client.toggle_pause();
     assert!(client.is_paused());
-    
-    let beneficiary = Address::generate(&env);
-    // Logic that depends on paused should fail
 }
 
 #[test]
@@ -140,7 +142,7 @@ fn test_batch_operations() {
     let r1 = Address::generate(&env);
     let r2 = Address::generate(&env);
     let now = env.ledger().timestamp();
-    
+
     let batch = BatchCreateData {
         recipients: vec![&env, r1, r2],
         amounts: vec![&env, 500i128, 500i128],
@@ -149,7 +151,7 @@ fn test_batch_operations() {
         keeper_fees: vec![&env, 0i128, 0i128],
         step_durations: vec![&env, 0u64, 0u64],
     };
-    
+
     let ids = client.batch_create_vaults_full(&batch);
     assert_eq!(ids.len(), 2);
     assert_eq!(ids.get(0).unwrap(), 1);
@@ -161,7 +163,7 @@ fn test_voting_power() {
     let (env, _, client, _, _) = setup();
     let beneficiary = Address::generate(&env);
     let now = env.ledger().timestamp();
-    
+
     // Irrevocable vault: 1000 tokens (100% weight = 1000 power)
     client.create_vault_full(
         &beneficiary,
@@ -173,7 +175,7 @@ fn test_voting_power() {
         &false,
         &0u64,
     );
-    
+
     // Revocable vault: 1000 tokens (50% weight = 500 power)
     client.create_vault_full(
         &beneficiary,
@@ -185,7 +187,7 @@ fn test_voting_power() {
         &false,
         &0u64,
     );
-    
+
     // Total power should be 1000 + 500 = 1500
     assert_eq!(client.get_voting_power(&beneficiary), 1500);
 }
@@ -197,7 +199,7 @@ fn test_delegated_voting_power() {
     let beneficiary_b = Address::generate(&env);
     let representative = Address::generate(&env);
     let now = env.ledger().timestamp();
-    
+
     // A: 1000 power (irrevocable)
     client.create_vault_full(
         &beneficiary_a,
@@ -209,7 +211,7 @@ fn test_delegated_voting_power() {
         &false,
         &0u64,
     );
-    
+
     // B: 500 power (revocable)
     client.create_vault_full(
         &beneficiary_b,
@@ -221,41 +223,33 @@ fn test_delegated_voting_power() {
         &false,
         &0u64,
     );
-    
-    // Initial check
+
     assert_eq!(client.get_voting_power(&beneficiary_a), 1000);
     assert_eq!(client.get_voting_power(&beneficiary_b), 500);
     assert_eq!(client.get_voting_power(&representative), 0);
-    
-    // A delegates to B
+
     client.delegate_voting_power(&beneficiary_a, &beneficiary_b);
     assert_eq!(client.get_voting_power(&beneficiary_a), 0);
-    assert_eq!(client.get_voting_power(&beneficiary_b), 1500); // 500 + 1000
-    
-    // B delegates to representative
+    assert_eq!(client.get_voting_power(&beneficiary_b), 1500);
+
     client.delegate_voting_power(&beneficiary_b, &representative);
     assert_eq!(client.get_voting_power(&beneficiary_b), 0);
-    // Note: C only gets B's own power (500) because A is not a direct delegator of C in current implementation
-    // This is fine as per simple requirements.
-    assert_eq!(client.get_voting_power(&representative), 500); 
-    
-    // A redelegates to representative
+    assert_eq!(client.get_voting_power(&representative), 500);
+
     client.delegate_voting_power(&beneficiary_a, &representative);
-    assert_eq!(client.get_voting_power(&representative), 1500); // 1000 + 500
-    
-    // A undelegates
+    assert_eq!(client.get_voting_power(&representative), 1500);
+
     client.delegate_voting_power(&beneficiary_a, &beneficiary_a);
     assert_eq!(client.get_voting_power(&beneficiary_a), 1000);
-    assert_eq!(client.get_voting_power(&representative), 500); // Only B left
+    assert_eq!(client.get_voting_power(&representative), 500);
 }
 
 #[test]
 fn test_vesting_acceleration() {
-    let (env, _, client, _admin, _) = setup();
+    let (env, _, client, _, _) = setup();
     let beneficiary = Address::generate(&env);
     let now = env.ledger().timestamp();
-    
-    // 1000 tokens over 1000 seconds
+
     let vault_id = client.create_vault_full(
         &beneficiary,
         &1000i128,
@@ -266,35 +260,28 @@ fn test_vesting_acceleration() {
         &false,
         &0u64,
     );
-    
-    // Fast forward halfway to check baseline
+
     env.ledger().set_timestamp(now + 250);
     assert_eq!(client.get_claimable_amount(&vault_id), 250);
-    
-    // Accelerate by 25% (Shift = 250)
+
     client.accelerate_all_schedules(&25);
-    // At T=250, effective is 500
     assert_eq!(client.get_claimable_amount(&vault_id), 500);
-    
-    // Accelerate by 50% (Shift = 500)
+
     client.accelerate_all_schedules(&50);
-    // At T=250, effective is 750
     assert_eq!(client.get_claimable_amount(&vault_id), 750);
-    
-    // Accelerate by 100%
+
     client.accelerate_all_schedules(&100);
     assert_eq!(client.get_claimable_amount(&vault_id), 1000);
 }
 
 #[test]
 fn test_slashing() {
-    let (env, _, client, _admin, token) = setup();
+    let (env, _, client, _, token) = setup();
     let beneficiary = Address::generate(&env);
     let treasury = Address::generate(&env);
     let token_client = token::Client::new(&env, &token);
     let now = env.ledger().timestamp();
-    
-    // 1000 tokens over 1000 seconds
+
     let vault_id = client.create_vault_full(
         &beneficiary,
         &1000i128,
@@ -305,29 +292,359 @@ fn test_slashing() {
         &false,
         &0u64,
     );
-    
-    // Jump to T=400
+
     env.ledger().set_timestamp(now + 400);
     assert_eq!(client.get_claimable_amount(&vault_id), 400);
-    
-    // Slash!
+
     client.slash_unvested_balance(&vault_id, &treasury);
-    
-    // Treasury should have received 600 (remaining unvested)
+
     assert_eq!(token_client.balance(&treasury), 600);
-    
-    // Beneficiary should still have 400 vested
     assert_eq!(client.get_claimable_amount(&vault_id), 400);
-    
-    // vault.total_amount should be 400
+
     let vault = client.get_vault(&vault_id);
     assert_eq!(vault.total_amount, 400);
-    
-    // Jump to T=1000, claimable should NOT increase
+
     env.ledger().set_timestamp(now + 1000);
     assert_eq!(client.get_claimable_amount(&vault_id), 400);
-    
-    // Claim 400
+
     client.claim_tokens(&vault_id, &400i128);
     assert_eq!(token_client.balance(&beneficiary), 400);
+}
+
+// =============================================================================
+// Auto-Stake Tests
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// Minimal mock staking contract for unit tests
+// ---------------------------------------------------------------------------
+
+#[contracttype]
+#[derive(Clone)]
+pub struct MockStakeRecord {
+    pub amount: i128,
+    pub pending_yield: i128,
+    pub is_active: bool,
+}
+
+#[contracttype]
+enum MockDataKey {
+    Admin,
+    Record(Address, u64),
+    AuthVault,
+}
+
+#[contract]
+pub struct MockStakingContract;
+
+#[contractimpl]
+impl MockStakingContract {
+    pub fn initialize(env: Env, admin: Address) {
+        env.storage().instance().set(&MockDataKey::Admin, &admin);
+    }
+
+    pub fn add_authorised_vault(env: Env, vault: Address) {
+        env.storage().instance().set(&MockDataKey::AuthVault, &vault);
+    }
+
+    pub fn stake_tokens(env: Env, beneficiary: Address, vault_id: u64, amount: i128) {
+        let key = MockDataKey::Record(beneficiary.clone(), vault_id);
+        if let Some(r) = env.storage().instance().get::<_, MockStakeRecord>(&key) {
+            if r.is_active { panic!("AlreadyStaked"); }
+        }
+        env.storage().instance().set(&key, &MockStakeRecord {
+            amount,
+            pending_yield: 0,
+            is_active: true,
+        });
+    }
+
+    pub fn unstake_tokens(env: Env, beneficiary: Address, vault_id: u64) {
+        let key = MockDataKey::Record(beneficiary.clone(), vault_id);
+        let mut r: MockStakeRecord = env.storage().instance()
+            .get(&key).unwrap_or_else(|| panic!("NotStaked"));
+        if !r.is_active { panic!("NotStaked"); }
+        r.is_active = false;
+        env.storage().instance().set(&key, &r);
+    }
+
+    pub fn claim_yield_for(env: Env, beneficiary: Address, vault_id: u64) -> i128 {
+        let key = MockDataKey::Record(beneficiary.clone(), vault_id);
+        let mut r: MockStakeRecord = env.storage().instance()
+            .get(&key).unwrap_or_else(|| panic!("NotStaked"));
+        let y = r.pending_yield;
+        r.pending_yield = 0;
+        env.storage().instance().set(&key, &r);
+        y
+    }
+
+    pub fn accrue_yield(env: Env, beneficiary: Address, vault_id: u64, amount: i128) {
+        let key = MockDataKey::Record(beneficiary.clone(), vault_id);
+        let mut r: MockStakeRecord = env.storage().instance()
+            .get(&key).unwrap_or_else(|| panic!("NotStaked"));
+        r.pending_yield += amount;
+        env.storage().instance().set(&key, &r);
+    }
+
+    pub fn get_record(env: Env, beneficiary: Address, vault_id: u64) -> MockStakeRecord {
+        env.storage().instance()
+            .get(&MockDataKey::Record(beneficiary, vault_id))
+            .unwrap_or_else(|| panic!("NotStaked"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Setup helper with staking
+// ---------------------------------------------------------------------------
+
+fn setup_with_staking() -> (
+    Env,
+    Address, // vesting contract id
+    VestingContractClient<'static>,
+    Address, // admin
+    Address, // token
+    Address, // staking contract id
+) {
+    let (env, contract_id, client, admin, token) = setup();
+
+    let staking_id = env.register(MockStakingContract, ());
+    let staking_client = MockStakingContractClient::new(&env, &staking_id);
+    staking_client.initialize(&admin);
+    staking_client.add_authorised_vault(&contract_id);
+
+    client.add_staking_contract(&staking_id);
+
+    (env, contract_id, client, admin, token, staking_id)
+}
+
+fn make_vault(client: &VestingContractClient, env: &Env, beneficiary: &Address) -> u64 {
+    let now = env.ledger().timestamp();
+    client.create_vault_full(
+        beneficiary,
+        &1000i128,
+        &now,
+        &(now + 1000),
+        &0i128,
+        &true,
+        &false,
+        &0u64,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Whitelist
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_add_staking_contract_whitelists_address() {
+    let (env, _, client, _, _, staking_id) = setup_with_staking();
+    assert!(client.get_staking_contracts().contains(&staking_id));
+}
+
+#[test]
+fn test_remove_staking_contract_removes_from_whitelist() {
+    let (env, _, client, _, _, staking_id) = setup_with_staking();
+    client.remove_staking_contract(&staking_id);
+    assert!(!client.get_staking_contracts().contains(&staking_id));
+}
+
+// ---------------------------------------------------------------------------
+// auto_stake
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_auto_stake_sets_staked_state() {
+    let (env, _, client, _, _, staking_id) = setup_with_staking();
+    let beneficiary = Address::generate(&env);
+    let vault_id = make_vault(&client, &env, &beneficiary);
+
+    client.auto_stake(&vault_id, &staking_id);
+
+    let status = client.get_stake_status(&vault_id);
+    assert_eq!(status.tokens_staked, 1000);
+    match status.stake_state {
+        StakeState::Staked(_, sc) => assert_eq!(sc, staking_id),
+        StakeState::Unstaked => panic!("Expected Staked"),
+    }
+}
+
+#[test]
+fn test_auto_stake_updates_vault_staked_amount() {
+    let (env, _, client, _, _, staking_id) = setup_with_staking();
+    let beneficiary = Address::generate(&env);
+    let vault_id = make_vault(&client, &env, &beneficiary);
+
+    client.auto_stake(&vault_id, &staking_id);
+
+    assert_eq!(client.get_vault(&vault_id).staked_amount, 1000);
+}
+
+#[test]
+#[should_panic(expected = "AlreadyStaked")]
+fn test_auto_stake_double_stake_panics() {
+    let (env, _, client, _, _, staking_id) = setup_with_staking();
+    let beneficiary = Address::generate(&env);
+    let vault_id = make_vault(&client, &env, &beneficiary);
+
+    client.auto_stake(&vault_id, &staking_id);
+    client.auto_stake(&vault_id, &staking_id);
+}
+
+#[test]
+#[should_panic(expected = "UnauthorizedStakingContract")]
+fn test_auto_stake_non_whitelisted_contract_panics() {
+    let (env, _, client, _, _, _) = setup_with_staking();
+    let beneficiary = Address::generate(&env);
+    let vault_id = make_vault(&client, &env, &beneficiary);
+
+    client.auto_stake(&vault_id, &Address::generate(&env));
+}
+
+#[test]
+#[should_panic(expected = "InsufficientBalance")]
+fn test_auto_stake_zero_balance_panics() {
+    let (env, _, client, _, _, staking_id) = setup_with_staking();
+    let beneficiary = Address::generate(&env);
+    let now = env.ledger().timestamp();
+
+    let vault_id = client.create_vault_full(
+        &beneficiary, &100i128, &now, &(now + 1), &0i128, &true, &false, &0u64,
+    );
+    env.ledger().set_timestamp(now + 2);
+    client.claim_tokens(&vault_id, &100i128);
+
+    client.auto_stake(&vault_id, &staking_id);
+}
+
+// ---------------------------------------------------------------------------
+// manual_unstake
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_manual_unstake_resets_state() {
+    let (env, _, client, _, _, staking_id) = setup_with_staking();
+    let beneficiary = Address::generate(&env);
+    let vault_id = make_vault(&client, &env, &beneficiary);
+
+    client.auto_stake(&vault_id, &staking_id);
+    client.manual_unstake(&vault_id);
+
+    let status = client.get_stake_status(&vault_id);
+    assert_eq!(status.tokens_staked, 0);
+    assert!(matches!(status.stake_state, StakeState::Unstaked));
+    assert_eq!(client.get_vault(&vault_id).staked_amount, 0);
+}
+
+#[test]
+#[should_panic(expected = "NotStaked")]
+fn test_manual_unstake_when_not_staked_panics() {
+    let (env, _, client, _, _, _) = setup_with_staking();
+    let beneficiary = Address::generate(&env);
+    let vault_id = make_vault(&client, &env, &beneficiary);
+
+    client.manual_unstake(&vault_id);
+}
+
+#[test]
+fn test_unstake_then_restake_succeeds() {
+    let (env, _, client, _, _, staking_id) = setup_with_staking();
+    let beneficiary = Address::generate(&env);
+    let vault_id = make_vault(&client, &env, &beneficiary);
+
+    client.auto_stake(&vault_id, &staking_id);
+    client.manual_unstake(&vault_id);
+    client.auto_stake(&vault_id, &staking_id);
+
+    assert_eq!(client.get_stake_status(&vault_id).tokens_staked, 1000);
+}
+
+// ---------------------------------------------------------------------------
+// revoke_vault
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_revoke_vault_unstakes_and_sends_to_treasury() {
+    let (env, _, client, _, token_addr, staking_id) = setup_with_staking();
+    let beneficiary = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let vault_id = make_vault(&client, &env, &beneficiary);
+
+    client.auto_stake(&vault_id, &staking_id);
+    client.revoke_vault(&vault_id, &treasury);
+
+    let vault = client.get_vault(&vault_id);
+    assert!(vault.is_frozen);
+    assert_eq!(vault.staked_amount, 0);
+    assert!(matches!(client.get_stake_status(&vault_id).stake_state, StakeState::Unstaked));
+
+    assert_eq!(token::Client::new(&env, &token_addr).balance(&treasury), 1000);
+}
+
+#[test]
+fn test_revoke_vault_not_staked_still_works() {
+    let (env, _, client, _, token_addr, _) = setup_with_staking();
+    let beneficiary = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let vault_id = make_vault(&client, &env, &beneficiary);
+
+    client.revoke_vault(&vault_id, &treasury);
+
+    assert_eq!(token::Client::new(&env, &token_addr).balance(&treasury), 1000);
+}
+
+#[test]
+#[should_panic(expected = "Vault is irrevocable")]
+fn test_revoke_irrevocable_vault_panics() {
+    let (env, _, client, _, _, _) = setup_with_staking();
+    let beneficiary = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let now = env.ledger().timestamp();
+
+    let vault_id = client.create_vault_full(
+        &beneficiary, &1000i128, &now, &(now + 1000), &0i128, &false, &false, &0u64,
+    );
+    client.revoke_vault(&vault_id, &treasury);
+}
+
+// ---------------------------------------------------------------------------
+// claim_yield
+// ---------------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "NotStaked")]
+fn test_claim_yield_when_not_staked_panics() {
+    let (env, _, client, _, _, _) = setup_with_staking();
+    let beneficiary = Address::generate(&env);
+    let vault_id = make_vault(&client, &env, &beneficiary);
+
+    client.claim_yield(&vault_id);
+}
+
+#[test]
+#[should_panic(expected = "BeneficiaryRevoked")]
+fn test_claim_yield_after_revocation_panics() {
+    let (env, _, client, _, _, staking_id) = setup_with_staking();
+    let beneficiary = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let vault_id = make_vault(&client, &env, &beneficiary);
+
+    client.auto_stake(&vault_id, &staking_id);
+    client.revoke_vault(&vault_id, &treasury);
+    client.claim_yield(&vault_id);
+}
+
+// ---------------------------------------------------------------------------
+// get_stake_status
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_get_stake_status_initial_is_unstaked() {
+    let (env, _, client, _, _, _) = setup_with_staking();
+    let beneficiary = Address::generate(&env);
+    let vault_id = make_vault(&client, &env, &beneficiary);
+
+    let status = client.get_stake_status(&vault_id);
+    assert!(matches!(status.stake_state, StakeState::Unstaked));
+    assert_eq!(status.tokens_staked, 0);
+    assert_eq!(status.accumulated_yield, 0);
 }

@@ -2,6 +2,7 @@
 members = [
     "contracts/vesting_contracts",
     "contracts/grant_contracts",
+    "contracts/staking_contract",
 ]
 resolver = "2"
 
