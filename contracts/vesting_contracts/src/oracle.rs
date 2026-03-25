@@ -6,6 +6,8 @@ pub enum OracleType {
     TVL, // Total Value Locked
     Price, // Token price target
     Custom, // Custom condition
+    NetworkGrowth, // Network growth percentage for anti-dilution
+    Inflation, // Inflation rate for anti-dilution
 }
 
 #[contracttype]
@@ -172,5 +174,51 @@ impl OracleClient {
             operator,
             parameter: Some(parameter),
         }
+    }
+
+    pub fn create_network_growth_condition(
+        oracle_address: Address,
+        target_growth: i128,
+        operator: ComparisonOperator
+    ) -> OracleCondition {
+        OracleCondition {
+            oracle_address,
+            oracle_type: OracleType::NetworkGrowth,
+            target_value: target_growth,
+            operator,
+            parameter: None,
+        }
+    }
+
+    pub fn create_inflation_condition(
+        oracle_address: Address,
+        target_inflation: i128,
+        operator: ComparisonOperator
+    ) -> OracleCondition {
+        OracleCondition {
+            oracle_address,
+            oracle_type: OracleType::Inflation,
+            target_value: target_inflation,
+            operator,
+            parameter: None,
+        }
+    }
+
+    /// Queries network growth value from oracle (returns percentage in basis points)
+    pub fn query_network_growth(env: &Env, oracle_address: &Address) -> i128 {
+        // This would make a cross-contract call to the oracle contract
+        // For now, return 0 as placeholder - should be replaced with actual oracle call
+        // let oracle_client = NetworkGrowthOracleClient::new(env, oracle_address);
+        // oracle_client.get_growth_percentage()
+        0
+    }
+
+    /// Queries inflation rate from oracle (returns percentage in basis points)
+    pub fn query_inflation_rate(env: &Env, oracle_address: &Address) -> i128 {
+        // This would make a cross-contract call to the oracle contract
+        // For now, return 0 as placeholder - should be replaced with actual oracle call
+        // let oracle_client = InflationOracleClient::new(env, oracle_address);
+        // oracle_client.get_inflation_rate()
+        0
     }
 }

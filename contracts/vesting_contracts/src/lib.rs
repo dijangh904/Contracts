@@ -85,6 +85,9 @@ pub enum DataKey {
     GlobalAccelerationPct,
     RevokedVaults,
     VaultSuccession(u64),
+    // Anti-Dilution Configuration
+    AntiDilutionConfig(u64),
+    NetworkGrowthSnapshot(u64),
 }
 
 #[contracttype]
@@ -94,6 +97,27 @@ pub struct PausedVault {
     pub pause_timestamp: u64,
     pub pause_authority: Address,
     pub reason: String,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AntiDilutionConfig {
+    pub enabled: bool,
+    pub network_growth_oracle: Address,
+    pub inflation_oracle: Option<Address>,
+    pub adjustment_frequency: u64, // Seconds between adjustments
+    pub last_adjustment_time: u64,
+    pub baseline_network_value: i128, // Baseline network value at creation
+    pub cumulative_adjustment_factor: i128, // In basis points (10000 = 100%)
+    pub max_adjustment_pct: u32, // Maximum adjustment percentage (basis points)
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct NetworkGrowthSnapshot {
+    pub timestamp: u64,
+    pub network_value: i128,
+    pub adjustment_factor: i128, // In basis points
 }
 
 #[contracttype]
@@ -273,6 +297,8 @@ impl VestingContract {
     pub fn propose_contract_upgrade(env: Env, new_contract: Address) -> u64 {
         Self::require_admin(&env);
         Self::create_governance_proposal(env, GovernanceAction::ContractUpgrade(new_contract))
+    }
+
     pub fn accept_ownership(env: Env) {
         let proposed: Address = env
             .storage()
@@ -619,14 +645,13 @@ impl VestingContract {
             let id = Self::create_vault_prefunded_internal(
                 &env,
                 data.recipients.get(i).unwrap(),
-                data.amounts.get(i).unwrap(),
+                data.asset_baskets.get(i).unwrap().clone(), // Use asset basket
                 data.start_times.get(i).unwrap(),
                 data.end_times.get(i).unwrap(),
                 data.keeper_fees.get(i).unwrap(),
-                true,
-                false,
-                data.step_durations.get(i).unwrap_or(0),
-                true,
+                true, // is_revocable
+                false, // is_transferable
+                data.step_durations.get(i).unwrap_or(0)
             );
             ids.push_back(id);
         }
@@ -642,18 +667,23 @@ impl VestingContract {
         let mut ids = Vec::new(&env);
         for i in 0..schedules.len() {
             let schedule = schedules.get(i).unwrap();
+            // Calculate total amount from asset basket
+            let mut schedule_total = 0i128;
+            for allocation in schedule.asset_basket.iter() {
+                schedule_total += allocation.total_amount;
+            }
+            
             let id = Self::create_vault_prefunded_internal(
                 &env,
                 schedule.owner,
-                schedule.amount,
+                schedule.asset_basket.clone(), // Pass the entire asset basket
                 schedule.start_time,
                 schedule.end_time,
                 schedule.keeper_fee,
                 schedule.is_revocable,
                 schedule.is_transferable,
-                schedule.step_duration,
-                true,
-                data.step_durations.get(i).unwrap_or(0)
+                schedule.step_durations.get(i).unwrap_or(0),
+                true
             );
             ids.push_back(id);
         }
@@ -895,11 +925,11 @@ impl VestingContract {
         } else {
             // No performance cliff set, use time-based cliff check
             let vault = Self::get_vault_internal(&env, vault_id);
-            let now = env.ledger().timestamp();
-            now > vault.start_time
+            env.ledger().timestamp() >= vault.start_time
         }
     }
 
+    /// Creates a vault with performance cliff conditions
     pub fn create_vault_with_cliff(
         env: Env,
         owner: Address,
@@ -926,6 +956,81 @@ impl VestingContract {
         );
         Self::set_performance_cliff(env, vault_id, cliff);
         vault_id
+    }
+
+    // --- Anti-Dilution Configuration Functions ---
+    
+    /// Configures anti-dilution settings for a vault (admin only)
+    pub fn configure_anti_dilution(
+        env: Env,
+        vault_id: u64,
+        network_growth_oracle: Address,
+        inflation_oracle: Option<Address>,
+        adjustment_frequency: u64,
+        max_adjustment_pct: u32,
+    ) {
+        Self::require_admin(&env);
+        
+        // Verify vault exists
+        let vault = Self::get_vault_internal(&env, vault_id);
+        
+        // Get baseline network value at configuration time
+        let baseline_network_value = OracleClient::query_network_growth(&env, &network_growth_oracle);
+        
+        let config = AntiDilutionConfig {
+            enabled: true,
+            network_growth_oracle,
+            inflation_oracle,
+            adjustment_frequency,
+            last_adjustment_time: vault.creation_time,
+            baseline_network_value,
+            cumulative_adjustment_factor: 0,
+            max_adjustment_pct,
+        };
+        
+        env.storage().instance().set(&DataKey::AntiDilutionConfig(vault_id), &config);
+    }
+
+    /// Enables or disables anti-dilution for a vault (admin only)
+    pub fn set_anti_dilution_enabled(env: Env, vault_id: u64, enabled: bool) {
+        Self::require_admin(&env);
+        
+        if let Some(mut config) = env.storage().instance().get::<_, AntiDilutionConfig>(&DataKey::AntiDilutionConfig(vault_id)) {
+            config.enabled = enabled;
+            env.storage().instance().set(&DataKey::AntiDilutionConfig(vault_id), &config);
+        }
+    }
+
+    /// Gets anti-dilution configuration for a vault
+    pub fn get_anti_dilution_config(env: Env, vault_id: u64) -> Option<AntiDilutionConfig> {
+        env.storage().instance().get::<_, AntiDilutionConfig>(&DataKey::AntiDilutionConfig(vault_id))
+    }
+
+    /// Gets the latest network growth snapshot for a vault
+    pub fn get_network_growth_snapshot(env: Env, vault_id: u64) -> Option<NetworkGrowthSnapshot> {
+        env.storage().instance().get(&DataKey::NetworkGrowthSnapshot(vault_id))
+    }
+
+    /// Manually triggers anti-dilution adjustment (admin only, for testing)
+    pub fn trigger_anti_dilution_adjustment(env: Env, vault_id: u64) {
+        Self::require_admin(&env);
+        
+        // Verify vault exists
+        let vault = Self::get_vault_internal(&env, vault_id);
+        
+        // Force adjustment by temporarily updating last_adjustment_time
+        if let Some(mut config) = env.storage().instance().get::<_, AntiDilutionConfig>(&DataKey::AntiDilutionConfig(vault_id)) {
+            let old_time = config.last_adjustment_time;
+            config.last_adjustment_time = 0; // Force adjustment
+            env.storage().instance().set(&DataKey::AntiDilutionConfig(vault_id), &config);
+            
+            // Trigger calculation to apply adjustment
+            Self::get_claimable_amount(&env, vault_id);
+            
+            // Restore original time
+            config.last_adjustment_time = old_time;
+            env.storage().instance().set(&DataKey::AntiDilutionConfig(vault_id), &config);
+        }
     }
 
     /// Gets total claimable amount across all assets (for backward compatibility)
@@ -1227,12 +1332,16 @@ impl VestingContract {
         let mut vault = Self::get_vault_internal(&env, vault_id);
         
         let vested = Self::calculate_claimable(&env, vault_id, &vault);
-        let unvested = vault.total_amount - vested;
+        let mut total_amount = 0i128;
+        let mut total_released = 0i128;
+        for allocation in vault.allocations.iter() {
+            total_amount += allocation.total_amount;
+            total_released += allocation.released_amount;
+        }
+        let unvested = total_amount - vested;
         
         if unvested <= 0 { panic!("Nothing to slash"); }
         
-        // The slashed tokens are taken from the vault's total capacity
-        vault.total_amount = vested;
         // Effectively stop the clock for this vault
         vault.end_time = env.ledger().timestamp();
         vault.step_duration = 0;
@@ -1314,7 +1423,10 @@ impl VestingContract {
         }
 
         // Must have locked balance
-        let locked = vault.total_amount - vault.released_amount;
+        let mut locked = 0i128;
+        for allocation in vault.allocations.iter() {
+            locked += allocation.total_amount - allocation.released_amount;
+        }
         if locked <= 0 {
             panic!("InsufficientBalance");
         }
@@ -1421,9 +1533,17 @@ impl VestingContract {
         Self::mark_vault_revoked(&env, vault_id);
 
         // Slash all remaining tokens to treasury
-        let remaining = vault.total_amount - vault.released_amount;
+        let mut remaining = 0i128;
+        for allocation in vault.allocations.iter() {
+            remaining += allocation.total_amount - allocation.released_amount;
+        }
         if remaining > 0 {
-            vault.total_amount = vault.released_amount;
+            // Update allocations to mark all as released
+            for (i, allocation) in vault.allocations.iter().enumerate() {
+                let mut updated_allocation = allocation.clone();
+                updated_allocation.released_amount = allocation.total_amount;
+                vault.allocations.set(i.try_into().unwrap(), updated_allocation);
+            }
             vault.end_time = env.ledger().timestamp();
             vault.step_duration = 0;
             vault.is_frozen = true;
@@ -1740,7 +1860,7 @@ impl VestingContract {
         if count == 0 {
             panic!("Empty batch");
         }
-        if data.amounts.len() != count
+        if data.asset_baskets.len() != count
             || data.start_times.len() != count
             || data.end_times.len() != count
             || data.keeper_fees.len() != count
@@ -1751,8 +1871,13 @@ impl VestingContract {
 
         let mut total_amount: i128 = 0;
         for i in 0..count {
-            let amount = data.amounts.get(i).unwrap();
-            if amount < 0 {
+            let asset_basket = data.asset_baskets.get(i).unwrap();
+            // Calculate total amount from asset basket
+            let mut basket_total = 0i128;
+            for allocation in asset_basket.iter() {
+                basket_total += allocation.total_amount;
+            }
+            if basket_total < 0 {
                 panic!("Invalid amount");
             }
 
@@ -1761,7 +1886,7 @@ impl VestingContract {
             Self::require_valid_duration(start_time, end_time);
 
             total_amount = total_amount
-                .checked_add(amount)
+                .checked_add(basket_total)
                 .expect("Batch amount overflow");
         }
         total_amount
@@ -1775,14 +1900,20 @@ impl VestingContract {
         let mut total_amount: i128 = 0;
         for i in 0..schedules.len() {
             let schedule = schedules.get(i).unwrap();
-            if schedule.amount < 0 {
+            // Calculate total amount from asset basket
+            let mut schedule_total = 0i128;
+            for allocation in schedule.asset_basket.iter() {
+                schedule_total += allocation.total_amount;
+            }
+            if schedule_total < 0 {
                 panic!("Invalid amount");
             }
 
             Self::require_valid_duration(schedule.start_time, schedule.end_time);
+
             total_amount = total_amount
-                .checked_add(schedule.amount)
-                .expect("Batch amount overflow");
+                .checked_add(schedule_total)
+                .expect("Schedule amount overflow");
         }
         total_amount
     }
@@ -1802,7 +1933,10 @@ impl VestingContract {
         let mut total_power: i128 = 0;
         for id in vault_ids.iter() {
             let vault = Self::get_vault_internal(env, id);
-            let balance = vault.total_amount - vault.released_amount;
+            let mut balance = 0i128;
+            for allocation in vault.allocations.iter() {
+                balance += allocation.total_amount - allocation.released_amount;
+            }
             let weight = if vault.is_irrevocable { 100 } else { 50 };
             total_power += (balance * weight) / 100;
         }
@@ -1972,10 +2106,83 @@ impl VestingContract {
                 let steps = duration / vault.step_duration as i128;
                 if steps == 0 { return 0; }
                 let completed = elapsed / vault.step_duration as i128;
-                (allocation.total_amount * completed) / steps
+                let base_vested = (allocation.total_amount * completed) / steps;
+                
+                // Apply anti-dilution adjustment if enabled
+                Self::apply_anti_dilution_adjustment(env, id, base_vested, allocation.total_amount)
             } else {
-                (allocation.total_amount * elapsed) / duration
+                let base_vested = (allocation.total_amount * elapsed) / duration;
+                
+                // Apply anti-dilution adjustment if enabled
+                Self::apply_anti_dilution_adjustment(env, id, base_vested, allocation.total_amount)
             }
+        }
+    }
+
+    /// Applies anti-dilution adjustments to vested amount based on network growth
+    fn apply_anti_dilution_adjustment(env: &Env, vault_id: u64, base_vested: i128, total_amount: i128) -> i128 {
+        // Check if anti-dilution is configured for this vault
+        if let Some(config) = env.storage().instance().get::<_, AntiDilutionConfig>(&DataKey::AntiDilutionConfig(vault_id)) {
+            if !config.enabled {
+                return base_vested;
+            }
+
+            let current_time = env.ledger().timestamp();
+            
+            // Check if it's time for adjustment
+            if current_time < config.last_adjustment_time + config.adjustment_frequency {
+                return base_vested;
+            }
+
+            // Query current network growth
+            let network_growth = OracleClient::query_network_growth(env, &config.network_growth_oracle);
+            
+            if network_growth <= 0 {
+                return base_vested; // No growth, no adjustment
+            }
+
+            // Calculate adjustment factor
+            let mut total_adjustment = config.cumulative_adjustment_factor;
+            
+            // Add new adjustment based on network growth
+            let new_adjustment = network_growth; // Network growth in basis points
+            
+            // Apply maximum adjustment limit
+            let max_adjustment = config.max_adjustment_pct as i128;
+            if total_adjustment + new_adjustment > max_adjustment {
+                total_adjustment = max_adjustment;
+            } else {
+                total_adjustment += new_adjustment;
+            }
+
+            // Calculate unvested amount
+            let unvested = total_amount - base_vested;
+            
+            // Apply adjustment to unvested amount only
+            // This preserves the beneficiary's "share of the network"
+            let adjustment_multiplier = (10000 + total_adjustment) as i128; // Convert basis points to multiplier
+            let adjusted_unvested = (unvested * adjustment_multiplier) / 10000;
+            let adjusted_vested = total_amount - adjusted_unvested;
+
+            // Update configuration with new adjustment
+            let updated_config = AntiDilutionConfig {
+                cumulative_adjustment_factor: total_adjustment,
+                last_adjustment_time: current_time,
+                ..config
+            };
+            env.storage().instance().set(&DataKey::AntiDilutionConfig(vault_id), &updated_config);
+
+            // Store snapshot for tracking
+            let snapshot = NetworkGrowthSnapshot {
+                timestamp: current_time,
+                network_value: network_growth,
+                adjustment_factor: total_adjustment,
+            };
+            env.storage().instance().set(&DataKey::NetworkGrowthSnapshot(vault_id), &snapshot);
+
+            adjusted_vested
+        } else {
+            base_vested
         }
     }
 
@@ -1986,10 +2193,12 @@ impl VestingContract {
             total_claimable += Self::calculate_claimable_for_asset(env, id, vault, i.try_into().unwrap());
         }
         total_claimable
+    }
+
     // --- Governance Helper Functions ---
 
     fn create_governance_proposal(env: Env, action: GovernanceAction) -> u64 {
-        let proposer = Self::get_admin(&env);
+        let proposer = Self::get_admin(env.clone());
         let now = env.ledger().timestamp();
         let proposal_id = Self::increment_proposal_count(&env);
         
@@ -2033,8 +2242,10 @@ impl VestingContract {
         
         let mut total_locked = 0i128;
         for vault_id in vault_ids.iter() {
-            let vault = Self::get_vault_internal(env, *vault_id);
-            total_locked += vault.total_amount - vault.released_amount;
+            let vault = Self::get_vault_internal(env, vault_id);
+            for allocation in vault.allocations.iter() {
+                total_locked += allocation.total_amount - allocation.released_amount;
+            }
         }
         
         total_locked
