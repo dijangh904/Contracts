@@ -575,6 +575,11 @@ impl VestingContract {
         panic!("Admin operations must be executed via AdminProposal: use propose_admin_action(...) and sign_admin_proposal to reach quorum");
     }
 
+    pub fn propose_contract_upgrade(env: Env, new_contract: Address) -> u64 {
+        Self::require_admin(&env);
+        Self::create_governance_proposal(env, GovernanceAction::ContractUpgrade(new_contract))
+    }
+
     pub fn accept_ownership(env: Env) {
         let proposed: Address = env
             .storage()
@@ -1516,6 +1521,90 @@ impl VestingContract {
         panic!("Admin actions must be executed via AdminProposal: call propose_admin_action(AdminAction::RevokeSchedule(vault_id, treasury)) and sign_admin_proposal to reach quorum");
     }
 
+    /// Partial revocation with a penalty split.
+    ///
+    /// Splits the unvested balance of a single-asset vault between the treasury
+    /// (penalty) and the beneficiary (severance):
+    ///   - `penalty_pct` % of unvested → treasury
+    ///   - `(100 - penalty_pct)` % of unvested → immediately claimable by beneficiary
+    ///
+    /// The vault is frozen after the call; the beneficiary may still claim any
+    /// tokens that were already vested plus the severance portion.
+    pub fn partial_revoke(env: Env, vault_id: u64, penalty_pct: u32, treasury: Address) {
+        Self::require_admin(&env);
+
+        if penalty_pct > 100 {
+            panic!("penalty_pct must be 0-100");
+        }
+
+        let mut vault = Self::get_vault_internal(&env, vault_id);
+
+        if vault.is_irrevocable {
+            panic!("Vault is irrevocable");
+        }
+        if vault.is_frozen {
+            panic!("Vault already frozen");
+        }
+        if vault.allocations.len() != 1 {
+            panic!("Use diversified variant for multi-asset vaults");
+        }
+
+        // Auto-unstake if staked
+        let stake_info = get_stake_info(&env, vault_id);
+        if stake_info.stake_state != StakeState::Unstaked {
+            Self::do_unstake(&env, vault_id, &mut vault);
+            stake::emit_revocation_unstaked(&env, vault_id, &vault.owner);
+        }
+
+        let allocation = vault.allocations.get(0).unwrap();
+        let unvested = allocation.total_amount - allocation.released_amount;
+
+        if unvested <= 0 {
+            panic!("Nothing to revoke");
+        }
+
+        // penalty goes to treasury; remainder is immediately vested for beneficiary
+        let penalty_amount = (unvested * penalty_pct as i128) / 100;
+        let severance_amount = unvested - penalty_amount;
+
+        let token: Address = env.storage().instance().get(&DataKey::Token).expect("Token not set");
+        let token_client = token::Client::new(&env, &token);
+
+        // Transfer penalty to treasury
+        if penalty_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &treasury, &penalty_amount);
+        }
+
+        // Transfer severance directly to beneficiary
+        if severance_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &vault.owner, &severance_amount);
+        }
+
+        // Update allocation: mark everything as released and freeze the vault
+        let mut updated = allocation.clone();
+        updated.released_amount = updated.total_amount;
+        vault.allocations.set(0, updated);
+        vault.is_frozen = true;
+        vault.end_time = env.ledger().timestamp();
+        vault.step_duration = 0;
+
+        Self::mark_vault_revoked(&env, vault_id);
+
+        if env.storage().instance().has(&DataKey::VaultMilestones(vault_id)) {
+            env.storage().instance().remove(&DataKey::VaultMilestones(vault_id));
+        }
+
+        env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
+
+        let total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TotalShares, &(total_shares - unvested));
+
+        env.events().publish(
+            (Symbol::new(&env, "partial_revoke"), vault_id),
+            (vault.owner, penalty_amount, severance_amount, treasury),
+        );
+    }
+
     /// Return the current stake status for a vault.
     pub fn get_stake_status(env: Env, vault_id: u64) -> StakeStatusView {
         let info = get_stake_info(&env, vault_id);
@@ -2102,6 +2191,8 @@ impl VestingContract {
             total_claimable += Self::calculate_claimable_for_asset(env, id, vault, i.try_into().unwrap());
         }
         total_claimable
+    }
+
     // --- Governance Helper Functions ---
 
     fn create_governance_proposal(env: Env, action: GovernanceAction) -> u64 {
