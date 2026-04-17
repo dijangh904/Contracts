@@ -1,27 +1,20 @@
 #![cfg(test)]
 
-use soroban_sdk::{vec, Address, Env, BytesN, Symbol, String, IntoVal, Val, Error};
-use soroban_sdk::testutils::Address as _;
-
-mod contract {
-    use super::*;
-    soroban_sdk::contractimport!(
-        file = "../../../target/wasm32-unknown-unknown/release/vesting_vault.wasm"
-    );
-}
-
-use contract::{VestingVault, VestingVaultClient};
+use soroban_sdk::{Address, Env, BytesN, Symbol, String, IntoVal, Val, Error, Vec};
+use soroban_sdk::testutils::{Address as _, Ledger};
+use vesting_vault::{VestingVault, VestingVaultClient};
+use vesting_vault::types::{Nullifier, ZKClaimProof};
 
 #[test]
 fn test_create_commitment() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, VestingVault);
+    let contract_id = env.register(VestingVault, ());
     let client = VestingVaultClient::new(&env, &contract_id);
     
     let user = Address::generate(&env);
     let vesting_id = 1u32;
     let amount = 1000i128;
-    let commitment_hash = [1u8; 32];
+    let commitment_hash = BytesN::from_array(&env, &[1u8; 32]);
     
     // Test creating a commitment
     client.create_commitment(&user, &vesting_id, &amount, &commitment_hash);
@@ -47,10 +40,10 @@ fn test_create_commitment() {
 #[test]
 fn test_nullifier_prevention() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, VestingVault);
+    let contract_id = env.register(VestingVault, ());
     let client = VestingVaultClient::new(&env, &contract_id);
     
-    let nullifier = contract::Nullifier { hash: BytesN::from_array(&env, &[2u8; 32]) };
+    let nullifier = Nullifier { hash: BytesN::from_array(&env, &[2u8; 32]) };
     
     // Initially nullifier should not be used
     assert!(!client.is_nullifier_used_public(&nullifier));
@@ -59,18 +52,18 @@ fn test_nullifier_prevention() {
 #[test]
 fn test_merkle_root_management() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, VestingVault);
+    let contract_id = env.register(VestingVault, ());
     let client = VestingVaultClient::new(&env, &contract_id);
     
     let admin = Address::generate(&env);
-    let merkle_root = [3u8; 32];
+    let merkle_root = BytesN::from_array(&env, &[3u8; 32]);
     
     // Add a Merkle root
     client.add_merkle_root_admin(&admin, &merkle_root);
     
     // Verify the Merkle root exists
     let roots = client.get_merkle_roots();
-    assert!(roots.contains(BytesN::from_array(&env, &merkle_root)));
+    assert!(roots.contains(merkle_root.clone()));
     
     // Test duplicate Merkle root should fail
     let result = env.try_invoke_contract::<Val, Error>(
@@ -84,17 +77,17 @@ fn test_merkle_root_management() {
 #[test]
 fn test_private_claim_flow() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, VestingVault);
+    let contract_id = env.register(VestingVault, ());
     let client = VestingVaultClient::new(&env, &contract_id);
     
     let user = Address::generate(&env);
     let admin = Address::generate(&env);
     let vesting_id = 1u32;
     let amount = 1000i128;
-    let commitment_hash = [4u8; 32];
-    let merkle_root = [5u8; 32];
-    let nullifier_hash = [6u8; 32];
-    let nullifier = contract::Nullifier { hash: BytesN::from_array(&env, &nullifier_hash) };
+    let commitment_hash = BytesN::from_array(&env, &[4u8; 32]);
+    let merkle_root = BytesN::from_array(&env, &[5u8; 32]);
+    let nullifier_hash = BytesN::from_array(&env, &[6u8; 32]);
+    let nullifier = Nullifier { hash: nullifier_hash.clone() };
     
     // Setup: Create commitment
     client.create_commitment(&user, &vesting_id, &amount, &commitment_hash);
@@ -103,10 +96,10 @@ fn test_private_claim_flow() {
     client.add_merkle_root_admin(&admin, &merkle_root);
     
     // Create ZK proof
-    let zk_proof = contract::ZKClaimProof {
-        commitment_hash: BytesN::from_array(&env, &commitment_hash),
-        nullifier_hash: BytesN::from_array(&env, &nullifier_hash),
-        merkle_root: BytesN::from_array(&env, &merkle_root),
+    let zk_proof = ZKClaimProof {
+        commitment_hash: commitment_hash.clone(),
+        nullifier_hash: nullifier_hash.clone(),
+        merkle_root: merkle_root.clone(),
         proof_data: soroban_sdk::Bytes::new(&env),
     };
     
@@ -125,27 +118,27 @@ fn test_private_claim_flow() {
 #[test]
 fn test_private_claim_double_spending_prevention() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, VestingVault);
+    let contract_id = env.register(VestingVault, ());
     let client = VestingVaultClient::new(&env, &contract_id);
     
     let user = Address::generate(&env);
     let admin = Address::generate(&env);
     let vesting_id = 1u32;
     let amount = 1000i128;
-    let commitment_hash = [7u8; 32];
-    let merkle_root = [8u8; 32];
-    let nullifier_hash = [9u8; 32];
-    let nullifier = contract::Nullifier { hash: BytesN::from_array(&env, &nullifier_hash) };
+    let commitment_hash = BytesN::from_array(&env, &[7u8; 32]);
+    let merkle_root = BytesN::from_array(&env, &[8u8; 32]);
+    let nullifier_hash = BytesN::from_array(&env, &[9u8; 32]);
+    let nullifier = Nullifier { hash: nullifier_hash.clone() };
     
     // Setup: Create commitment and add Merkle root
     client.create_commitment(&user, &vesting_id, &amount, &commitment_hash);
     client.add_merkle_root_admin(&admin, &merkle_root);
     
     // Create ZK proof
-    let zk_proof = contract::ZKClaimProof {
-        commitment_hash: BytesN::from_array(&env, &commitment_hash),
-        nullifier_hash: BytesN::from_array(&env, &nullifier_hash),
-        merkle_root: BytesN::from_array(&env, &merkle_root),
+    let zk_proof = ZKClaimProof {
+        commitment_hash: commitment_hash.clone(),
+        nullifier_hash: nullifier_hash.clone(),
+        merkle_root: merkle_root.clone(),
         proof_data: soroban_sdk::Bytes::new(&env),
     };
     
@@ -164,7 +157,7 @@ fn test_private_claim_double_spending_prevention() {
 #[test]
 fn test_emergency_pause_with_private_claims() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, VestingVault);
+    let contract_id = env.register(VestingVault, ());
     let client = VestingVaultClient::new(&env, &contract_id);
     
     let user = Address::generate(&env);
@@ -172,17 +165,17 @@ fn test_emergency_pause_with_private_claims() {
     let auditor1 = Address::generate(&env);
     let auditor2 = Address::generate(&env);
     let amount = 1000i128;
-    let commitment_hash = [19u8; 32];
-    let merkle_root = [20u8; 32];
-    let nullifier_hash = [21u8; 32];
-    let nullifier = contract::Nullifier { hash: BytesN::from_array(&env, &nullifier_hash) };
+    let commitment_hash = BytesN::from_array(&env, &[19u8; 32]);
+    let merkle_root = BytesN::from_array(&env, &[20u8; 32]);
+    let nullifier_hash = BytesN::from_array(&env, &[21u8; 32]);
+    let nullifier = Nullifier { hash: nullifier_hash.clone() };
     
     // Setup: Create commitment and add Merkle root
     client.create_commitment(&user, &1u32, &amount, &commitment_hash);
     client.add_merkle_root_admin(&admin, &merkle_root);
     
     // Initialize auditors and trigger emergency pause
-    let mut auditors = soroban_sdk::Vec::new(&env);
+    let mut auditors = Vec::new(&env);
     auditors.push_back(auditor1.clone());
     auditors.push_back(auditor2.clone());
     auditors.push_back(Address::generate(&env));
@@ -191,10 +184,10 @@ fn test_emergency_pause_with_private_claims() {
     client.request_emergency_pause(&auditor2, &String::from_str(&env, "Test pause"));
     
     // Create ZK proof
-    let zk_proof = contract::ZKClaimProof {
-        commitment_hash: BytesN::from_array(&env, &commitment_hash),
-        nullifier_hash: BytesN::from_array(&env, &nullifier_hash),
-        merkle_root: BytesN::from_array(&env, &merkle_root),
+    let zk_proof = ZKClaimProof {
+        commitment_hash: commitment_hash.clone(),
+        nullifier_hash: nullifier_hash.clone(),
+        merkle_root: merkle_root.clone(),
         proof_data: soroban_sdk::Bytes::new(&env),
     };
     

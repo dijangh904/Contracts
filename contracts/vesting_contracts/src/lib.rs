@@ -559,7 +559,7 @@ impl VestingContract {
     pub fn sign_admin_proposal(env: Env, signer: Address, proposal_id: u64) {
         signer.require_auth();
         if !Self::is_admin(&env, &signer) { panic!("Not an admin"); }
-        let mut proposal = Self::get_admin_proposal(&env, proposal_id);
+        let proposal = Self::get_admin_proposal(&env, proposal_id);
         if proposal.is_executed { panic!("Proposal already executed"); }
         let sig_key = DataKey::AdminProposalSignature(proposal_id, signer.clone());
         if env.storage().instance().get::<_, bool>(&sig_key).unwrap_or(false) { panic!("Already signed"); }

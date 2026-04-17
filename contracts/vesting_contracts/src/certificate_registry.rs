@@ -79,8 +79,10 @@ pub struct WorkVerified {
     pub impact_score: u32,
 }
 
+#[contract]
 pub struct VestingCertificateRegistry;
 
+#[contractimpl]
 impl VestingCertificateRegistry {
     /// Register a completed vest in the certificate registry
     /// This should be called when a vault fully completes its vesting period

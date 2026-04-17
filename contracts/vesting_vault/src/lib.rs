@@ -3,7 +3,7 @@
 use soroban_sdk::{contract, contractimpl, Env, Address, Vec, Map, String, BytesN};
 
 mod storage;
-mod types;
+pub mod types;
 mod audit_exporter;
 mod emergency;
 

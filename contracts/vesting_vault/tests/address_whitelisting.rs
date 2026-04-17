@@ -1,12 +1,12 @@
 #![cfg(test)]
-use soroban_sdk::{Address, Env, Vec, IntoVal, Symbol};
-use soroban_sdk::testutils::Address as _;
+use soroban_sdk::{Address, Env, Vec, IntoVal, Symbol, Val, Error};
+use soroban_sdk::testutils::{Address as _, Ledger};
 use vesting_vault::{VestingVault, VestingVaultClient};
 
 fn setup() -> (Env, Address, VestingVaultClient<'static>) {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register_contract(None, VestingVault);
+    let contract_id = env.register(VestingVault, ());
     let client = VestingVaultClient::new(&env, &contract_id);
     (env, contract_id, client)
 }
@@ -30,19 +30,19 @@ fn test_address_whitelisting() {
     assert!(request.requested_address == hardware_wallet, "Requested address should match");
     
     // Test 2: Try to confirm before timelock (should fail)
-    // Assuming timelock is 172800
+    // Assuming timelock is 172800 (48 hours)
     env.ledger().set_timestamp(request.requested_at + 172800 - 1000);
     
-    let result = env.try_invoke_contract::<(), ()>(
+    let result = env.try_invoke_contract::<Val, Error>(
         &contract_id,
-        &Symbol::new(&env, "confirm_authorized_payout_address"),
+        &Symbol::new(&env, "confirm_auth_payout_addr"),
         (&beneficiary,).into_val(&env),
     );
     assert!(result.is_err(), "Should fail before timelock");
     
     // Test 3: Confirm after timelock
     env.ledger().set_timestamp(request.requested_at + 172800 + 1000);
-    client.confirm_authorized_payout_address(&beneficiary);
+    client.confirm_auth_payout_addr(&beneficiary);
     
     // Check authorized address
     let auth = client.get_authorized_payout_address(&beneficiary);
@@ -57,20 +57,4 @@ fn test_address_whitelisting() {
     client.remove_authorized_payout_address(&beneficiary);
     let auth_after = client.get_authorized_payout_address(&beneficiary);
     assert!(auth_after.is_none(), "Authorized address should be removed");
-}
-
-#[test]
-fn test_unauthorized_change_rejected() {
-    let (env, contract_id, client) = setup();
-    let beneficiary = Address::generate(&env);
-    let attacker = Address::generate(&env);
-    let attacker_address = Address::generate(&env);
-    
-    // Attacker tries to set address for beneficiary
-    // This should fail because set_authorized_payout_address requires beneficiary.require_auth()
-    // Since we mock_all_auths, it would normally pass IF we don't handle auth properly.
-    // But Soroban's mock_all_auths() will only work if the top-level call is authorized.
-    
-    // Actually, a better test for unauthorized change is to check if it FAILS when not mocked.
-    // But integration tests usually stay mocked.
 }

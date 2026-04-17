@@ -1,5 +1,5 @@
 use crate::{StakingContract, StakingContractClient};
-use soroban_sdk::{testutils::Address as _, token, Address, Env};
+use soroban_sdk::{testutils::Address as _, Address, Env};
 
 fn setup() -> (Env, Address, StakingContractClient<'static>, Address, Address) {
     let env = Env::default();
