@@ -7,7 +7,7 @@ use soroban_sdk::{
     Vec,
 };
 
-use vesting_contracts::{VestingContract, VestingContractClient, AdminAction, ScheduleConfig};
+use vesting_contracts::{VestingContract, VestingContractClient, AdminAction, ScheduleConfig, AssetAllocationEntry};
 
 #[contract]
 struct MultisigAccount;
@@ -142,7 +142,6 @@ fn create_vault_succeeds_with_multisig_admin_threshold_met() {
     env.ledger().set_sequence_number(1);
     env.ledger().set_timestamp(1_000);
 
-    // Use the contract's native multisig initializer: admins = [s1,s2,s3], quorum = 2
     let s1 = Address::generate(&env);
     let s2 = Address::generate(&env);
     let s3 = Address::generate(&env);
@@ -151,7 +150,6 @@ fn create_vault_succeeds_with_multisig_admin_threshold_met() {
     admins.push_back(s2.clone());
     admins.push_back(s3.clone());
 
-    // Vesting contract with multisig admins
     let vesting_id = env.register(VestingContract, ());
     let vesting = VestingContractClient::new(&env, &vesting_id);
     vesting.initialize_multisig(&admins, &2u32, &1_000_000i128);
@@ -164,31 +162,31 @@ fn create_vault_succeeds_with_multisig_admin_threshold_met() {
     let end = now + 1_000;
     let is_revocable = true;
     let is_transferable = false;
-    let step_duration = 0u64;
+    let token = Address::generate(&env);
 
-    // Build an AdminAction to add the beneficiary (ScheduleConfig) and propose it as s1,
-    // then have s2 sign it so quorum (2) is reached and the action executes.
     let cfg = ScheduleConfig {
         owner: beneficiary.clone(),
-        amount,
+        asset_basket: soroban_sdk::vec![&env, AssetAllocationEntry {
+            asset_id: token,
+            total_amount: amount,
+            released_amount: 0,
+            locked_amount: 0,
+            percentage: 10000,
+        }],
         start_time: start,
         end_time: end,
         keeper_fee,
         is_revocable,
         is_transferable,
-        step_duration,
     };
     let action = AdminAction::AddBeneficiary(beneficiary.clone(), cfg);
 
-    // For unit test simplicity, mock auths so signer.require_auth() succeeds for s1 and s2.
     env.mock_all_auths();
     let proposal_id = vesting.propose_admin_action(&s1, &action);
 
-    // Mock auths again for s2 and sign the proposal to reach quorum.
     env.mock_all_auths();
     vesting.sign_admin_proposal(&s2, &proposal_id);
 
-    // After signing quorum signatures, the proposal should have been executed; assert signatures == quorum.
     let sig_count = vesting.admin_proposal_signature_count(&proposal_id);
     assert_eq!(sig_count, 2u32);
 }
@@ -224,7 +222,6 @@ fn create_vault_panics_when_multisig_threshold_not_met() {
     let is_transferable = false;
     let step_duration = 0u64;
 
-    // Only one signer provided, but threshold is 2.
     let args: Vec<Val> = (
         beneficiary.clone(),
         amount,

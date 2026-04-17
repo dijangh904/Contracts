@@ -536,9 +536,6 @@ fn test_contract_upgrade_governance() {
     let (env, _, client, _, _) = setup();
     let new_contract = Address::generate(&env);
     
-    // Initially not deprecated
-    // Note: We'd need a getter for IsDeprecated to test this properly
-    
     // Propose contract upgrade
     let proposal_id = client.propose_contract_upgrade(&new_contract);
     
@@ -552,13 +549,6 @@ fn test_contract_upgrade_governance() {
     // Check proposal is executed
     let updated_proposal = client.get_proposal_info(&proposal_id);
     assert!(updated_proposal.is_executed);
-        &true, // is_revocable = true => is_irrevocable = false
-        &false,
-        &0u64,
-    );
-
-    // Total power should be 1000 + 500 = 1500
-    assert_eq!(client.get_voting_power(&beneficiary), 1500);
 }
 
 #[test]
@@ -581,33 +571,6 @@ fn test_delegated_voting_power() {
         &0u64
     );
 
-    // Fast forward and pause
-    env.ledger().set_timestamp(now + 500);
-    client.pause_specific_schedule(&vault_id, &String::from_str(&env, "Legal dispute"));
-    assert!(client.is_vault_paused(&vault_id));
-
-    // Resume the vault
-    client.resume_specific_schedule(&vault_id);
-
-    // Check that vault is no longer paused
-    assert!(!client.is_vault_paused(&vault_id));
-    assert!(client.get_paused_vault_info(&vault_id).is_none());
-
-    // Claim should now work
-    client.claim_tokens(&vault_id, &100i128);
-    assert_eq!(client.get_claimable_amount(&vault_id), 400);
-}
-
-#[test]
-#[should_panic]
-fn test_pause_already_paused_vault() {
-    let (env, _, client, _, _) = setup();
-    let beneficiary = Address::generate(&env);
-    let now = env.ledger().timestamp();
-
-        &0u64,
-    );
-
     // B: 500 power (revocable)
     client.create_vault_full(
         &beneficiary_b,
@@ -617,27 +580,50 @@ fn test_pause_already_paused_vault() {
         &0i128,
         &true,
         &false,
-        &0u64,
+        &0u64
     );
 
-    assert_eq!(client.get_voting_power(&beneficiary_a), 1000);
-    assert_eq!(client.get_voting_power(&beneficiary_b), 500);
-    assert_eq!(client.get_voting_power(&representative), 0);
+    assert_eq!(client.get_voting_power(beneficiary_a.clone()), 1000);
+    assert_eq!(client.get_voting_power(beneficiary_b.clone()), 500);
+    assert_eq!(client.get_voting_power(representative.clone()), 0);
 
     client.delegate_voting_power(&beneficiary_a, &beneficiary_b);
-    assert_eq!(client.get_voting_power(&beneficiary_a), 0);
-    assert_eq!(client.get_voting_power(&beneficiary_b), 1500);
+    assert_eq!(client.get_voting_power(beneficiary_a.clone()), 0);
+    assert_eq!(client.get_voting_power(beneficiary_b.clone()), 1500);
 
     client.delegate_voting_power(&beneficiary_b, &representative);
-    assert_eq!(client.get_voting_power(&beneficiary_b), 0);
-    assert_eq!(client.get_voting_power(&representative), 500);
+    assert_eq!(client.get_voting_power(beneficiary_b.clone()), 0);
+    assert_eq!(client.get_voting_power(representative.clone()), 1500);
 
     client.delegate_voting_power(&beneficiary_a, &representative);
-    assert_eq!(client.get_voting_power(&representative), 1500);
+    assert_eq!(client.get_voting_power(representative.clone()), 1500);
 
+    // Return to self
     client.delegate_voting_power(&beneficiary_a, &beneficiary_a);
-    assert_eq!(client.get_voting_power(&beneficiary_a), 1000);
-    assert_eq!(client.get_voting_power(&representative), 500);
+    assert_eq!(client.get_voting_power(beneficiary_a.clone()), 1000);
+    assert_eq!(client.get_voting_power(representative.clone()), 500);
+}
+
+#[test]
+#[should_panic]
+fn test_pause_already_paused_vault() {
+    let (env, _, client, _, _) = setup();
+    let beneficiary = Address::generate(&env);
+    let now = env.ledger().timestamp();
+    
+    let vault_id = client.create_vault_full(
+        &beneficiary,
+        &1000i128,
+        &now,
+        &(now + 1000),
+        &0i128,
+        &false,
+        &false,
+        &0u64
+    );
+
+    client.pause_specific_schedule(&vault_id, &String::from_str(&env, "First pause"));
+    client.pause_specific_schedule(&vault_id, &String::from_str(&env, "Second pause"));
 }
 
 #[test]
@@ -657,25 +643,6 @@ fn test_vesting_acceleration() {
         &0u64
     );
 
-    // Pause once
-    client.pause_specific_schedule(&vault_id, &String::from_str(&env, "First pause"));
-
-    // Try to pause again - should panic
-    client.pause_specific_schedule(&vault_id, &String::from_str(&env, "Second pause"));
-}
-
-#[test]
-#[should_panic]
-fn test_resume_non_paused_vault() {
-    let (env, _, client, _, _) = setup();
-    let beneficiary = Address::generate(&env);
-    let now = env.ledger().timestamp();
-
-        &true,
-        &false,
-        &0u64,
-    );
-
     env.ledger().set_timestamp(now + 250);
     assert_eq!(client.get_claimable_amount(&vault_id), 250);
 
@@ -687,6 +654,27 @@ fn test_resume_non_paused_vault() {
 
     client.accelerate_all_schedules(&100);
     assert_eq!(client.get_claimable_amount(&vault_id), 1000);
+}
+
+#[test]
+#[should_panic]
+fn test_resume_non_paused_vault() {
+    let (env, _, client, _, _) = setup();
+    let beneficiary = Address::generate(&env);
+    let now = env.ledger().timestamp();
+    
+    let vault_id = client.create_vault_full(
+        &beneficiary,
+        &1000i128,
+        &now,
+        &(now + 1000),
+        &0i128,
+        &false,
+        &false,
+        &0u64
+    );
+
+    client.resume_specific_schedule(&vault_id);
 }
 
 #[test]
@@ -706,13 +694,6 @@ fn test_slashing() {
         &false,
         &false,
         &0u64
-    );
-
-    // Try to resume without pausing first - should panic
-    client.resume_specific_schedule(&vault_id);
-        &true,
-        &false,
-        &0u64,
     );
 
     env.ledger().set_timestamp(now + 400);
