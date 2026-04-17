@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, contractevent, Address, Vec, Map, String, BytesN};
+use soroban_sdk::{contracttype, contractevent, Address, Vec, Map, String, BytesN, Bytes};
 
 #[contracttype]
 #[derive(Clone)]
@@ -29,14 +29,18 @@ pub struct AddressWhitelistRequest {
 }
 
 #[contractevent]
+#[derive(Clone)]
 pub struct AuthorizedAddressSet {
+    #[topic]
     pub beneficiary: Address,
     pub authorized_address: Address,
     pub effective_at: u64,
 }
 
 #[contractevent]
+#[derive(Clone)]
 pub struct AddressWhitelistRequested {
+    #[topic]
     pub beneficiary: Address,
     pub requested_address: Address,
     pub requested_at: u64,
@@ -61,7 +65,9 @@ pub struct MilestoneStatus {
 }
 
 #[contractevent]
+#[derive(Clone)]
 pub struct MilestoneCompleted {
+    #[topic]
     pub vesting_id: u32,
     pub milestone_number: u32,
     pub completed_at: u64,
@@ -89,7 +95,9 @@ pub struct ReputationBonus {
 }
 
 #[contractevent]
+#[derive(Clone)]
 pub struct ReputationBonusApplied {
+    #[topic]
     pub beneficiary: Address,
     pub cliff_reduction_months: u32,
     pub applied_at: u64,
@@ -118,7 +126,7 @@ pub struct ZKClaimProof {
     pub commitment_hash: BytesN<32>,
     pub nullifier_hash: BytesN<32>,
     pub merkle_root: BytesN<32>,
-    pub proof_data: Vec<u8>, // Placeholder for actual ZK-SNARK proof
+    pub proof_data: Bytes, // Placeholder for actual ZK-SNARK proof
 }
 
 #[contracttype]
@@ -132,15 +140,20 @@ pub struct PrivacyClaimEvent {
 }
 
 #[contractevent]
+#[derive(Clone)]
 pub struct CommitmentCreated {
+    #[topic]
     pub commitment_hash: BytesN<32>,
+    #[topic]
     pub vesting_id: u32,
     pub amount: i128,
     pub created_at: u64,
 }
 
 #[contractevent]
+#[derive(Clone)]
 pub struct PrivateClaimExecuted {
+    #[topic]
     pub nullifier_hash: BytesN<32>,
     pub amount: i128,
     pub timestamp: u64,
@@ -178,3 +191,31 @@ pub struct PathPaymentSimulation {
     pub reason: String,
     pub estimated_gas_fee: u64,
 }
+#[contractevent]
+#[derive(Clone)]
+pub struct PathPaymentConfigured {
+    pub destination_asset: Address,
+    pub min_destination_amount: i128,
+    pub path: Vec<Address>,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct PathPaymentDisabled {
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct PathPaymentClaimExecuted {
+    #[topic]
+    pub user: Address,
+    pub source_amount: i128,
+    pub destination_amount: i128,
+    pub destination_asset: Address,
+    pub timestamp: u64,
+    #[topic]
+    pub vesting_id: u32,
+}
+

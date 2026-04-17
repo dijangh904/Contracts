@@ -7,9 +7,9 @@ mod types;
 mod audit_exporter;
 mod emergency;
 
-use types::{ClaimEvent, AddressWhitelistRequest, AuthorizedPayoutAddress, MilestoneConfig, ClaimSimulation, Nullifier, Commitment, ZKClaimProof, PrivacyClaimEvent, CommitmentCreated, PrivateClaimExecuted, PathPaymentConfig, PathPaymentClaimEvent, PathPaymentSimulation};
+use types::*;
 use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event};
-use emergency::{AuditorPauseRequest, EmergencyPause};
+use emergency::{AuditorPauseRequest, EmergencyPause, EmergencyPauseTriggered, EmergencyPauseLifted};
 
 #[contract]
 pub struct VestingVault;
@@ -92,10 +92,7 @@ impl VestingVault {
         storage_set_pending_address_request(&e, &beneficiary, &request);
 
         // Emit event
-        e.events().publish(
-            ("AddressWhitelistRequested", (), ()),
-            (beneficiary.clone(), authorized_address.clone(), current_time, effective_at),
-        );
+        AddressWhitelistRequested { beneficiary: beneficiary.clone(), requested_address: authorized_address, requested_at: current_time, effective_at }.publish(&e);
     }
 
     /// Confirms and activates a pending authorized payout address request
@@ -130,10 +127,7 @@ impl VestingVault {
         storage_remove_pending_address_request(&e, &beneficiary);
 
         // Emit confirmation event
-        e.events().publish(
-            ("AuthorizedAddressSet", (), ()),
-            (beneficiary.clone(), pending_request.requested_address.clone(), pending_request.effective_at),
-        );
+        AuthorizedAddressSet { beneficiary: beneficiary.clone(), authorized_address: pending_request.requested_address, effective_at: pending_request.effective_at }.publish(&e);
     }
 
     /// Gets the current authorized payout address for a beneficiary
@@ -239,10 +233,7 @@ impl VestingVault {
         set_auditor_pause_requests(e, &Map::new(e));
         
         // Emit event
-        e.events().publish(
-            ("EmergencyPauseTriggered", (), ()),
-            (auditors.clone(), current_time, current_time + pause_duration, reason.clone()),
-        );
+        EmergencyPauseTriggered { auditors: auditors.clone(), paused_at: current_time, expires_at: current_time + pause_duration, reason: reason.clone() }.publish(e);
     }
 
     /// Check if contract is currently paused
@@ -349,10 +340,7 @@ impl VestingVault {
             set_reputation_bonus_applied(&e, &beneficiary);
             
             // Emit event
-            e.events().publish(
-                ("ReputationBonusApplied", (), ()),
-                (beneficiary.clone(), cliff_reduction, current_time),
-            );
+            ReputationBonusApplied { beneficiary: beneficiary.clone(), cliff_reduction_months: cliff_reduction, applied_at: current_time }.publish(&e);
         }
     }
 
@@ -409,10 +397,7 @@ impl VestingVault {
         set_milestone_status(&e, vesting_id, &status);
         
         // Emit event
-        e.events().publish(
-            ("MilestoneCompleted", (), ()),
-            (vesting_id, milestone_number, e.ledger().timestamp()),
-        );
+        MilestoneCompleted { vesting_id, milestone_number, completed_at: e.ledger().timestamp() }.publish(&e);
     }
 
     /// Get milestone status for a vesting schedule
@@ -441,7 +426,7 @@ impl VestingVault {
         
         // Create the commitment
         let commitment = Commitment {
-            hash: commitment_hash,
+            hash: commitment_hash.clone(),
             created_at: current_time,
             vesting_id,
             amount,
@@ -449,13 +434,10 @@ impl VestingVault {
         };
         
         // Store the commitment
-        set_commitment(&e, &commitment_hash, &commitment);
+        set_commitment(&e, &commitment_hash.clone(), &commitment);
         
         // Emit event
-        e.events().publish(
-            ("CommitmentCreated", (), ()),
-            (commitment_hash, vesting_id, amount, current_time),
-        );
+        CommitmentCreated { commitment_hash, vesting_id, amount, created_at: current_time }.publish(&e);
     }
     
     /// Execute a private claim using ZK proof
@@ -524,10 +506,7 @@ impl VestingVault {
         add_privacy_claim_event(&e, &privacy_event);
         
         // Emit event
-        e.events().publish(
-            ("PrivateClaimExecuted", (), ()),
-            (nullifier.hash, amount, current_time),
-        );
+        PrivateClaimExecuted { nullifier_hash: nullifier.hash, amount, timestamp: current_time }.publish(&e);
         
         // TODO: Execute actual token transfer
         // This would integrate with the existing vesting logic
@@ -612,10 +591,7 @@ impl VestingVault {
         set_path_payment_config(&e, &config);
         
         // Emit configuration event
-        e.events().publish(
-            ("PathPaymentConfigured", (), ()),
-            (destination_asset, min_destination_amount, path, e.ledger().timestamp()),
-        );
+        PathPaymentConfigured { destination_asset, min_destination_amount, path, timestamp: e.ledger().timestamp() }.publish(&e);
     }
     
     /// Disable path payment feature
@@ -627,10 +603,7 @@ impl VestingVault {
             set_path_payment_config(&e, &config);
             
             // Emit disable event
-            e.events().publish(
-                ("PathPaymentDisabled", (), ()),
-                (e.ledger().timestamp(),),
-            );
+            PathPaymentDisabled { timestamp: e.ledger().timestamp() }.publish(&e);
         }
     }
     
@@ -705,10 +678,7 @@ impl VestingVault {
         set_claim_history(&e, &history);
         
         // Emit the path payment claim event
-        e.events().publish(
-            ("PathPaymentClaimExecuted", (), ()),
-            (user.clone(), actual_claimable_amount, destination_amount, config.destination_asset.clone(), current_time, vesting_id),
-        );
+        PathPaymentClaimExecuted { user: user.clone(), source_amount: actual_claimable_amount, destination_amount, destination_asset: config.destination_asset.clone(), timestamp: current_time, vesting_id }.publish(&e);
     }
     
     /// Simulate a path payment claim to show expected amounts without consuming gas

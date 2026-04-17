@@ -1,4 +1,5 @@
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, symbol_short};
+#![no_std]
+use soroban_sdk::{contract, contractimpl, contracttype, contractevent, Address, Env, String, symbol_short};
 
 mod vesting_contract {
     soroban_sdk::contractimport!(
@@ -46,10 +47,7 @@ impl VestingStatusNFT {
         env.storage().instance().set(&DataKey::UserBadge(user.clone()), &true);
         
         // Emit event for minting
-        env.events().publish(
-            (symbol_short!("mint"),),
-            MintEvent { user }
-        );
+        MintEvent { user }.publish(&env);
     }
 
     pub fn get_level(env: Env, user: Address) -> u32 {

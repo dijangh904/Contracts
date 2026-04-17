@@ -46,6 +46,7 @@ pub struct StakeRecord {
 #[contractevent]
 #[derive(Clone)]
 pub struct StakedEvent {
+    #[topic]
     pub vault_id: u64,
     pub beneficiary: Address,
     pub amount: i128,
@@ -54,6 +55,7 @@ pub struct StakedEvent {
 #[contractevent]
 #[derive(Clone)]
 pub struct UnstakedEvent {
+    #[topic]
     pub vault_id: u64,
     pub beneficiary: Address,
     pub amount: i128,
@@ -62,6 +64,7 @@ pub struct UnstakedEvent {
 #[contractevent]
 #[derive(Clone)]
 pub struct SlashedEvent {
+    #[topic]
     pub vault_id: u64,
     pub beneficiary: Address,
     pub amount: i128,
@@ -124,10 +127,7 @@ impl StakingContract {
             is_active: true,
         };
         env.storage().instance().set(&key, &record);
-        env.events().publish(
-            (Symbol::new(&env, "staked"),),
-            StakedEvent { vault_id, beneficiary, amount },
-        );
+        StakedEvent { vault_id, beneficiary, amount }.publish(&env);
     }
 
     /// Remove the stake record for `beneficiary`/`vault_id`.
@@ -148,10 +148,7 @@ impl StakingContract {
         }
         record.is_active = false;
         env.storage().instance().set(&key, &record);
-        env.events().publish(
-            (Symbol::new(&env, "unstaked"),),
-            UnstakedEvent { vault_id, beneficiary, amount: record.amount },
-        );
+        UnstakedEvent { vault_id, beneficiary, amount: record.amount }.publish(&env);
     }
 
     /// Return the pending yield for `beneficiary`/`vault_id` without resetting.
@@ -220,10 +217,7 @@ impl StakingContract {
         }
         record.amount -= amount;
         env.storage().instance().set(&key, &record);
-        env.events().publish(
-            (Symbol::new(&env, "slash_stake"),),
-            SlashedEvent { vault_id, beneficiary, amount },
-        );
+        SlashedEvent { vault_id, beneficiary, amount }.publish(&env);
     }
 
     /// Return the stake record for inspection.

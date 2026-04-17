@@ -25,6 +25,7 @@ pub struct EmergencyPause {
 }
 
 #[contractevent]
+#[derive(Clone)]
 pub struct EmergencyPauseTriggered {
     pub auditors: Vec<Address>,
     pub paused_at: u64,
@@ -33,6 +34,7 @@ pub struct EmergencyPauseTriggered {
 }
 
 #[contractevent]
+#[derive(Clone)]
 pub struct EmergencyPauseLifted {
     pub lifted_at: u64,
 }
