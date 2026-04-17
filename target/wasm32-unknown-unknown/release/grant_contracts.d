@@ -1,1 +1,1 @@
-/home/abujulaybeeb/Documents/Drips/Contracts/target/wasm32-unknown-unknown/release/grant_contracts.wasm: /home/abujulaybeeb/Documents/Drips/Contracts/contracts/grant_contracts/src/lib.rs /home/abujulaybeeb/Documents/Drips/Contracts/contracts/grant_contracts/src/test.rs
+C:\Users\dell\Contracts\target\wasm32-unknown-unknown\release\grant_contracts.wasm: C:\Users\dell\Contracts\contracts\grant_contracts\src\lib.rs C:\Users\dell\Contracts\contracts\grant_contracts\src\test.rs

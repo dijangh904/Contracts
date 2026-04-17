@@ -16,8 +16,8 @@ pub enum DataKey {
 }
 
 #[contractevent]
-#[derive(Clone)]
 pub struct MintEvent {
+    #[topic]
     pub user: Address,
 }
 

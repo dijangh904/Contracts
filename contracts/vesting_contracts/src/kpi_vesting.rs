@@ -2,7 +2,7 @@
 // Plugs into VestingContract::claim_tokens as an additional guard.
 // All token math stays in lib.rs — this module only enforces the KPI gate.
 
-use soroban_sdk::{symbol_short, Address, Env, Symbol};
+use soroban_sdk::{contractevent, symbol_short, Address, Env, Symbol};
 use crate::kpi_engine::{
     get_kpi_config, is_kpi_met, set_kpi_config, get_kpi_log,
     verify_kpi, KpiOracleConfig, KpiVerificationRecord,
@@ -51,10 +51,19 @@ pub fn attach_kpi_gate(
 
     set_kpi_config(env, vault_id, &config);
 
-    env.events().publish(
-        (symbol_short!("KpiSet"), vault_id),
-        (threshold, env.ledger().timestamp()),
-    );
+    KpiSetEvent {
+        vault_id,
+        threshold,
+        timestamp: env.ledger().timestamp(),
+    }.publish(env);
+}
+
+#[contractevent]
+pub struct KpiSetEvent {
+    #[topic]
+    pub vault_id: u64,
+    pub threshold: i128,
+    pub timestamp: u64,
 }
 
 /// Gate check inserted at the top of claim_tokens / claim_tokens_diversified.

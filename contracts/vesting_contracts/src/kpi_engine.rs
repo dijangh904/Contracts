@@ -1,7 +1,7 @@
 // Issue #145 / #92 — Oracle-Verified KPI Vesting Triggers
 // KPI Engine: stores config, verifies oracle values, flips idempotent flag.
 
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Vec};
+use soroban_sdk::{contracttype, contractevent, symbol_short, Address, Env, Symbol, Vec};
 use crate::oracle::ComparisonOperator;
 
 // ── Storage key symbols ───────────────────────────────────────────────────
@@ -178,11 +178,22 @@ pub fn verify_kpi(env: &Env, vault_id: u64, caller: &Address) -> bool {
         );
 
         // Emit event for indexers / front-end alerts.
-        env.events().publish(
-            (symbol_short!("KpiMet"), vault_id),
-            (live_value, config.threshold, env.ledger().timestamp()),
-        );
+        KpiMetEvent {
+            vault_id,
+            live_value,
+            threshold: config.threshold,
+            timestamp: env.ledger().timestamp(),
+        }.publish(env);
     }
 
     condition_met
+}
+
+#[contractevent]
+pub struct KpiMetEvent {
+    #[topic]
+    pub vault_id: u64,
+    pub live_value: i128,
+    pub threshold: i128,
+    pub timestamp: u64,
 }
