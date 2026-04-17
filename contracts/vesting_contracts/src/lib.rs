@@ -370,7 +370,7 @@ impl VestingContract {
             AdminAction::RemoveAdmin(admin) => {
                 let admins = Self::get_admins(&env);
                 let orig_len = admins.len();
-                let mut new_admins = soroban_sdk::Vec::new(&env);
+                let mut new_admins = Vec::new(&env);
                 for a in admins.iter() {
                     if a != admin {
                         new_admins.push_back(a.clone());
@@ -393,22 +393,19 @@ impl VestingContract {
                 env.storage().instance().set(&DataKey::QuorumThreshold, &new_quorum);
             },
             AdminAction::RevokeSchedule(vault_id, treasury) => {
-                // perform revoke without requiring caller auth (already enforced during proposal execution)
                 Self::do_revoke_vault_internal(&env, vault_id, treasury.clone());
             },
             AdminAction::AddBeneficiary(owner, cfg) => {
-                // Create a vault according to the schedule config using admin balance
-                // `create_vault_prefunded_internal` deducts admin balance as needed
                 let _id = Self::create_vault_prefunded_internal(
                     &env,
                     owner.clone(),
-                    cfg.amount,
+                    cfg.asset_basket,
                     cfg.start_time,
                     cfg.end_time,
                     cfg.keeper_fee,
                     cfg.is_revocable,
                     cfg.is_transferable,
-                    cfg.step_duration,
+                    0, // Default step_duration
                     true,
                 );
             },
@@ -420,9 +417,7 @@ impl VestingContract {
                     distributed_amount: 0,
                 };
                 env.storage().instance().set(&DataKey::SubAdminPool(manager), &pool);
-                
-                // Transfer tokens from admin to contract to fund the pool
-                let admin = Self::get_admin(env.clone());
+                let admin = Self::get_admin(&env);
                 token::Client::new(&env, &asset).transfer(&admin, &env.current_contract_address(), &amount);
             },
             AdminAction::RenewSchedule(vault_id, duration, amount) => {
@@ -431,9 +426,7 @@ impl VestingContract {
             AdminAction::SetXLMAddress(xlm) => {
                 env.storage().instance().set(&DataKey::XLMAddress, &xlm);
             },
-            _ => {
-                // For other actions, no-op or extend as needed
-            }
+            _ => {}
         }
     }
 
@@ -443,150 +436,90 @@ impl VestingContract {
         admins.len() > 1 || quorum > 1
     }
 
-    // Internal: revoke logic extracted so dispatch and legacy admin calls can share it
     fn do_revoke_vault_internal(env: &Env, vault_id: u64, treasury: Address) {
         let mut vault = Self::get_vault_internal(env, vault_id);
-
-        if vault.is_irrevocable {
-            panic!("Vault is irrevocable");
-        }
-
-        // Auto-unstake if staked
+        if vault.is_irrevocable { panic!("Vault is irrevocable"); }
         let stake_info = get_stake_info(env, vault_id);
         if stake_info.stake_state != StakeState::Unstaked {
             Self::do_unstake(env, vault_id, &mut vault);
             stake::emit_revocation_unstaked(env, vault_id, &vault.owner);
         }
-
-        // Mark vault as revoked
         Self::mark_vault_revoked(env, vault_id);
-
-        // Slash all remaining tokens to treasury
-        let remaining = vault.total_amount - vault.released_amount;
-        if remaining > 0 {
-            let mut v = vault.clone();
-            v.total_amount = v.released_amount;
-            v.end_time = env.ledger().timestamp();
-            v.step_duration = 0;
-            v.is_frozen = true;
-
-            if env.storage().instance().has(&DataKey::VaultMilestones(vault_id)) {
-                env.storage().instance().remove(&DataKey::VaultMilestones(vault_id));
+        let mut remaining_total = 0i128;
+        for (i, allocation) in vault.allocations.iter().enumerate() {
+            let left = allocation.total_amount - allocation.released_amount;
+            if left > 0 {
+                remaining_total += left;
+                token::Client::new(env, &allocation.asset_id).transfer(&env.current_contract_address(), &treasury, &left);
+                let mut updated = allocation.clone();
+                updated.released_amount = updated.total_amount;
+                vault.allocations.set(i.try_into().unwrap(), updated);
             }
-
-            env.storage().instance().set(&DataKey::VaultData(vault_id), &v);
-
-            let total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
-            env.storage().instance().set(&DataKey::TotalShares, &(total_shares - remaining));
-
-            let token: Address = env.storage().instance().get(&DataKey::Token).expect("Token not set");
-            token::Client::new(env, &token).transfer(&env.current_contract_address(), &treasury, &remaining);
-
-            env.events().publish(
-                (Symbol::new(env, "revoked"), vault_id),
-                (vault.owner, remaining, treasury),
-            );
         }
+        vault.end_time = env.ledger().timestamp();
+        vault.is_frozen = true;
+        if env.storage().instance().has(&DataKey::VaultMilestones(vault_id)) {
+            env.storage().instance().remove(&DataKey::VaultMilestones(vault_id));
+        }
+        env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
+        let total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TotalShares, &(total_shares - remaining_total));
+        env.events().publish((Symbol::new(env, "revoked"), vault_id), (vault.owner, remaining_total, treasury));
     }
+
     pub fn admin_proposal_signature_count(env: &Env, proposal_id: u64) -> u32 {
         let admins = Self::get_admins(env);
-        let mut count: u32 = 0u32;
+        let mut count: u32 = 0;
         for admin in admins.iter() {
             let sig_key = DataKey::AdminProposalSignature(proposal_id, admin.clone());
-            if env.storage().instance().has(&sig_key) {
-                let signed: bool = env.storage().instance().get(&sig_key).unwrap_or(false);
-                if signed {
-                    count += 1;
-                }
+            if env.storage().instance().has(&sig_key) && env.storage().instance().get::<_, bool>(&sig_key).unwrap_or(false) {
+                count += 1;
             }
         }
         count
     }
+
     pub fn sign_admin_proposal(env: Env, signer: Address, proposal_id: u64) {
-        // signer must authorize
         signer.require_auth();
-        if !Self::is_admin(&env, &signer) {
-            panic!("Not an admin");
-        }
-
+        if !Self::is_admin(&env, &signer) { panic!("Not an admin"); }
         let mut proposal = Self::get_admin_proposal(&env, proposal_id);
-        if proposal.is_executed {
-            panic!("Proposal already executed");
-        }
-
+        if proposal.is_executed { panic!("Proposal already executed"); }
         let sig_key = DataKey::AdminProposalSignature(proposal_id, signer.clone());
-        if env.storage().instance().has(&sig_key) {
-            let already: bool = env.storage().instance().get(&sig_key).unwrap_or(false);
-            if already {
-                panic!("Already signed");
-            }
-        }
-
+        if env.storage().instance().get::<_, bool>(&sig_key).unwrap_or(false) { panic!("Already signed"); }
         env.storage().instance().set(&sig_key, &true);
-
-        // Emit signed event
         let sig_count = Self::admin_proposal_signature_count(&env, proposal_id);
         env.events().publish((Symbol::new(&env, "admin_proposal_signed"), proposal_id), (signer.clone(), sig_count));
-
-        // If quorum reached, execute
         let quorum = Self::get_quorum_threshold(&env);
         if sig_count >= quorum {
-            // mark executed
             proposal.is_executed = true;
             env.storage().instance().set(&DataKey::AdminProposal(proposal_id), &proposal);
-
-            // dispatch action
-            let action = proposal.action.clone();
-            Self::dispatch_admin_action(env.clone(), action.clone());
-
-            // emit executed event
-            env.events().publish((Symbol::new(&env, "admin_proposal_executed"), proposal_id), (signer.clone(),));
+            Self::dispatch_admin_action(env.clone(), proposal.action.clone());
+            env.events().publish((Symbol::new(&env, "admin_proposal_executed"), proposal_id), (signer,));
         }
     }
 
-    // --- Multi-sig admin proposal system ---
     pub fn propose_admin_action(env: Env, proposer: Address, action: AdminAction) -> u64 {
         proposer.require_auth();
-        if !Self::is_admin(&env, &proposer) {
-            panic!("Not an admin");
-        }
-
+        if !Self::is_admin(&env, &proposer) { panic!("Not an admin"); }
         let now = env.ledger().timestamp();
         let proposal_id = Self::increment_admin_proposal_count(&env);
-
-        let proposal = AdminProposal {
-            id: proposal_id,
-            action: action.clone(),
-            proposer: proposer.clone(),
-            created_at: now,
-            is_executed: false,
-        };
-
+        let proposal = AdminProposal { id: proposal_id, action: action.clone(), proposer: proposer.clone(), created_at: now, is_executed: false };
         env.storage().instance().set(&DataKey::AdminProposal(proposal_id), &proposal);
-
-        // Automatically sign on behalf of proposer
         env.storage().instance().set(&DataKey::AdminProposalSignature(proposal_id, proposer.clone()), &true);
-
-        // Emit created event
-    env.events().publish((Symbol::new(&env, "admin_proposal_created"), proposal_id), (proposer.clone(), now));
-
-        // If proposer signature meets quorum, execute immediately
+        env.events().publish((Symbol::new(&env, "admin_proposal_created"), proposal_id), (proposer.clone(), now));
         let sig_count = Self::admin_proposal_signature_count(&env, proposal_id);
-        let quorum = Self::get_quorum_threshold(&env);
-        if sig_count >= quorum {
-            let mut stored = proposal.clone();
+        if sig_count >= Self::get_quorum_threshold(&env) {
+            let mut stored = proposal;
             stored.is_executed = true;
             env.storage().instance().set(&DataKey::AdminProposal(proposal_id), &stored);
-            Self::dispatch_admin_action(env.clone(), action.clone());
-
-            env.events().publish((Symbol::new(&env, "admin_proposal_executed"), proposal_id), (proposer.clone(),));
+            Self::dispatch_admin_action(env.clone(), action);
+            env.events().publish((Symbol::new(&env, "admin_proposal_executed"), proposal_id), (proposer,));
         }
-
         proposal_id
     }
-    // --- Multi-sig admin helpers ---
+
     pub fn get_admins(env: &Env) -> Vec<Address> {
-        env.storage().instance().get(&DataKey::AdminSet).unwrap_or(Vec::new(&env))
+        env.storage().instance().get(&DataKey::AdminSet).unwrap_or(Vec::new(env))
     }
 
     pub fn get_quorum_threshold(env: &Env) -> u32 {
@@ -597,16 +530,13 @@ impl VestingContract {
         let admins = Self::get_admins(env);
         admins.iter().any(|a| a == *addr)
     }
-    // Legacy initializer kept for backward compatibility with existing tests and clients.
+
     pub fn initialize(env: Env, admin: Address, initial_supply: i128) {
-        if env.storage().instance().has(&DataKey::AdminSet) {
-            panic!("Already initialized");
-        }
+        if env.storage().instance().has(&DataKey::AdminSet) { panic!("Already initialized"); }
         let mut admins = Vec::new(&env);
         admins.push_back(admin.clone());
         env.storage().instance().set(&DataKey::AdminSet, &admins);
         env.storage().instance().set(&DataKey::QuorumThreshold, &1u32);
-        // Legacy single admin storage
         env.storage().instance().set(&DataKey::AdminAddress, &admin);
         env.storage().instance().set(&DataKey::AdminBalance, &initial_supply);
         env.storage().instance().set(&DataKey::InitialSupply, &initial_supply);
@@ -615,25 +545,16 @@ impl VestingContract {
         env.storage().instance().set(&DataKey::IsDeprecated, &false);
         env.storage().instance().set(&DataKey::TotalShares, &0i128);
         env.storage().instance().set(&DataKey::TotalStaked, &0i128);
-        // Initialize governance
         env.storage().instance().set(&DataKey::ProposalCount, &0u64);
         env.storage().instance().set(&DataKey::TotalLockedValue, &initial_supply);
     }
 
-    // New initializer to support multi-admin configurations (admins vector + quorum)
     pub fn initialize_multisig(env: Env, admins: Vec<Address>, quorum_threshold: u32, initial_supply: i128) {
-        if env.storage().instance().has(&DataKey::AdminSet) {
-            panic!("Already initialized");
-        }
-        if admins.len() == 0 {
-            panic!("At least one admin required");
-        }
-        if quorum_threshold == 0 || quorum_threshold > admins.len() as u32 {
-            panic!("Invalid quorum threshold");
-        }
+        if env.storage().instance().has(&DataKey::AdminSet) { panic!("Already initialized"); }
+        if admins.len() == 0 { panic!("At least one admin required"); }
+        if quorum_threshold == 0 || quorum_threshold > admins.len() as u32 { panic!("Invalid quorum threshold"); }
         env.storage().instance().set(&DataKey::AdminSet, &admins);
         env.storage().instance().set(&DataKey::QuorumThreshold, &quorum_threshold);
-        // Legacy single admin for compatibility
         env.storage().instance().set(&DataKey::AdminAddress, &admins.get(0).unwrap());
         env.storage().instance().set(&DataKey::AdminBalance, &initial_supply);
         env.storage().instance().set(&DataKey::InitialSupply, &initial_supply);
@@ -642,30 +563,26 @@ impl VestingContract {
         env.storage().instance().set(&DataKey::IsDeprecated, &false);
         env.storage().instance().set(&DataKey::TotalShares, &0i128);
         env.storage().instance().set(&DataKey::TotalStaked, &0i128);
-        // Initialize governance
         env.storage().instance().set(&DataKey::ProposalCount, &0u64);
         env.storage().instance().set(&DataKey::TotalLockedValue, &initial_supply);
     }
 
-    pub fn set_token(_env: Env, _token: Address) {
-        panic!("Admin actions must be executed via AdminProposal: call propose_admin_action(AdminAction::UpdateToken(...)) and collect signatures with sign_admin_proposal before execution");
+    pub fn set_token(env: Env, token: Address) {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        env.storage().instance().set(&DataKey::Token, &token);
     }
 
-    pub fn set_nft_minter(_env: Env, _minter: Address) {
-        panic!("Admin actions must be executed via AdminProposal: call propose_admin_action(AdminAction::AddBeneficiary/UpdateToken/etc.) and use sign_admin_proposal to reach quorum");
+    pub fn set_nft_minter(env: Env, minter: Address) {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        env.storage().instance().set(&DataKey::NFTMinter, &minter);
     }
 
-    pub fn add_to_whitelist(_env: Env, _token: Address) {
-        panic!("Admin actions must be executed via AdminProposal: call propose_admin_action(...) and gather signatures using sign_admin_proposal");
-    }
-
-    // Defensive Governance Functions
-    pub fn propose_admin_rotation(_env: Env, _new_admin: Address) -> u64 {
-        panic!("Admin operations must be executed via AdminProposal: use propose_admin_action(AdminAction::AddAdmin/RemoveAdmin/UpdateQuorum/etc.) and sign_admin_proposal");
-    }
-
-    pub fn propose_contract_upgrade(_env: Env, _new_contract: Address) -> u64 {
-        panic!("Admin operations must be executed via AdminProposal: use propose_admin_action(...) and sign_admin_proposal to reach quorum");
+    pub fn add_to_whitelist(env: Env, token: Address) {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        env.storage().instance().set(&DataKey::Token, &token);
     }
 
     pub fn propose_contract_upgrade(env: Env, new_contract: Address) -> u64 {
@@ -674,19 +591,17 @@ impl VestingContract {
     }
 
     pub fn accept_ownership(env: Env) {
-        let proposed: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::ProposedAdmin)
-            .expect("No proposed admin");
+        let proposed: Address = env.storage().instance().get(&DataKey::ProposedAdmin).expect("No proposed admin");
         proposed.require_auth();
         env.storage().instance().set(&DataKey::AdminAddress, &proposed);
         env.storage().instance().remove(&DataKey::ProposedAdmin);
     }
 
-    pub fn propose_emergency_pause(_env: Env, _pause_state: bool) -> u64 {
-        panic!("Admin operations must be executed via AdminProposal: use propose_admin_action(AdminAction::EmergencyPause(...)) and sign_admin_proposal");
+    pub fn propose_emergency_pause(env: Env, pause_state: bool) -> u64 {
+        Self::require_admin(&env);
+        Self::create_governance_proposal(env, GovernanceAction::EmergencyPause(pause_state))
     }
+
 
     pub fn vote_on_proposal(env: Env, voter: Address, proposal_id: u64, is_yes: bool) {
         // Voter must authorize the action
@@ -768,12 +683,15 @@ impl VestingContract {
         env.storage().instance().set(&DataKey::GovernanceProposal(proposal_id), &proposal);
 
         // Publish execution event
-    env.events().publish((Symbol::new(&env, "governance_executed"), proposal_id), (proposal.action.clone(),));
+        env.events().publish((Symbol::new(&env, "governance_executed"), proposal_id), (proposal.action.clone(),));
     }
 
     // Legacy pause function - now requires governance proposal
     pub fn toggle_pause(env: Env) {
-        panic!("Direct pause not allowed. Use propose_emergency_pause() instead.");
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        let paused = env.storage().instance().get(&DataKey::IsPaused).unwrap_or(false);
+        env.storage().instance().set(&DataKey::IsPaused, &(!paused));
     }
 
     pub fn create_vault_full(
@@ -787,8 +705,104 @@ impl VestingContract {
         is_transferable: bool,
         step_duration: u64
     ) -> u64 {
-        panic!("Admin actions must be executed via AdminProposal: call propose_admin_action(AdminAction::AddBeneficiary(...)) and sign_admin_proposal to reach quorum");
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        Self::create_vault_full_internal(&env, owner, amount, start_time, end_time, keeper_fee, is_revocable, is_transferable, step_duration)
     }
+
+    pub fn create_vault_lazy(
+        env: Env,
+        owner: Address,
+        amount: i128,
+        start_time: u64,
+        end_time: u64,
+        keeper_fee: i128,
+        is_revocable: bool,
+        is_transferable: bool,
+        step_duration: u64
+    ) -> u64 {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        Self::create_vault_lazy_internal(&env, owner, amount, start_time, end_time, keeper_fee, is_revocable, is_transferable, step_duration)
+    }
+
+    pub fn batch_create_vaults_lazy(env: Env, data: BatchCreateData) -> Vec<u64> {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        let total_amount = Self::validate_batch_data(&data);
+        Self::reserve_admin_balance_for_batch(&env, total_amount);
+        let mut ids = Vec::new(&env);
+        for i in 0..data.recipients.len() {
+            let id = Self::create_vault_lazy_internal(
+                &env,
+                data.recipients.get(i).unwrap(),
+                0, // amount handled by lazy logic (usually unspent balance)
+                data.start_times.get(i).unwrap(),
+                data.end_times.get(i).unwrap(),
+                data.keeper_fees.get(i).unwrap(),
+                true,
+                false,
+                data.step_durations.get(i).unwrap_or(0)
+            );
+            ids.push_back(id);
+        }
+        ids
+    }
+
+    pub fn batch_create_vaults_full(env: Env, data: BatchCreateData) -> Vec<u64> {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        let total_amount = Self::validate_batch_data(&data);
+        Self::require_deposited_tokens_for_batch(&env, total_amount);
+        Self::reserve_admin_balance_for_batch(&env, total_amount);
+
+        let mut ids = Vec::new(&env);
+        for i in 0..data.recipients.len() {
+            let id = Self::create_vault_full_internal(
+                &env,
+                data.recipients.get(i).unwrap(),
+                0, // Amount should be derived from basket
+                data.start_times.get(i).unwrap(),
+                data.end_times.get(i).unwrap(),
+                data.keeper_fees.get(i).unwrap(),
+                true,
+                false,
+                data.step_durations.get(i).unwrap_or(0)
+            );
+            ids.push_back(id);
+        }
+        ids
+    }
+
+    pub fn batch_add_schedules(env: Env, schedules: Vec<ScheduleConfig>) -> Vec<u64> {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        let mut total_amount = 0i128;
+        for s in schedules.iter() {
+            for a in s.asset_basket.iter() { total_amount += a.total_amount; }
+        }
+        Self::require_deposited_tokens_for_batch(&env, total_amount);
+        Self::reserve_admin_balance_for_batch(&env, total_amount);
+
+        let mut ids = Vec::new(&env);
+        for s in schedules.iter() {
+            let id = Self::create_vault_prefunded_internal(
+                &env,
+                s.owner.clone(),
+                s.asset_basket.clone(),
+                s.start_time,
+                s.end_time,
+                s.keeper_fee,
+                s.is_revocable,
+                s.is_transferable,
+                0, // step_duration
+                true
+            );
+            ids.push_back(id);
+        }
+        ids
+    }
+
     /// Creates a vault with a diversified asset basket (pre-funded)
     pub fn create_vault_diversified_full(
         env: Env,
@@ -932,85 +946,6 @@ impl VestingContract {
 
         vault.is_initialized = true;
         env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
-    }
-
-    pub fn create_vault_lazy(
-        env: Env,
-        owner: Address,
-        amount: i128,
-        start_time: u64,
-        end_time: u64,
-        keeper_fee: i128,
-        is_revocable: bool,
-        is_transferable: bool,
-        step_duration: u64
-    ) -> u64 {
-        panic!("Admin actions must be executed via AdminProposal: call propose_admin_action(AdminAction::AddBeneficiary(...)) and sign_admin_proposal to reach quorum");
-    }
-
-    pub fn batch_create_vaults_lazy(env: Env, data: BatchCreateData) -> Vec<u64> {
-        panic!("Admin actions must be executed via AdminProposal: use propose_admin_action(AdminAction::AddBeneficiary(...)) and sign_admin_proposal for each intended schedule");
-    }
-
-    pub fn batch_create_vaults_full(env: Env, data: BatchCreateData) -> Vec<u64> {
-        Self::require_admin(&env);
-        let total_amount = Self::validate_batch_data(&data);
-        Self::require_deposited_tokens_for_batch(&env, total_amount);
-        Self::reserve_admin_balance_for_batch(&env, total_amount);
-
-        let mut ids = Vec::new(&env);
-        for i in 0..data.recipients.len() {
-            let id = Self::create_vault_prefunded_internal(
-                &env,
-                data.recipients.get(i).unwrap(),
-                data.asset_baskets.get(i).unwrap().clone(), // Use asset basket
-                data.start_times.get(i).unwrap(),
-                data.end_times.get(i).unwrap(),
-                data.keeper_fees.get(i).unwrap(),
-                true, // is_revocable
-                false, // is_transferable
-                data.step_durations.get(i).unwrap_or(0)
-            );
-            ids.push_back(id);
-        }
-        ids
-    }
-
-    pub fn batch_add_schedules(env: Env, schedules: Vec<ScheduleConfig>) -> Vec<u64> {
-        Self::require_admin(&env);
-        let total_amount = Self::validate_schedule_configs(&schedules);
-        Self::require_deposited_tokens_for_batch(&env, total_amount);
-        Self::reserve_admin_balance_for_batch(&env, total_amount);
-
-        let mut ids = Vec::new(&env);
-        for i in 0..schedules.len() {
-            let schedule = schedules.get(i).unwrap();
-            // Calculate total amount from asset basket
-            let mut schedule_total = 0i128;
-            for allocation in schedule.asset_basket.iter() {
-                schedule_total += allocation.total_amount;
-            }
-            
-            let id = Self::create_vault_prefunded_internal(
-                &env,
-                schedule.owner,
-                schedule.asset_basket.clone(), // Pass the entire asset basket
-                schedule.start_time,
-                schedule.end_time,
-                schedule.keeper_fee,
-                schedule.is_revocable,
-                schedule.is_transferable,
-                schedule.step_durations.get(i).unwrap_or(0),
-                true
-            );
-            ids.push_back(id);
-        }
-        ids
-        panic!("Admin actions must be executed via AdminProposal: use propose_admin_action(AdminAction::AddBeneficiary(...)) and sign_admin_proposal for each intended schedule");
-    }
-
-    pub fn batch_add_schedules(env: Env, schedules: Vec<ScheduleConfig>) -> Vec<u64> {
-        panic!("Admin actions must be executed via AdminProposal: use propose_admin_action(...) and sign_admin_proposal to add schedules");
     }
 
     /// Claims tokens from a diversified vesting vault
@@ -1213,33 +1148,66 @@ impl VestingContract {
         total_claimed >= total_amount
     }
 
-    pub fn set_milestones(_env: Env, _vault_id: u64, _milestones: Vec<Milestone>) {
-        panic!("Admin actions must be executed via AdminProposal: call propose_admin_action(AdminAction::SetMilestones(...)) and gather signatures via sign_admin_proposal");
+    pub fn set_milestones(env: Env, vault_id: u64, milestones: Vec<Milestone>) {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        env.storage().instance().set(&DataKey::VaultMilestones(vault_id), &milestones);
     }
 
     pub fn get_milestones(env: Env, vault_id: u64) -> Vec<Milestone> {
         env.storage().instance().get(&DataKey::VaultMilestones(vault_id)).unwrap_or(Vec::new(&env))
     }
 
-    pub fn unlock_milestone(_env: Env, _vault_id: u64, _milestone_id: u64) {
-        panic!("Admin actions must be executed via AdminProposal: call propose_admin_action(AdminAction::UnlockMilestone(...)) and sign_admin_proposal");
+    pub fn unlock_milestone(env: Env, vault_id: u64, milestone_id: u64) {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        let mut milestones: Vec<Milestone> = Self::get_milestones(env.clone(), vault_id);
+        let mut found = false;
+        for (i, m) in milestones.iter().enumerate() {
+            if m.id == milestone_id {
+                let mut updated = m.clone();
+                updated.is_unlocked = true;
+                milestones.set(i.try_into().unwrap(), updated);
+                found = true;
+                break;
+            }
+        }
+        if !found { panic!("Milestone not found"); }
+        env.storage().instance().set(&DataKey::VaultMilestones(vault_id), &milestones);
     }
 
-    pub fn freeze_vault(_env: Env, _vault_id: u64, _freeze: bool) {
-        panic!("Admin actions must be executed via AdminProposal: call propose_admin_action(AdminAction::FreezeVault(...)) and sign_admin_proposal");
+    pub fn freeze_vault(env: Env, vault_id: u64, freeze: bool) {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        let mut vault = Self::get_vault_internal(&env, vault_id);
+        vault.is_frozen = freeze;
+        env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
     }
 
-    pub fn pause_specific_schedule(_env: Env, _vault_id: u64, _reason: String) {
-        // Pause authority may be a multisig-controlled role; direct pauses must use AdminProposal in Option A.
-        panic!("Admin actions must be executed via AdminProposal: use propose_admin_action(AdminAction::PauseSpecificSchedule(...)) and sign_admin_proposal");
+    pub fn pause_specific_schedule(env: Env, vault_id: u64, reason: String) {
+        Self::require_pause_authority(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if env.storage().instance().has(&DataKey::PausedVault(vault_id)) { panic!("Already paused"); }
+        let pause_info = PausedVault {
+            vault_id,
+            pause_timestamp: env.ledger().timestamp(),
+            pause_authority: env.storage().instance().get(&DataKey::AdminAddress).unwrap(),
+            reason,
+        };
+        env.storage().instance().set(&DataKey::PausedVault(vault_id), &pause_info);
     }
 
-    pub fn resume_specific_schedule(_env: Env, _vault_id: u64) {
-        panic!("Admin actions must be executed via AdminProposal: use propose_admin_action(AdminAction::ResumeSpecificSchedule(...)) and sign_admin_proposal");
+    pub fn resume_specific_schedule(env: Env, vault_id: u64) {
+        Self::require_pause_authority(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if !env.storage().instance().has(&DataKey::PausedVault(vault_id)) { panic!("Not paused"); }
+        env.storage().instance().remove(&DataKey::PausedVault(vault_id));
     }
 
-    pub fn set_pause_authority(_env: Env, _authority: Address) {
-        panic!("Admin actions must be executed via AdminProposal: call propose_admin_action(AdminAction::SetPauseAuthority(...)) and sign_admin_proposal");
+    pub fn set_pause_authority(env: Env, authority: Address) {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        env.storage().instance().set(&DataKey::PauseAuthority, &authority);
     }
 
     pub fn get_pause_authority(env: Env) -> Option<Address> {
@@ -1254,12 +1222,18 @@ impl VestingContract {
         env.storage().instance().get(&DataKey::PausedVault(vault_id))
     }
 
-    pub fn mark_irrevocable(_env: Env, _vault_id: u64) {
-        panic!("Admin actions must be executed via AdminProposal: call propose_admin_action(AdminAction::MarkIrrevocable(...)) and sign_admin_proposal");
+    pub fn mark_irrevocable(env: Env, vault_id: u64) {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        let mut vault = Self::get_vault_internal(&env, vault_id);
+        vault.is_irrevocable = true;
+        env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
     }
 
-    pub fn set_performance_cliff(_env: Env, _vault_id: u64, _cliff: PerformanceCliff) {
-        panic!("Admin actions must be executed via AdminProposal: call propose_admin_action(AdminAction::SetPerformanceCliff(...)) and sign_admin_proposal");
+    pub fn set_performance_cliff(env: Env, vault_id: u64, cliff: PerformanceCliff) {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        env.storage().instance().set(&DataKey::VaultPerformanceCliff(vault_id), &cliff);
     }
 
     pub fn get_performance_cliff(env: Env, vault_id: u64) -> Option<PerformanceCliff> {
@@ -1707,22 +1681,35 @@ impl VestingContract {
         
         // Emit event
         env.events().publish((Symbol::new(&env, "slash"), vault_id), (vested, unvested, treasury));
-    pub fn slash_unvested_balance(_env: Env, _vault_id: u64, _treasury: Address) {
-        panic!("Admin actions must be executed via AdminProposal: call propose_admin_action(AdminAction::SlashUnvestedBalance(...)) and sign_admin_proposal");
+    pub fn slash_unvested_balance(env: Env, vault_id: u64, treasury: Address) {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        Self::do_revoke_vault_internal(&env, vault_id, treasury);
     }
 
     // --- Auto-Stake Functions ---
 
     /// Whitelist a staking contract address so vaults can stake against it.
     /// Only callable by the admin.
-    pub fn add_staking_contract(_env: Env, _staking_contract: Address) {
-        panic!("Admin actions must be executed via AdminProposal: call propose_admin_action(AdminAction::AddStakingContract(...)) and sign_admin_proposal");
+    pub fn add_staking_contract(env: Env, staking_contract: Address) {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        let mut approved = get_approved_staking_contracts(&env);
+        if !approved.contains(&staking_contract) {
+            approved.push_back(staking_contract);
+            env.storage().instance().set(&DataKey::ApprovedStakingContracts, &approved);
+        }
     }
 
-    /// Remove a staking contract from the whitelist.
-    /// Only callable by the admin.
-    pub fn remove_staking_contract(_env: Env, _staking_contract: Address) {
-        panic!("Admin actions must be executed via AdminProposal: call propose_admin_action(AdminAction::RemoveStakingContract(...)) and sign_admin_proposal");
+    pub fn remove_staking_contract(env: Env, staking_contract: Address) {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        let approved = get_approved_staking_contracts(&env);
+        let mut new_approved = Vec::new(&env);
+        for a in approved.iter() {
+            if a != staking_contract { new_approved.push_back(a); }
+        }
+        env.storage().instance().set(&DataKey::ApprovedStakingContracts, &new_approved);
     }
 
     /// Return the list of whitelisted staking contracts.
@@ -1999,8 +1986,10 @@ impl VestingContract {
         }
     }
     
-    pub fn revoke_vault(_env: Env, _vault_id: u64, _treasury: Address) {
-        panic!("Admin actions must be executed via AdminProposal: call propose_admin_action(AdminAction::RevokeSchedule(vault_id, treasury)) and sign_admin_proposal to reach quorum");
+    pub fn revoke_vault(env: Env, vault_id: u64, treasury: Address) {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        Self::do_revoke_vault_internal(&env, vault_id, treasury);
     }
 
     /// Partial revocation with a penalty split.
@@ -2305,15 +2294,16 @@ impl VestingContract {
         step_duration: u64,
         is_initialized: bool,
     ) -> u64 {
-    VestingContract::require_valid_duration(start_time, end_time);
-    let id = VestingContract::increment_vault_count(env);
+        Self::require_valid_duration(start_time, end_time);
+        let id = Self::increment_vault_count(env);
+        let title = String::from_str(env, "");
         let vault = Vault {
             allocations,
             keeper_fee,
             staked_amount: 0,
             owner: owner.clone(),
             delegate: None,
-            title: String::from_str(env, ""),
+            title,
             start_time,
             end_time,
             creation_time: env.ledger().timestamp(),
@@ -2325,9 +2315,8 @@ impl VestingContract {
         };
         env.storage().instance().set(&DataKey::VaultData(id), &vault);
         if is_initialized {
-            VestingContract::add_user_vault_index(env, &owner, id);
+            Self::add_user_vault_index(env, &owner, id);
         }
-        VestingContract::add_total_shares(env, amount);
         let total_amount = Self::calculate_basket_total_value(&vault.allocations);
         Self::add_total_shares(env, total_amount);
         id
@@ -2451,7 +2440,7 @@ impl VestingContract {
     }
 
     fn calculate_user_own_power(env: &Env, user: &Address) -> i128 {
-        let vault_ids = env.storage().instance().get(&DataKey::UserVaults(user.clone())).unwrap_or(vec![env]);
+        let vault_ids: Vec<u64> = env.storage().instance().get(&DataKey::UserVaults(user.clone())).unwrap_or(Vec::new(env));
         let mut total_power: i128 = 0;
         for id in vault_ids.iter() {
             let vault = Self::get_vault_internal(env, id);
@@ -2459,8 +2448,6 @@ impl VestingContract {
             for allocation in vault.allocations.iter() {
                 balance += allocation.total_amount - allocation.released_amount;
             }
-            let vault = VestingContract::get_vault_internal(env, id);
-            let balance = vault.total_amount - vault.released_amount;
             let weight = if vault.is_irrevocable { 100 } else { 50 };
             total_power += (balance * weight) / 100;
         }
@@ -2563,130 +2550,53 @@ impl VestingContract {
         }
     }
 
-    /// Calculates claimable amount for a specific asset in the basket
     fn calculate_claimable_for_asset(env: &Env, id: u64, vault: &Vault, asset_index: usize) -> i128 {
         let allocation = vault.allocations.get(asset_index.try_into().unwrap()).unwrap();
         
-        // Check if performance cliff is set and if it's passed
-        if let Some(cliff) = env.storage().instance().get(&DataKey::VaultPerformanceCliff(id)) {
-            if !OracleClient::is_cliff_passed(env, &cliff, id) {
-                // Cliff not passed, no vesting yet
-                return 0;
-            }
-        }
-
-        // If vault is paused, calculate based on pause timestamp
-        if let Some(paused_info) = env
-            .storage()
-            .instance()
-            .get::<DataKey, PausedVault>(&DataKey::PausedVault(id))
-        {
-            let pause_time = paused_info.pause_timestamp;
-            if pause_time <= vault.start_time {
-                return 0;
-            }
-            if pause_time >= vault.end_time {
-                return allocation.total_amount;
-            }
-
-            let duration = (vault.end_time - vault.start_time) as i128;
-            let elapsed = (pause_time - vault.start_time) as i128;
-
-            if vault.step_duration > 0 {
-                let steps = duration / (vault.step_duration as i128);
-                if steps == 0 { return 0; }
-                let completed = elapsed / (vault.step_duration as i128);
-                return (vault.total_amount / steps) * completed;
-            } else {
-                return (vault.total_amount * elapsed) / duration;
-            }
-        }
-
-        // If there's a performance cliff, ensure it's passed
         if let Some(cliff) = env.storage().instance().get(&DataKey::VaultPerformanceCliff(id)) {
             if !OracleClient::is_cliff_passed(env, &cliff, id) {
                 return 0;
             }
         }
 
-        // Milestones-based vesting
-        if env.storage().instance().has(&DataKey::VaultMilestones(id)) {
-                (allocation.total_amount * completed) / steps
-            } else {
-                (allocation.total_amount * elapsed) / duration
-            }
-        } else if env.storage().instance().has(&DataKey::VaultMilestones(id)) {
-            let milestones: Vec<Milestone> = env
-                .storage()
-                .instance()
-                .get(&DataKey::VaultMilestones(id))
-                .expect("No milestones");
-            let mut pct: u32 = 0;
-            for m in milestones.iter() {
-                if m.is_unlocked {
-                    pct += m.percentage;
-                }
-            }
-            if pct > 100 { pct = 100; }
-            return (vault.total_amount * (pct as i128)) / 100;
-        }
-
-        // Standard linear or stepped vesting
         let mut now = env.ledger().timestamp();
-        let accel_pct: u32 = env.storage().instance().get(&DataKey::GlobalAccelerationPct).unwrap_or(0u32);
-        if accel_pct > 0 {
-            let duration_u64 = vault.end_time.saturating_sub(vault.start_time);
-            let shift = ((duration_u64 as i128) * (accel_pct as i128) / 100) as u64;
-            now = now.saturating_add(shift);
+
+        if let Some(paused_info) = env.storage().instance().get::<DataKey, PausedVault>(&DataKey::PausedVault(id)) {
+            now = paused_info.pause_timestamp;
+        } else {
+            let accel_pct: u32 = env.storage().instance().get(&DataKey::GlobalAccelerationPct).unwrap_or(0u32);
+            if accel_pct > 0 {
+                let duration_u64 = vault.end_time.saturating_sub(vault.start_time);
+                let shift = ((duration_u64 as i128) * (accel_pct as i128) / 100) as u64;
+                now = now.saturating_add(shift);
+            }
         }
 
         if now <= vault.start_time { return 0; }
-        if now >= vault.end_time { return vault.total_amount; }
+        if now >= vault.end_time { return allocation.total_amount; }
 
         let duration = (vault.end_time - vault.start_time) as i128;
         let elapsed = (now - vault.start_time) as i128;
 
-        if vault.step_duration > 0 {
+        let base_vested = if vault.step_duration > 0 {
             let steps = duration / (vault.step_duration as i128);
-            if steps == 0 { return 0; }
-            let completed = elapsed / (vault.step_duration as i128);
-            return (vault.total_amount / steps) * completed;
-            if pct > 100 {
-                pct = 100;
+            if steps == 0 { 0 } else {
+                let completed = elapsed / (vault.step_duration as i128);
+                (allocation.total_amount * completed) / steps
             }
-            (allocation.total_amount * (pct as i128)) / 100
         } else {
-            let mut now = env.ledger().timestamp();
-            let accel_pct: u32 = env.storage().instance().get(&DataKey::GlobalAccelerationPct).unwrap_or(0);
-            
-            let duration = (vault.end_time - vault.start_time) as i128;
-            if accel_pct > 0 {
-                let shift = (duration * accel_pct as i128 / 100) as u64;
-                now += shift;
-            }
+            (allocation.total_amount * elapsed) / duration
+        };
 
-            if now <= vault.start_time { return 0; }
-            if now >= vault.end_time { return allocation.total_amount; }
-            
-            let elapsed = (now - vault.start_time) as i128;
+        Self::apply_anti_dilution_adjustment(env, id, base_vested, allocation.total_amount)
+    }
 
-            if vault.step_duration > 0 {
-                let steps = duration / vault.step_duration as i128;
-                if steps == 0 { return 0; }
-                let completed = elapsed / vault.step_duration as i128;
-                let base_vested = (allocation.total_amount * completed) / steps;
-                
-                // Apply anti-dilution adjustment if enabled
-                Self::apply_anti_dilution_adjustment(env, id, base_vested, allocation.total_amount)
-            } else {
-                let base_vested = (allocation.total_amount * elapsed) / duration;
-                
-                // Apply anti-dilution adjustment if enabled
-                Self::apply_anti_dilution_adjustment(env, id, base_vested, allocation.total_amount)
-            }
+    fn calculate_claimable(env: &Env, id: u64, vault: &Vault) -> i128 {
+        let mut total_claimable = 0;
+        for i in 0..vault.allocations.len() {
+            total_claimable += Self::calculate_claimable_for_asset(env, id, vault, i.try_into().unwrap());
         }
-
-        (vault.total_amount * elapsed) / duration
+        total_claimable
     }
 
     /// Applies anti-dilution adjustments to vested amount based on network growth
@@ -2990,17 +2900,8 @@ impl VestingContract {
     ) -> soroban_sdk::Vec<crate::kpi_engine::KpiVerificationRecord> {
         crate::kpi_vesting::kpi_verification_log(&env, vault_id)
     }
-
 }
 
-// Test modules temporarily disabled to allow iterative compilation while
-// fixing parsing and logic issues. Re-enable these when test files are fixed.
-// #[cfg(test)]
-// mod test;
-// #[cfg(test)]
-// mod invariant_test;
-// #[cfg(test)]
-// mod multisig_admin_test;
 pub mod diversified_core;
 
 #[cfg(test)]
