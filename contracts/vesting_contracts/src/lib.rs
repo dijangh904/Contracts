@@ -1,9 +1,9 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, contractevent, token, vec, Address, Env, IntoVal, Map, Symbol, Val, Vec, String, U256};
 use soroban_sdk::{
     contract,
     contractimpl,
     contracttype,
+    contractevent,
     token,
     vec,
     Address,
@@ -14,6 +14,7 @@ use soroban_sdk::{
     Val,
     Vec,
     String,
+    U256,
 };
 
 mod factory;
@@ -1681,10 +1682,6 @@ impl VestingContract {
         
         // Emit event
         env.events().publish((Symbol::new(&env, "slash"), vault_id), (vested, unvested, treasury));
-    pub fn slash_unvested_balance(env: Env, vault_id: u64, treasury: Address) {
-        Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
-        Self::do_revoke_vault_internal(&env, vault_id, treasury);
     }
 
     // --- Auto-Stake Functions ---
@@ -2736,10 +2733,6 @@ impl VestingContract {
             for allocation in vault.allocations.iter() {
                 total_locked += allocation.total_amount - allocation.released_amount;
             }
-        for i in 0..vault_ids.len() {
-            let vault_id = vault_ids.get(i).unwrap();
-            let vault = VestingContract::get_vault_internal(env, vault_id);
-            total_locked += vault.total_amount - vault.released_amount;
         }
         
         total_locked

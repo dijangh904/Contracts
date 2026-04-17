@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, contractevent, Address, Env, String, symbol_short};
+use soroban_sdk::{contract, contractimpl, contracttype, contractevent, Address, Env, String};
 
 mod vesting_contract {
     soroban_sdk::contractimport!(
@@ -63,9 +63,9 @@ impl VestingStatusNFT {
         let mut total_released: i128 = 0;
 
         for id in vault_ids.iter() {
-            let vault = client.get_vault(&id);
-            total_amount += vault.total_amount;
-            total_released += vault.released_amount;
+            let (vault_total, vault_released, _claimable, _count) = client.get_vault_statistics(&id);
+            total_amount += vault_total;
+            total_released += vault_released;
         }
 
         if total_amount == 0 {

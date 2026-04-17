@@ -6,7 +6,7 @@
 /// its own logic and exposes `claim_yield_for` so the vault can pull yield
 /// back to the beneficiary.
 use soroban_sdk::{
-    contract, contractimpl, contracttype, contractevent, Address, Env, Symbol, Vec,
+    contract, contractimpl, contracttype, contractevent, Address, Env, Vec,
 };
 
 // ---------------------------------------------------------------------------

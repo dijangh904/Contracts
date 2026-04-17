@@ -35,6 +35,7 @@ pub struct EmergencyPauseTriggered {
 
 #[contractevent]
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct EmergencyPauseLifted {
     pub lifted_at: u64,
 }
