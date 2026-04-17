@@ -1,4 +1,4 @@
-use soroban_sdk::{Env, Vec, Address, Map};
+use soroban_sdk::{Env, Vec, Address, Map, BytesN};
 use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent};
 
 pub const CLAIM_HISTORY: &str = "CLAIM_HISTORY";
@@ -158,24 +158,24 @@ pub fn get_emergency_pause_duration() -> u64 {
 pub fn is_nullifier_used(e: &Env, nullifier: &Nullifier) -> bool {
     e.storage()
         .instance()
-        .get(&(NULLIFIER_MAP, nullifier))
+        .get(&(NULLIFIER_MAP, nullifier.clone()))
         .unwrap_or(false)
 }
 
 pub fn set_nullifier_used(e: &Env, nullifier: &Nullifier) {
-    e.storage().instance().set(&(NULLIFIER_MAP, nullifier), &true);
+    e.storage().instance().set(&(NULLIFIER_MAP, nullifier.clone()), &true);
 }
 
 // Commitment storage functions
-pub fn get_commitment(e: &Env, commitment_hash: &[u8; 32]) -> Option<Commitment> {
-    e.storage().instance().get(&(COMMITMENT_STORAGE, commitment_hash))
+pub fn get_commitment(e: &Env, commitment_hash: &BytesN<32>) -> Option<Commitment> {
+    e.storage().instance().get(&(COMMITMENT_STORAGE, commitment_hash.clone()))
 }
 
-pub fn set_commitment(e: &Env, commitment_hash: &[u8; 32], commitment: &Commitment) {
-    e.storage().instance().set(&(COMMITMENT_STORAGE, commitment_hash), commitment);
+pub fn set_commitment(e: &Env, commitment_hash: &BytesN<32>, commitment: &Commitment) {
+    e.storage().instance().set(&(COMMITMENT_STORAGE, commitment_hash.clone()), commitment);
 }
 
-pub fn mark_commitment_used(e: &Env, commitment_hash: &[u8; 32]) {
+pub fn mark_commitment_used(e: &Env, commitment_hash: &BytesN<32>) {
     if let Some(mut commitment) = get_commitment(e, commitment_hash) {
         commitment.is_used = true;
         set_commitment(e, commitment_hash, &commitment);
@@ -197,22 +197,22 @@ pub fn add_privacy_claim_event(e: &Env, event: &crate::types::PrivacyClaimEvent)
 }
 
 // Merkle root management for ZK proofs
-pub fn add_merkle_root(e: &Env, merkle_root: &[u8; 32]) {
+pub fn add_merkle_root(e: &Env, merkle_root: &BytesN<32>) {
     let mut roots = get_merkle_roots(e);
-    roots.push_back(*merkle_root);
+    roots.push_back(merkle_root.clone());
     e.storage().instance().set(&MERKLE_ROOTS, &roots);
 }
 
-pub fn get_merkle_roots(e: &Env) -> Vec<[u8; 32]> {
+pub fn get_merkle_roots(e: &Env) -> Vec<BytesN<32>> {
     e.storage()
         .instance()
         .get(&MERKLE_ROOTS)
         .unwrap_or(Vec::new(e))
 }
 
-pub fn is_valid_merkle_root(e: &Env, merkle_root: &[u8; 32]) -> bool {
+pub fn is_valid_merkle_root(e: &Env, merkle_root: &BytesN<32>) -> bool {
     let roots = get_merkle_roots(e);
-    roots.contains(merkle_root)
+    roots.contains(merkle_root.clone())
 }
 
 // Stellar Horizon Path Payment Claim storage functions
@@ -235,4 +235,4 @@ pub fn add_path_payment_claim_event(e: &Env, event: &PathPaymentClaimEvent) {
     let mut history = get_path_payment_claim_history(e);
     history.push_back(event.clone());
     e.storage().instance().set(&PATH_PAYMENT_CLAIM_HISTORY, &history);
-}
+}

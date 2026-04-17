@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, contractevent, Address, Vec, Map, String};
+use soroban_sdk::{contracttype, contractevent, Address, Vec, Map, String, BytesN};
 
 #[contracttype]
 #[derive(Clone)]
@@ -99,13 +99,13 @@ pub struct ReputationBonusApplied {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Nullifier {
-    pub hash: [u8; 32], // 256-bit hash
+    pub hash: BytesN<32>, // 256-bit hash
 }
 
 #[contracttype]
 #[derive(Clone)]
 pub struct Commitment {
-    pub hash: [u8; 32], // 256-bit hash
+    pub hash: BytesN<32>, // 256-bit hash
     pub created_at: u64,
     pub vesting_id: u32,
     pub amount: i128,
@@ -115,9 +115,9 @@ pub struct Commitment {
 #[contracttype]
 #[derive(Clone)]
 pub struct ZKClaimProof {
-    pub commitment_hash: [u8; 32],
-    pub nullifier_hash: [u8; 32],
-    pub merkle_root: [u8; 32],
+    pub commitment_hash: BytesN<32>,
+    pub nullifier_hash: BytesN<32>,
+    pub merkle_root: BytesN<32>,
     pub proof_data: Vec<u8>, // Placeholder for actual ZK-SNARK proof
 }
 
@@ -133,7 +133,7 @@ pub struct PrivacyClaimEvent {
 
 #[contractevent]
 pub struct CommitmentCreated {
-    pub commitment_hash: [u8; 32],
+    pub commitment_hash: BytesN<32>,
     pub vesting_id: u32,
     pub amount: i128,
     pub created_at: u64,
@@ -141,7 +141,7 @@ pub struct CommitmentCreated {
 
 #[contractevent]
 pub struct PrivateClaimExecuted {
-    pub nullifier_hash: [u8; 32],
+    pub nullifier_hash: BytesN<32>,
     pub amount: i128,
     pub timestamp: u64,
 }
@@ -156,7 +156,7 @@ pub struct PathPaymentConfig {
     pub enabled: bool,
 }
 
-#[contractevent]
+#[contracttype]
 #[derive(Clone)]
 pub struct PathPaymentClaimEvent {
     pub beneficiary: Address,

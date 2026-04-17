@@ -1,9 +1,8 @@
-#![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec, symbol_short};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, symbol_short};
 
 mod vesting_contract {
     soroban_sdk::contractimport!(
-        file = "../../target/wasm32v1-none/release/vesting_contracts.wasm"
+        file = "../../target/wasm32-unknown-unknown/release/vesting_contracts.wasm"
     );
 }
 
@@ -13,6 +12,12 @@ pub enum DataKey {
     Admin,
     VestingContract,
     UserBadge(Address),
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct MintEvent {
+    pub user: Address,
 }
 
 #[contract]
@@ -42,8 +47,8 @@ impl VestingStatusNFT {
         
         // Emit event for minting
         env.events().publish(
-            (symbol_short!("mint"), user),
-            ()
+            (symbol_short!("mint"),),
+            MintEvent { user }
         );
     }
 

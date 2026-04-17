@@ -6,7 +6,7 @@
 /// its own logic and exposes `claim_yield_for` so the vault can pull yield
 /// back to the beneficiary.
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, Symbol, Vec,
+    contract, contractimpl, contracttype, contractevent, Address, Env, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -41,6 +41,30 @@ pub struct StakeRecord {
     pub pending_yield: i128,
     /// Whether the stake is active.
     pub is_active: bool,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct StakedEvent {
+    pub vault_id: u64,
+    pub beneficiary: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct UnstakedEvent {
+    pub vault_id: u64,
+    pub beneficiary: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct SlashedEvent {
+    pub vault_id: u64,
+    pub beneficiary: Address,
+    pub amount: i128,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,8 +125,8 @@ impl StakingContract {
         };
         env.storage().instance().set(&key, &record);
         env.events().publish(
-            (Symbol::new(&env, "staked"), vault_id),
-            (beneficiary, amount),
+            (Symbol::new(&env, "staked"),),
+            StakedEvent { vault_id, beneficiary, amount },
         );
     }
 
@@ -125,8 +149,8 @@ impl StakingContract {
         record.is_active = false;
         env.storage().instance().set(&key, &record);
         env.events().publish(
-            (Symbol::new(&env, "unstaked"), vault_id),
-            (beneficiary, record.amount),
+            (Symbol::new(&env, "unstaked"),),
+            UnstakedEvent { vault_id, beneficiary, amount: record.amount },
         );
     }
 
@@ -197,8 +221,8 @@ impl StakingContract {
         record.amount -= amount;
         env.storage().instance().set(&key, &record);
         env.events().publish(
-            (Symbol::new(&env, "slash_stake"), vault_id),
-            (beneficiary, amount),
+            (Symbol::new(&env, "slash_stake"),),
+            SlashedEvent { vault_id, beneficiary, amount },
         );
     }
 
@@ -234,9 +258,6 @@ impl StakingContract {
         // the vault contract address. For simplicity we accept any authorised
         // vault that has signed the invocation.
         let _ = (vaults, caller);
-        // Auth is enforced by the vault calling require_auth on itself before
-        // invoking us. No additional check needed here beyond the vault's own
-        // auth guard. This is the standard Soroban cross-contract trust model.
     }
 }
 

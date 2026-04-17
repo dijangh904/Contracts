@@ -1,15 +1,15 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, Env, Address, Vec, Map, String};
+use soroban_sdk::{contract, contractimpl, Env, Address, Vec, Map, String, BytesN};
 
 mod storage;
 mod types;
 mod audit_exporter;
 mod emergency;
 
-use types::{ClaimEvent, AuthorizedAddressSet, AddressWhitelistRequest, AuthorizedPayoutAddress, MilestoneConfig, MilestoneStatus, MilestoneCompleted, ClaimSimulation, ReputationBonus, ReputationBonusApplied, Nullifier, Commitment, ZKClaimProof, PrivacyClaimEvent, CommitmentCreated, PrivateClaimExecuted, PathPaymentConfig, PathPaymentClaimEvent, PathPaymentSimulation};
+use types::{ClaimEvent, AddressWhitelistRequest, AuthorizedPayoutAddress, MilestoneConfig, ClaimSimulation, Nullifier, Commitment, ZKClaimProof, PrivacyClaimEvent, CommitmentCreated, PrivateClaimExecuted, PathPaymentConfig, PathPaymentClaimEvent, PathPaymentSimulation};
 use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event};
-use emergency::{AuditorPauseRequest, EmergencyPause, EmergencyPauseTriggered, EmergencyPauseLifted};
+use emergency::{AuditorPauseRequest, EmergencyPause};
 
 #[contract]
 pub struct VestingVault;
@@ -429,7 +429,7 @@ impl VestingVault {
     
     /// Create a commitment for future private claims
     /// This function allows users to create a commitment that can be used for private claims later
-    pub fn create_commitment(e: Env, user: Address, vesting_id: u32, amount: i128, commitment_hash: [u8; 32]) {
+    pub fn create_commitment(e: Env, user: Address, vesting_id: u32, amount: i128, commitment_hash: BytesN<32>) {
         user.require_auth();
         
         // Check if commitment already exists
@@ -535,7 +535,7 @@ impl VestingVault {
     
     /// Add a Merkle root for ZK proof verification
     /// This function is called by the admin to add new Merkle roots
-    pub fn add_merkle_root_admin(e: Env, admin: Address, merkle_root: [u8; 32]) {
+    pub fn add_merkle_root_admin(e: Env, admin: Address, merkle_root: BytesN<32>) {
         admin.require_auth();
         
         // Check if Merkle root already exists
@@ -548,7 +548,7 @@ impl VestingVault {
     }
     
     /// Get all valid Merkle roots
-    pub fn get_merkle_roots(e: Env) -> Vec<[u8; 32]> {
+    pub fn get_merkle_roots(e: Env) -> Vec<BytesN<32>> {
         get_merkle_roots(&e)
     }
     
@@ -558,7 +558,7 @@ impl VestingVault {
     }
     
     /// Get commitment information
-    pub fn get_commitment_info(e: Env, commitment_hash: [u8; 32]) -> Option<Commitment> {
+    pub fn get_commitment_info(e: Env, commitment_hash: BytesN<32>) -> Option<Commitment> {
         get_commitment(&e, &commitment_hash)
     }
     
@@ -578,7 +578,7 @@ impl VestingVault {
     
     /// Enable privacy mode for a vesting schedule
     /// This allows beneficiaries to choose between public and private claims
-    pub fn enable_privacy_mode(e: Env, user: Address, vesting_id: u32) {
+    pub fn enable_privacy_mode(_e: Env, user: Address, _vesting_id: u32) {
         user.require_auth();
         
         // TODO: Implement privacy mode toggle
@@ -587,7 +587,7 @@ impl VestingVault {
     }
     
     /// Disable privacy mode for a vesting schedule
-    pub fn disable_privacy_mode(e: Env, user: Address, vesting_id: u32) {
+    pub fn disable_privacy_mode(_e: Env, user: Address, _vesting_id: u32) {
         user.require_auth();
         
         // TODO: Implement privacy mode toggle
@@ -712,7 +712,7 @@ impl VestingVault {
     }
     
     /// Simulate a path payment claim to show expected amounts without consuming gas
-    pub fn simulate_path_payment_claim(e: Env, user: Address, vesting_id: u32, amount: i128, min_destination_amount: Option<i128>) -> PathPaymentSimulation {
+    pub fn simulate_path_payment_claim(e: Env, _user: Address, _vesting_id: u32, amount: i128, min_destination_amount: Option<i128>) -> PathPaymentSimulation {
         let current_time = e.ledger().timestamp();
         
         // Check if contract is under emergency pause
@@ -809,7 +809,7 @@ impl VestingVault {
     
     /// Internal function to execute the path payment using Stellar's path_payment_strict_receive
     /// This is the core logic that enables the Auto-Exit feature
-    fn execute_path_payment(e: &Env, beneficiary: &Address, source_amount: i128, destination_asset: &Address, min_destination_amount: i128, path: &Vec<Address>) -> i128 {
+    fn execute_path_payment(e: &Env, _beneficiary: &Address, source_amount: i128, destination_asset: &Address, min_destination_amount: i128, path: &Vec<Address>) -> i128 {
         // In a real Stellar Soroban implementation, this would use the built-in
         // path_payment_strict_receive function from the Stellar SDK
         
