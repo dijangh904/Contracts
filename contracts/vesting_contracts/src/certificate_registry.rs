@@ -1,4 +1,4 @@
-﻿use soroban_sdk::{contract, contractimpl, contracttype, contractevent, Address, Env, Map, String, Symbol, Vec, U256};
+use soroban_sdk::{contract, contractimpl, contracttype, contractevent, Address, Env, Map, String, Symbol, Vec, U256};
 use crate::{Vault, DataKey};
 
 #[contracttype]
@@ -329,7 +329,7 @@ impl VestingCertificateRegistry {
     
     // --- Helper Functions ---
     
-    fn calculate_loyalty_metrics(env: &Env, vault_id: u64, vault: &Vault) -> LoyaltyMetrics {
+    fn calculate_loyalty_metrics(env: &Env, _vault_id: u64, vault: &Vault) -> LoyaltyMetrics {
         let total_duration = vault.end_time.saturating_sub(vault.start_time);
         let actual_completion_time = env.ledger().timestamp().saturating_sub(vault.start_time);
         

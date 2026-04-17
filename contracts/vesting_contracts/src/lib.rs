@@ -1,4 +1,4 @@
-﻿#![no_std]
+#![no_std]
 use soroban_sdk::{
     contract,
     contractimpl,
@@ -405,6 +405,23 @@ pub struct MarketplaceSold {
     #[topic]
     pub new_owner: Address,
     pub marketplace: Address,
+}
+
+#[contractevent]
+pub struct TeamRevoked {
+    pub vaults_count: u32,
+    pub owners: Vec<Address>,
+    pub total_amount: i128,
+    pub treasury: Address,
+}
+
+#[contractevent]
+pub struct PartialRevocation {
+    #[topic]
+    pub vault_id: u64,
+    pub penalty_amount: i128,
+    pub severance_amount: i128,
+    pub treasury: Address,
 }
 
 #[contract]
@@ -1212,7 +1229,7 @@ impl VestingContract {
     }
 
     /// Check if a vault is fully vested (all tokens claimed)
-    fn is_vault_fully_vested(env: &Env, vault_id: u64, vault: &Vault) -> bool {
+    fn is_vault_fully_vested(env: &Env, _vault_id: u64, vault: &Vault) -> bool {
         let now = env.ledger().timestamp();
         
         // Check if vesting period has ended
@@ -1735,10 +1752,8 @@ impl VestingContract {
         
         let vested = Self::calculate_claimable(&env, vault_id, &vault);
         let mut total_amount = 0i128;
-        let mut total_released = 0i128;
         for allocation in vault.allocations.iter() {
             total_amount += allocation.total_amount;
-            total_released += allocation.released_amount;
         }
         let unvested = total_amount - vested;
         
@@ -2004,10 +2019,12 @@ impl VestingContract {
             token::Client::new(&env, &token).transfer(&env.current_contract_address(), &treasury, &total_revoked);
             
             // Emit single TeamRevocation event
-            env.events().publish(
-                (Symbol::new(&env, "team_revoked"), vault_ids.len()),
-                (revoked_owners, total_revoked, treasury),
-            );
+            TeamRevoked {
+                vaults_count: vault_ids.len(),
+                owners: revoked_owners,
+                total_amount: total_revoked,
+                treasury: treasury.clone(),
+            }.publish(&env);
         }
     }
     
@@ -2095,10 +2112,12 @@ impl VestingContract {
         let total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
         env.storage().instance().set(&DataKey::TotalShares, &(total_shares - unvested));
 
-        env.events().publish(
-            (Symbol::new(&env, "partial_revoke"), vault_id),
-            (vault.owner, penalty_amount, severance_amount, treasury),
-        );
+        PartialRevocation {
+            vault_id,
+            penalty_amount,
+            severance_amount,
+            treasury: treasury.clone(),
+        }.publish(&env);
     }
 
     /// Return the current stake status for a vault.

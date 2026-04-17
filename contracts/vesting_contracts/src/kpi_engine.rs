@@ -110,7 +110,7 @@ pub fn get_kpi_log(env: &Env, vault_id: u64) -> Vec<KpiVerificationRecord> {
 /// Uses Soroban's `invoke_contract` — same pattern as existing oracle.rs stubs.
 /// Replace the placeholder with the real cross-contract call when your oracle
 /// adapter contract is deployed.
-fn query_oracle_value(env: &Env, config: &KpiOracleConfig) -> i128 {
+fn query_oracle_value(_env: &Env, config: &KpiOracleConfig) -> i128 {
     // Real call (uncomment when oracle adapter is ready):
     //
     // env.invoke_contract::<i128>(

@@ -56,7 +56,7 @@ impl OracleClient {
         Self
     }
 
-    pub fn is_cliff_passed(env: &Env, cliff: &PerformanceCliff, vault_id: u64) -> bool {
+    pub fn is_cliff_passed(env: &Env, cliff: &PerformanceCliff, _vault_id: u64) -> bool {
         // First try to evaluate oracle conditions
         if
             let Some(result) = Self::evaluate_oracle_conditions(
@@ -109,10 +109,10 @@ impl OracleClient {
         }
     }
 
-    fn query_oracle(env: &Env, condition: &OracleCondition) -> i128 {
+    fn query_oracle(_env: &Env, condition: &OracleCondition) -> i128 {
         // This would make a cross-contract call to the oracle contract
         // For now, we'll implement a basic interface that can be extended
-        let oracle_address = condition.oracle_address.clone();
+        let _oracle_address = condition.oracle_address.clone();
 
         // In a real implementation, this would be:
         // let oracle_client = OracleContractClient::new(env, &oracle_address);
@@ -205,7 +205,7 @@ impl OracleClient {
     }
 
     /// Queries network growth value from oracle (returns percentage in basis points)
-    pub fn query_network_growth(env: &Env, oracle_address: &Address) -> i128 {
+    pub fn query_network_growth(_env: &Env, _oracle_address: &Address) -> i128 {
         // This would make a cross-contract call to the oracle contract
         // For now, return 0 as placeholder - should be replaced with actual oracle call
         // let oracle_client = NetworkGrowthOracleClient::new(env, oracle_address);
@@ -214,7 +214,7 @@ impl OracleClient {
     }
 
     /// Queries inflation rate from oracle (returns percentage in basis points)
-    pub fn query_inflation_rate(env: &Env, oracle_address: &Address) -> i128 {
+    pub fn query_inflation_rate(_env: &Env, _oracle_address: &Address) -> i128 {
         // This would make a cross-contract call to the oracle contract
         // For now, return 0 as placeholder - should be replaced with actual oracle call
         // let oracle_client = InflationOracleClient::new(env, oracle_address);
