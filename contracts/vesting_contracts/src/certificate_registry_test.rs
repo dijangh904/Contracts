@@ -1,17 +1,19 @@
 #![cfg(test)]
 
-use soroban_sdk::{symbol_short, Address, Env, String, U256, Vec};
+use soroban_sdk::{symbol_short, vec, Address, Env, String, U256, Vec};
+use soroban_sdk::testutils::{Address as _, Ledger as _};
 use crate::{
-    contractimpl, VestingContract,
+    VestingContract, VestingContractClient,
     certificate_registry::{
-        VestingCertificateRegistry, CompletedVestCertificate, CertificateQuery, WorkVerification,
+        VestingCertificateRegistry, VestingCertificateRegistryClient, CompletedVestCertificate, CertificateQuery, WorkVerification,
     },
-    Vault, AssetAllocation, DataKey,
+    Vault, AssetAllocationEntry, DataKey,
 };
 
 #[test]
 fn test_certificate_registration() {
     let env = Env::default();
+    env.ledger().set_timestamp(200000);
     env.mock_all_auths();
     
     let admin = Address::generate(&env);
@@ -23,15 +25,15 @@ fn test_certificate_registration() {
     let client = VestingContractClient::new(&env, &contract_id);
     
     // Initialize contract
-    client.initialize(&admin, &token);
+    client.initialize(&admin, &1_000_000i128);
     
     // Create a completed vault
     let now = env.ledger().timestamp();
     let start_time = now - 100000; // Started in the past
     let end_time = now - 1000;      // Ended in the past (fully vested)
     
-    let allocation = AssetAllocation {
-        asset_id: token,
+    let allocation = AssetAllocationEntry {
+        asset_id: token.clone(),
         total_amount: 1000,
         released_amount: 1000, // Fully claimed
         locked_amount: 0,
@@ -44,7 +46,7 @@ fn test_certificate_registration() {
         allocations,
         keeper_fee: 0,
         staked_amount: 0,
-        owner: beneficiary,
+        owner: beneficiary.clone(),
         delegate: None,
         title: String::from_str(&env, "Test Vault"),
         start_time,
@@ -57,20 +59,23 @@ fn test_certificate_registration() {
         is_frozen: false,
     };
     
+    // Setup registry
+    let registry_id = env.register_contract(None, VestingCertificateRegistry);
+    let registry_client = VestingCertificateRegistryClient::new(&env, &registry_id);
+    
     // Register certificate
-    let certificate_id = VestingCertificateRegistry::register_completed_vest(
-        env.clone(),
-        1,
-        beneficiary,
-        vault.clone(),
-        1000,
-        1000,
-        vec![&env, token],
-        None,
+    let certificate_id = registry_client.register_completed_vest(
+        &1,
+        &beneficiary,
+        &vault,
+        &1000,
+        &1000,
+        &vec![&env, token],
+        &None,
     );
     
     // Verify certificate was created
-    let certificate = VestingCertificateRegistry::get_certificate(env.clone(), certificate_id);
+    let certificate = registry_client.get_certificate(&certificate_id);
     assert_eq!(certificate.vault_id, 1);
     assert_eq!(certificate.beneficiary, beneficiary);
     assert_eq!(certificate.total_claimed, 1000);
@@ -82,6 +87,7 @@ fn test_certificate_registration() {
 #[test]
 fn test_work_verification() {
     let env = Env::default();
+    env.ledger().set_timestamp(200000);
     env.mock_all_auths();
     
     let beneficiary = Address::generate(&env);
@@ -95,7 +101,7 @@ fn test_work_verification() {
     registry_client.set_verifier(&verifier);
     
     // Create a certificate first
-    let vault = create_test_vault(&env, beneficiary, token);
+    let vault = create_test_vault(&env, beneficiary.clone(), token.clone());
     let certificate_id = registry_client.register_completed_vest(
         &1,
         &beneficiary,
@@ -134,6 +140,7 @@ fn test_work_verification() {
 #[test]
 fn test_certificate_query_by_beneficiary() {
     let env = Env::default();
+    env.ledger().set_timestamp(200000);
     env.mock_all_auths();
     
     let beneficiary1 = Address::generate(&env);
@@ -144,8 +151,8 @@ fn test_certificate_query_by_beneficiary() {
     let registry_client = VestingCertificateRegistryClient::new(&env, &contract_id);
     
     // Create certificates for two beneficiaries
-    let vault1 = create_test_vault(&env, beneficiary1, token);
-    let vault2 = create_test_vault(&env, beneficiary2, token);
+    let vault1 = create_test_vault(&env, beneficiary1.clone(), token.clone());
+    let vault2 = create_test_vault(&env, beneficiary2.clone(), token.clone());
     
     let cert1_id = registry_client.register_completed_vest(
         &1,
@@ -153,11 +160,11 @@ fn test_certificate_query_by_beneficiary() {
         &vault1,
         &1000,
         &1000,
-        &vec![&env, token],
+        &vec![&env, token.clone()],
         &None,
     );
     
-    let cert2_id = registry_client.register_completed_vest(
+    let _cert2_id = registry_client.register_completed_vest(
         &2,
         &beneficiary2,
         &vault2,
@@ -169,7 +176,7 @@ fn test_certificate_query_by_beneficiary() {
     
     // Query by beneficiary1
     let query = CertificateQuery {
-        beneficiary: Some(beneficiary1),
+        beneficiary: Some(beneficiary1.clone()),
         work_type: None,
         min_loyalty_score: None,
         time_range_start: None,
@@ -186,6 +193,7 @@ fn test_certificate_query_by_beneficiary() {
 #[test]
 fn test_certificate_query_by_loyalty_score() {
     let env = Env::default();
+    env.ledger().set_timestamp(200000);
     env.mock_all_auths();
     
     let beneficiary = Address::generate(&env);
@@ -195,8 +203,8 @@ fn test_certificate_query_by_loyalty_score() {
     let registry_client = VestingCertificateRegistryClient::new(&env, &contract_id);
     
     // Create certificates with different loyalty scores
-    let vault1 = create_test_vault(&env, beneficiary, token);
-    let vault2 = create_test_vault(&env, beneficiary, token);
+    let vault1 = create_test_vault(&env, beneficiary.clone(), token.clone());
+    let vault2 = create_test_vault(&env, beneficiary.clone(), token.clone());
     
     registry_client.register_completed_vest(
         &1,
@@ -204,7 +212,7 @@ fn test_certificate_query_by_loyalty_score() {
         &vault1,
         &1000,
         &1000,
-        &vec![&env, token],
+        &vec![&env, token.clone()],
         &None,
     );
     
@@ -236,6 +244,7 @@ fn test_certificate_query_by_loyalty_score() {
 #[test]
 fn test_certificate_query_verified_only() {
     let env = Env::default();
+    env.ledger().set_timestamp(200000);
     env.mock_all_auths();
     
     let beneficiary = Address::generate(&env);
@@ -248,8 +257,8 @@ fn test_certificate_query_verified_only() {
     registry_client.set_verifier(&verifier);
     
     // Create two certificates
-    let vault1 = create_test_vault(&env, beneficiary, token);
-    let vault2 = create_test_vault(&env, beneficiary, token);
+    let vault1 = create_test_vault(&env, beneficiary.clone(), token.clone());
+    let vault2 = create_test_vault(&env, beneficiary.clone(), token.clone());
     
     let cert1_id = registry_client.register_completed_vest(
         &1,
@@ -257,11 +266,11 @@ fn test_certificate_query_verified_only() {
         &vault1,
         &1000,
         &1000,
-        &vec![&env, token],
+        &vec![&env, token.clone()],
         &None,
     );
     
-    let cert2_id = registry_client.register_completed_vest(
+    let _cert2_id = registry_client.register_completed_vest(
         &2,
         &beneficiary,
         &vault2,
@@ -297,6 +306,7 @@ fn test_certificate_query_verified_only() {
 #[test]
 fn test_get_beneficiary_certificates() {
     let env = Env::default();
+    env.ledger().set_timestamp(200000);
     env.mock_all_auths();
     
     let beneficiary = Address::generate(&env);
@@ -306,9 +316,9 @@ fn test_get_beneficiary_certificates() {
     let registry_client = VestingCertificateRegistryClient::new(&env, &contract_id);
     
     // Create multiple certificates for the same beneficiary
-    let vault1 = create_test_vault(&env, beneficiary, token);
-    let vault2 = create_test_vault(&env, beneficiary, token);
-    let vault3 = create_test_vault(&env, beneficiary, token);
+    let vault1 = create_test_vault(&env, beneficiary.clone(), token.clone());
+    let vault2 = create_test_vault(&env, beneficiary.clone(), token.clone());
+    let vault3 = create_test_vault(&env, beneficiary.clone(), token.clone());
     
     let cert1_id = registry_client.register_completed_vest(
         &1,
@@ -316,7 +326,7 @@ fn test_get_beneficiary_certificates() {
         &vault1,
         &1000,
         &1000,
-        &vec![&env, token],
+        &vec![&env, token.clone()],
         &None,
     );
     
@@ -326,7 +336,7 @@ fn test_get_beneficiary_certificates() {
         &vault2,
         &2000,
         &2000,
-        &vec![&env, token],
+        &vec![&env, token.clone()],
         &None,
     );
     
@@ -354,6 +364,7 @@ fn test_get_beneficiary_certificates() {
 #[test]
 fn test_loyalty_score_calculation() {
     let env = Env::default();
+    env.ledger().set_timestamp(200000);
     env.mock_all_auths();
     
     let beneficiary = Address::generate(&env);
@@ -367,8 +378,8 @@ fn test_loyalty_score_calculation() {
     let start_time = now - 100000;
     let end_time = now - 1000; // Just ended
     
-    let allocation = AssetAllocation {
-        asset_id: token,
+    let allocation = AssetAllocationEntry {
+        asset_id: token.clone(),
         total_amount: 1000,
         released_amount: 1000,
         locked_amount: 0,
@@ -381,7 +392,7 @@ fn test_loyalty_score_calculation() {
         allocations,
         keeper_fee: 0,
         staked_amount: 0,
-        owner: beneficiary,
+        owner: beneficiary.clone(),
         delegate: None,
         title: String::from_str(&env, "Perfect Timing Vault"),
         start_time,
@@ -411,11 +422,12 @@ fn test_loyalty_score_calculation() {
 
 // Helper function to create a test vault
 fn create_test_vault(env: &Env, beneficiary: Address, token: Address) -> Vault {
+    env.ledger().set_timestamp(200000);
     let now = env.ledger().timestamp();
     let start_time = now - 100000;
     let end_time = now - 1000;
     
-    let allocation = AssetAllocation {
+    let allocation = AssetAllocationEntry {
         asset_id: token,
         total_amount: 1000,
         released_amount: 1000,

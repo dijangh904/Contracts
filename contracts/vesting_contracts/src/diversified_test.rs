@@ -1,13 +1,14 @@
 #[cfg(test)]
 mod diversified_vesting_tests {
-    use crate::{AssetAllocation, VestingContract, VestingContractClient};
+    use crate::{AssetAllocationEntry, VestingContract, VestingContractClient};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
-        token, vec, Address, Env, String,
+        token, vec, Address, Env, String, IntoVal,
     };
 
-    fn create_token_contract<'a>(env: &Env, admin: &Address) -> token::Client<'a> {
-        token::Client::new(env, &env.register_stellar_asset_contract(admin.clone()))
+    fn create_token_contract<'a>(env: &Env, admin: &Address) -> (token::Client<'a>, token::StellarAssetClient<'a>) {
+        let address = env.register_stellar_asset_contract(admin.clone());
+        (token::Client::new(env, &address), token::StellarAssetClient::new(env, &address))
     }
 
     #[test]
@@ -19,44 +20,39 @@ mod diversified_vesting_tests {
         let beneficiary = Address::generate(&env);
 
         // Create three different tokens
-        let token1 = create_token_contract(&env, &admin);
-        let token2 = create_token_contract(&env, &admin);
-        let token3 = create_token_contract(&env, &admin);
-
-        // Initialize tokens with supply
-        token1.initialize(&admin, &7, &"Token1".into_val(&env), &"TK1".into_val(&env));
-        token2.initialize(&admin, &7, &"Token2".into_val(&env), &"TK2".into_val(&env));
-        token3.initialize(&admin, &7, &"Token3".into_val(&env), &"TK3".into_val(&env));
+        let (token1, asset1) = create_token_contract(&env, &admin);
+        let (token2, asset2) = create_token_contract(&env, &admin);
+        let (token3, asset3) = create_token_contract(&env, &admin);
 
         // Mint tokens to admin
-        token1.mint(&admin, &10000);
-        token2.mint(&admin, &10000);
-        token3.mint(&admin, &10000);
+        asset1.mint(&admin, &10000);
+        asset2.mint(&admin, &10000);
+        asset3.mint(&admin, &10000);
 
         // Create vesting contract
         let contract_id = env.register_contract(None, VestingContract);
         let client = VestingContractClient::new(&env, &contract_id);
 
         // Initialize vesting contract
-        client.initialize(&admin, &10000);
+        client.initialize(&admin, &1_000_000i128);
 
         // Create asset basket: 50% Token1, 30% Token2, 20% Token3
         let mut asset_basket = vec![&env];
-        asset_basket.push_back(AssetAllocation {
+        asset_basket.push_back(AssetAllocationEntry {
             asset_id: token1.address.clone(),
             total_amount: 1000,
             released_amount: 0,
             locked_amount: 0,
             percentage: 5000, // 50%
         });
-        asset_basket.push_back(AssetAllocation {
+        asset_basket.push_back(AssetAllocationEntry {
             asset_id: token2.address.clone(),
             total_amount: 600,
             released_amount: 0,
             locked_amount: 0,
             percentage: 3000, // 30%
         });
-        asset_basket.push_back(AssetAllocation {
+        asset_basket.push_back(AssetAllocationEntry {
             asset_id: token3.address.clone(),
             total_amount: 400,
             released_amount: 0,
@@ -113,7 +109,7 @@ mod diversified_vesting_tests {
         });
 
         // Claim remaining tokens
-        let claimed = client.claim_tokens_diversified(&vault_id);
+        let _claimed = client.claim_tokens_diversified(&vault_id);
         
         // Check final balances
         assert_eq!(token1.balance(&beneficiary), 1000); // 100% of 1000
@@ -122,6 +118,7 @@ mod diversified_vesting_tests {
     }
 
     #[test]
+    #[should_panic]
     fn test_asset_basket_validation() {
         let env = Env::default();
         env.mock_all_auths();
@@ -129,17 +126,16 @@ mod diversified_vesting_tests {
         let admin = Address::generate(&env);
         let beneficiary = Address::generate(&env);
 
-        let token1 = create_token_contract(&env, &admin);
-        token1.initialize(&admin, &7, &"Token1".into_val(&env), &"TK1".into_val(&env));
-        token1.mint(&admin, &10000);
+        let (token1, asset1) = create_token_contract(&env, &admin);
+        asset1.mint(&admin, &10000);
 
         let contract_id = env.register_contract(None, VestingContract);
         let client = VestingContractClient::new(&env, &contract_id);
-        client.initialize(&admin, &10000);
+        client.initialize(&admin, &1_000_000i128);
 
         // Create invalid asset basket (percentages don't sum to 100%)
         let mut invalid_basket = vec![&env];
-        invalid_basket.push_back(AssetAllocation {
+        invalid_basket.push_back(AssetAllocationEntry {
             asset_id: token1.address.clone(),
             total_amount: 1000,
             released_amount: 0,
@@ -151,20 +147,16 @@ mod diversified_vesting_tests {
         let end_time = start_time + 365 * 24 * 60 * 60;
 
         // This should panic due to invalid percentages
-        let result = std::panic::catch_unwind(|| {
-            client.create_vault_diversified_full(
-                &beneficiary,
-                &invalid_basket,
-                &start_time,
-                &end_time,
-                &0,
-                &true,
-                &true,
-                &0,
-                &String::from_str(&env, "Invalid Vault"),
-            );
-        });
-
-        assert!(result.is_err());
+        client.create_vault_diversified_full(
+            &beneficiary,
+            &invalid_basket,
+            &start_time,
+            &end_time,
+            &0,
+            &true,
+            &true,
+            &0,
+            &String::from_str(&env, "Invalid Vault"),
+        );
     }
 }

@@ -55,6 +55,9 @@ pub use certificate_registry::{
 #[cfg(test)]
 mod certificate_registry_test;
 
+pub mod diversified_core;
+pub use diversified_core::{AssetAllocation as DiversifiedAllocation, DiversifiedVault};
+
 // 10 years in seconds
 pub const MAX_DURATION: u64 = 315_360_000;
 // 72 hours in seconds for challenge period
@@ -432,7 +435,7 @@ impl VestingContract {
     fn dispatch_admin_action(env: Env, action: AdminAction) {
         match action {
             AdminAction::AddAdmin(admin) => {
-                let mut admins = Self::get_admins(&env);
+                let mut admins = Self::get_admins(env.clone());
                 if admins.iter().any(|a| a == admin) {
                     panic!("Admin already exists");
                 }
@@ -440,7 +443,7 @@ impl VestingContract {
                 env.storage().instance().set(&DataKey::AdminSet, &admins);
             },
             AdminAction::RemoveAdmin(admin) => {
-                let admins = Self::get_admins(&env);
+                let admins = Self::get_admins(env.clone());
                 let orig_len = admins.len();
                 let mut new_admins = Vec::new(&env);
                 for a in admins.iter() {
@@ -451,14 +454,14 @@ impl VestingContract {
                 if new_admins.len() == orig_len {
                     panic!("Admin not found");
                 }
-                let quorum = Self::get_quorum_threshold(&env);
+                let quorum = Self::get_quorum_threshold(env.clone());
                 if new_admins.len() < quorum {
                     panic!("Cannot have fewer admins than quorum");
                 }
                 env.storage().instance().set(&DataKey::AdminSet, &new_admins);
             },
             AdminAction::UpdateQuorum(new_quorum) => {
-                let admins = Self::get_admins(&env);
+                let admins = Self::get_admins(env.clone());
                 if new_quorum == 0 || new_quorum > admins.len() as u32 {
                     panic!("Invalid quorum");
                 }
@@ -489,7 +492,7 @@ impl VestingContract {
                     distributed_amount: 0,
                 };
                 env.storage().instance().set(&DataKey::SubAdminPool(manager), &pool);
-                let admin = Self::get_admin(&env);
+                let admin = Self::get_admin(env.clone());
                 token::Client::new(&env, &asset).transfer(&admin, &env.current_contract_address(), &amount);
             },
             AdminAction::RenewSchedule(vault_id, duration, amount) => {
@@ -503,8 +506,8 @@ impl VestingContract {
     }
 
     fn multisig_active(env: &Env) -> bool {
-        let admins = Self::get_admins(env);
-        let quorum = Self::get_quorum_threshold(env);
+        let admins = Self::get_admins(env.clone());
+        let quorum = Self::get_quorum_threshold(env.clone());
         admins.len() > 1 || quorum > 1
     }
 
@@ -544,8 +547,8 @@ impl VestingContract {
         }.publish(&env);
     }
 
-    pub fn admin_proposal_signature_count(env: &Env, proposal_id: u64) -> u32 {
-        let admins = Self::get_admins(env);
+    pub fn admin_proposal_signature_count(env: Env, proposal_id: u64) -> u32 {
+        let admins = Self::get_admins(env.clone());
         let mut count: u32 = 0;
         for admin in admins.iter() {
             let sig_key = DataKey::AdminProposalSignature(proposal_id, admin.clone());
@@ -558,14 +561,14 @@ impl VestingContract {
 
     pub fn sign_admin_proposal(env: Env, signer: Address, proposal_id: u64) {
         signer.require_auth();
-        if !Self::is_admin(&env, &signer) { panic!("Not an admin"); }
+        if !Self::is_admin(env.clone(), signer.clone()) { panic!("Not an admin"); }
         let proposal = Self::get_admin_proposal(&env, proposal_id);
         if proposal.is_executed { panic!("Proposal already executed"); }
         let sig_key = DataKey::AdminProposalSignature(proposal_id, signer.clone());
         if env.storage().instance().get::<_, bool>(&sig_key).unwrap_or(false) { panic!("Already signed"); }
         env.storage().instance().set(&sig_key, &true);
-        let sig_count = Self::admin_proposal_signature_count(&env, proposal_id);
-        let quorum = Self::get_quorum_threshold(&env);
+        let sig_count = Self::admin_proposal_signature_count(env.clone(), proposal_id);
+        let quorum = Self::get_quorum_threshold(env.clone());
         AdminProposalSigned {
             proposal_id,
             signer: signer.clone(),
@@ -583,7 +586,7 @@ impl VestingContract {
 
     pub fn propose_admin_action(env: Env, proposer: Address, action: AdminAction) -> u64 {
         proposer.require_auth();
-        if !Self::is_admin(&env, &proposer) { panic!("Not an admin"); }
+        if !Self::is_admin(env.clone(), proposer.clone()) { panic!("Not an admin"); }
         let now = env.ledger().timestamp();
         let proposal_id = Self::increment_admin_proposal_count(&env);
         let proposal = AdminProposal { id: proposal_id, action: action.clone(), proposer: proposer.clone(), created_at: now, is_executed: false };
@@ -596,8 +599,8 @@ impl VestingContract {
             created_at: now,
         }.publish(&env);
 
-        let sig_count = Self::admin_proposal_signature_count(&env, proposal_id);
-        if sig_count >= Self::get_quorum_threshold(&env) {
+        let sig_count = Self::admin_proposal_signature_count(env.clone(), proposal_id);
+        if sig_count >= Self::get_quorum_threshold(env.clone()) {
             let mut stored = proposal;
             stored.is_executed = true;
             env.storage().instance().set(&DataKey::AdminProposal(proposal_id), &stored);
@@ -611,17 +614,17 @@ impl VestingContract {
         proposal_id
     }
 
-    pub fn get_admins(env: &Env) -> Vec<Address> {
-        env.storage().instance().get(&DataKey::AdminSet).unwrap_or(Vec::new(env))
+    pub fn get_admins(env: Env) -> Vec<Address> {
+        env.storage().instance().get(&DataKey::AdminSet).unwrap_or(Vec::new(&env))
     }
 
-    pub fn get_quorum_threshold(env: &Env) -> u32 {
+    pub fn get_quorum_threshold(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::QuorumThreshold).unwrap_or(1u32)
     }
 
-    pub fn is_admin(env: &Env, addr: &Address) -> bool {
+    pub fn is_admin(env: Env, addr: Address) -> bool {
         let admins = Self::get_admins(env);
-        admins.iter().any(|a| a == *addr)
+        admins.iter().any(|a| a == addr)
     }
 
     pub fn initialize(env: Env, admin: Address, initial_supply: i128) {
@@ -854,21 +857,31 @@ impl VestingContract {
         Self::require_admin(&env);
         if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
         let total_amount = Self::validate_batch_data(&data);
-        Self::require_deposited_tokens_for_batch(&env, total_amount);
         Self::reserve_admin_balance_for_batch(&env, total_amount);
 
         let mut ids = Vec::new(&env);
         for i in 0..data.recipients.len() {
-            let id = Self::create_vault_full_internal(
+            let recipient = data.recipients.get(i).unwrap();
+            let basket = data.asset_baskets.get(i).unwrap();
+            
+            // Perform actual token transfers for this recipient's basket
+            for allocation in basket.iter() {
+                let admin = Self::get_admin(env.clone());
+                token::Client::new(&env, &allocation.asset_id)
+                    .transfer(&admin, &env.current_contract_address(), &allocation.total_amount);
+            }
+            
+            let id = Self::create_vault_prefunded_internal(
                 &env,
-                data.recipients.get(i).unwrap(),
-                0, // Amount should be derived from basket
+                recipient,
+                basket,
                 data.start_times.get(i).unwrap(),
                 data.end_times.get(i).unwrap(),
                 data.keeper_fees.get(i).unwrap(),
-                true,
-                false,
-                data.step_durations.get(i).unwrap_or(0)
+                true, // revocable
+                false, // transferable
+                data.step_durations.get(i).unwrap_or(0),
+                true // is_initialized
             );
             ids.push_back(id);
         }
@@ -941,7 +954,7 @@ impl VestingContract {
         let vault_id = Self::increment_vault_count(&env);
 
         // Transfer all assets from admin to contract
-        let admin = Self::get_admin(&env);
+        let admin = Self::get_admin(env.clone());
         for allocation in asset_basket.iter() {
             token::Client::new(&env, &allocation.asset_id)
                 .transfer(&admin, &env.current_contract_address(), &allocation.total_amount);
@@ -1037,7 +1050,7 @@ impl VestingContract {
             panic!("Vault already initialized");
         }
 
-        let admin = Self::get_admin(&env);
+        let admin = Self::get_admin(env.clone());
 
         // Transfer all assets from admin to contract
         for allocation in vault.allocations.iter() {
@@ -1667,7 +1680,7 @@ impl VestingContract {
         env.storage().instance().get(&DataKey::IsPaused).unwrap_or(false)
     }
 
-    pub fn get_admin(env: &Env) -> Address {
+    pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&DataKey::AdminAddress).expect("Admin not set")
     }
 
@@ -2265,7 +2278,7 @@ impl VestingContract {
         // For backward compatibility, create a single-asset vault
         let token: Address = env.storage().instance().get(&DataKey::Token).expect("Token not set");
         let allocation = AssetAllocationEntry {
-            asset_id: token,
+            asset_id: token.clone(),
             total_amount: amount,
             released_amount: 0,
             locked_amount: 0,
@@ -2275,6 +2288,8 @@ impl VestingContract {
         allocations.push_back(allocation);
         
         Self::sub_admin_balance(env, amount);
+        let admin = Self::get_admin(env.clone());
+        token::Client::new(env, &token).transfer(&admin, &env.current_contract_address(), &amount);
         Self::create_vault_prefunded_internal(
             env,
             owner,
@@ -2650,8 +2665,9 @@ impl VestingContract {
 
     fn calculate_claimable(env: &Env, id: u64, vault: &Vault) -> i128 {
         let mut total_claimable = 0;
-        for i in 0..vault.allocations.len() {
-            total_claimable += Self::calculate_claimable_for_asset(env, id, vault, i.try_into().unwrap());
+        for (i, allocation) in vault.allocations.iter().enumerate() {
+            let vested = Self::calculate_claimable_for_asset(env, id, vault, i.try_into().unwrap());
+            total_claimable += vested - allocation.released_amount;
         }
         total_claimable
     }
@@ -2727,7 +2743,7 @@ impl VestingContract {
     // --- Governance Helper Functions ---
 
     fn create_governance_proposal(env: Env, action: GovernanceAction) -> u64 {
-        let proposer = Self::get_admin(&env);
+        let proposer = Self::get_admin(env.clone());
         let now = env.ledger().timestamp();
         let proposal_id = Self::increment_proposal_count(&env);
         
@@ -2833,6 +2849,16 @@ impl VestingContract {
     VestingContract::get_total_locked_value(&env)
     }
 
+    pub fn pause(env: Env) {
+        Self::get_admin(env.clone()).require_auth();
+        env.storage().instance().set(&DataKey::IsPaused, &true);
+    }
+
+    pub fn resume(env: Env) {
+        Self::get_admin(env.clone()).require_auth();
+        env.storage().instance().set(&DataKey::IsPaused, &false);
+    }
+
     // --- Marketplace Functions (#89) ---
 
     pub fn authorize_marketplace_transfer(env: Env, vault_id: u64, marketplace: Address) {
@@ -2884,7 +2910,7 @@ impl VestingContract {
         let asset_id = allocation.asset_id.clone();
         
         // Fund extra from admin
-        let admin = Self::get_admin(&env);
+        let admin = Self::get_admin(env.clone());
         token::Client::new(env, &asset_id).transfer(&admin, &env.current_contract_address(), &additional_amount);
         
         allocation.total_amount += additional_amount;
@@ -2954,7 +2980,7 @@ impl VestingContract {
     }
 }
 
-pub mod diversified_core;
+// Redefinition removed
 
 #[cfg(test)]
 mod test;

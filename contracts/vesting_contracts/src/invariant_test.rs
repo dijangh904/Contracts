@@ -1,22 +1,28 @@
-use crate::{VestingContract, VestingContractClient, Milestone, BatchCreateData};
+#![cfg(test)]
+
+use crate::{VestingContract, VestingContractClient, Milestone, BatchCreateData, AssetAllocationEntry};
 use soroban_sdk::{testutils::{Address as _, Ledger}, token, vec, Address, Env};
 use proptest::prelude::*;
 
 fn setup_env() -> (Env, Address, VestingContractClient<'static>, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register(VestingContract, ());
+    let contract_id = env.register_contract(None, VestingContract);
     let client = VestingContractClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin, &1_000_000_000i128);
-
+    
     let token_admin = Address::generate(&env);
-    let token_addr = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_addr = env.register_stellar_asset_contract(token_admin.clone());
+    
+    client.initialize(&admin, &1_000_000_000i128);
     client.set_token(&token_addr);
-    client.add_to_whitelist(&token_addr);
-
+    
+    // We need to set the token in the contract if it expects it
+    // In our implementation, initialize sets up the token?
+    // Let's check lib.rs initialization.
+    
     let stellar = token::StellarAssetClient::new(&env, &token_addr);
-    stellar.mint(&contract_id, &1_000_000_000i128);
+    stellar.mint(&admin, &1_000_000_000i128); // Mint to admin, contract draws from sub-admin balance
 
     (env, contract_id, client, admin, token_addr)
 }
@@ -42,20 +48,24 @@ fn test_math_invariant_linear() {
 
     // Test multiple timestamps
     for t in 0..6000 {
-        env.ledger().set_timestamp(t);
+        env.ledger().with_mut(|li| {
+            li.timestamp = t;
+        });
+        
         let claimable = client.get_claimable_amount(&vault_id);
         let vault = client.get_vault(&vault_id);
+        let allocation = vault.allocations.get(0).unwrap();
         
         // Invariant 1: claimable + released <= total
-        assert!(claimable + vault.released_amount <= vault.total_amount, 
-            "Invariant 1 failed at t={}: {} + {} > {}", t, claimable, vault.released_amount, vault.total_amount);
+        assert!(claimable + allocation.released_amount <= allocation.total_amount, 
+            "Invariant 1 failed at t={}: {} + {} > {}", t, claimable, allocation.released_amount, allocation.total_amount);
         
         // Invariant 2: claimable >= 0
         assert!(claimable >= 0, "Invariant 2 failed at t={}", t);
         
         // Invariant 3: at end_time, everything is claimable
         if t >= end {
-            assert_eq!(claimable + vault.released_amount, vault.total_amount, "Invariant 3 failed at t={}", t);
+            assert_eq!(claimable + allocation.released_amount, allocation.total_amount, "Invariant 3 failed at t={}", t);
         }
     }
 }
@@ -70,17 +80,18 @@ proptest! {
     ) {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(VestingContract, ());
+        
+        let contract_id = env.register_contract(None, VestingContract);
         let client = VestingContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-        client.initialize(&admin, &amount);
         
         let token_admin = Address::generate(&env);
-        let token_addr = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
-        client.set_token(&token_addr);
-        client.add_to_whitelist(&token_addr);
+        let token_addr = env.register_stellar_asset_contract(token_admin.clone());
         
-        token::StellarAssetClient::new(&env, &token_addr).mint(&contract_id, &amount);
+        client.initialize(&admin, &amount); // supplying amount for admin balance
+        client.set_token(&token_addr);
+        
+        token::StellarAssetClient::new(&env, &token_addr).mint(&admin, &amount);
         
         let beneficiary = Address::generate(&env);
         let start = 10000u64;
@@ -104,15 +115,18 @@ proptest! {
                    else if i == 2 { end }
                    else { (start + (duration * i as u64 / 10)) };
             
-            env.ledger().set_timestamp(t);
+            env.ledger().with_mut(|li| {
+                li.timestamp = t;
+            });
+            
             let claimable = client.get_claimable_amount(&vault_id);
             let vault = client.get_vault(&vault_id);
+            let allocation = vault.allocations.get(0).unwrap();
             
-            assert!(claimable + vault.released_amount <= amount, "Invariant Violation! Released: {}, Claimable: {}, Total: {}", vault.released_amount, claimable, amount);
+            assert!(claimable + allocation.released_amount <= amount, "Invariant Violation! Released: {}, Claimable: {}, Total: {}", allocation.released_amount, claimable, amount);
             if t >= end {
-                 assert_eq!(claimable + vault.released_amount, amount, "Final unlock invariant failed!");
+                 assert_eq!(claimable + allocation.released_amount, amount, "Final unlock invariant failed!");
             }
         }
     }
 }
-

@@ -4,8 +4,8 @@ use soroban_sdk::{Env, Address};
 fn test_export_claims() {
     let env = Env::default();
 
-    let user1 = Address::random(&env);
-    let user2 = Address::random(&env);
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
 
     // simulate claims (pseudo depending on setup)
 

@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod diversified_core_tests {
-    use super::diversified_core::*;
-    use soroban_sdk::{testutils::Address as _, vec, Address, Env};
+    use crate::diversified_core::*;
+    use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, vec, Address, Env};
 
     #[test]
     fn test_asset_basket_validation() {
