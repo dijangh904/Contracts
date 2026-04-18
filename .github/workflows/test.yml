@@ -19,8 +19,8 @@ jobs:
       - name: Install Rust
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: stable
-          target: wasm32-unknown-unknown
+          toolchain: 1.84.0
+          target: wasm32v1-none
           override: true
           components: rustfmt, clippy
 
@@ -53,7 +53,7 @@ jobs:
       - name: Build Contract
         run: |
           cargo clean
-          cargo build --target wasm32-unknown-unknown --release
+          cargo build --target wasm32v1-none --release
 
       - name: Run Unit Tests
         run: |
