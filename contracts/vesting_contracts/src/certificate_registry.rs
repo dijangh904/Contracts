@@ -1,4 +1,4 @@
-use soroban_sdk::{contract, contractimpl, contracttype, contractevent, Address, Env, Map, String, Symbol, Vec, U256};
+use soroban_sdk::{contract, contractimpl, contracttype, contractevent, Address, Env, String, Vec, U256};
 use crate::{Vault, DataKey};
 
 #[contracttype]

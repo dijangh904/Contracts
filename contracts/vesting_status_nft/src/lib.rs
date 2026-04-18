@@ -3,7 +3,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, contractevent, Address, 
 
 mod vesting_contract {
     soroban_sdk::contractimport!(
-        file = "../../target/wasm32-unknown-unknown/release/vesting_contracts.wasm"
+        file = "../../target/wasm32v1-none/release/vesting_contracts.wasm"
     );
 }
 

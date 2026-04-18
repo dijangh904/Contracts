@@ -9,9 +9,7 @@ use soroban_sdk::{
     Address,
     Env,
     IntoVal,
-    Map,
     Symbol,
-    Val,
     Vec,
     String,
     U256,
@@ -1451,7 +1449,7 @@ impl VestingContract {
         Self::require_admin(&env);
         
         // Verify vault exists
-        let vault = Self::get_vault_internal(&env, vault_id);
+        let _vault = Self::get_vault_internal(&env, vault_id);
         
         // Force adjustment by temporarily updating last_adjustment_time
         if let Some(mut config) = env.storage().instance().get::<_, AntiDilutionConfig>(&DataKey::AntiDilutionConfig(vault_id)) {
@@ -2246,7 +2244,7 @@ impl VestingContract {
         }
     }
 
-    fn require_collateral_bridge(env: &Env) {
+    fn _require_collateral_bridge(env: &Env) {
         let bridge: Address = env
             .storage()
             .instance()
@@ -2461,7 +2459,7 @@ impl VestingContract {
         total_amount
     }
 
-    fn validate_schedule_configs(schedules: &Vec<ScheduleConfig>) -> i128 {
+    fn _validate_schedule_configs(schedules: &Vec<ScheduleConfig>) -> i128 {
         if schedules.is_empty() {
             panic!("Empty batch");
         }

@@ -2,7 +2,7 @@
 // Plugs into VestingContract::claim_tokens as an additional guard.
 // All token math stays in lib.rs — this module only enforces the KPI gate.
 
-use soroban_sdk::{contractevent, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{contractevent, Address, Env, Symbol};
 use crate::kpi_engine::{self, KpiOracleConfig, KpiVerificationRecord};
 use crate::oracle::ComparisonOperator;
 
