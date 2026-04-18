@@ -157,6 +157,10 @@ impl VestingVault {
         get_claim_history(&e)
     }
 
+    pub fn get_claims_by_user(e: Env, user: Address) -> Vec<ClaimEvent> {
+        audit_exporter::export_claims_by_user(&e, user)
+    }
+
     // ========== ISSUE #140: Emergency Protocol Pause for Auditors ==========
     
     /// Initialize the auditor security team
