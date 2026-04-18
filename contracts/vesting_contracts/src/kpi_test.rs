@@ -1,11 +1,10 @@
 #![cfg(test)]
 
 use soroban_sdk::{
-    symbol_short, testutils::Address as _, Address, Env, Symbol,
+    symbol_short, testutils::Address as _, Address, Env,
 };
 use crate::kpi_engine::{
-    is_kpi_met, set_kpi_met, get_kpi_config,
-    get_kpi_log, KpiOracleConfig, KpiVerificationRecord,
+    is_kpi_met, set_kpi_met, get_kpi_config, get_kpi_log,
 };
 use crate::kpi_vesting::{
     attach_kpi_gate, require_kpi_gate_passed, kpi_status, kpi_threshold,
@@ -27,7 +26,7 @@ fn dummy_oracle(env: &Env) -> Address {
 #[test]
 fn test_kpi_flag_starts_false() {
     let env = make_env();
-    let cid = env.register_contract(None, crate::VestingContract);
+    let cid = env.register(crate::VestingContract, ());
     env.as_contract(&cid, || {
         assert!(!is_kpi_met(&env, 1));
     });
@@ -36,7 +35,7 @@ fn test_kpi_flag_starts_false() {
 #[test]
 fn test_kpi_flag_write_once_true() {
     let env = make_env();
-    let cid = env.register_contract(None, crate::VestingContract);
+    let cid = env.register(crate::VestingContract, ());
     env.as_contract(&cid, || {
         set_kpi_met(&env, 1, true);
         assert!(is_kpi_met(&env, 1));
@@ -46,7 +45,7 @@ fn test_kpi_flag_write_once_true() {
 #[test]
 fn test_kpi_flag_idempotent_set_true_twice() {
     let env = make_env();
-    let cid = env.register_contract(None, crate::VestingContract);
+    let cid = env.register(crate::VestingContract, ());
     env.as_contract(&cid, || {
         // Setting true twice must not panic — it is a no-op on the second call.
         set_kpi_met(&env, 1, true);
@@ -59,7 +58,7 @@ fn test_kpi_flag_idempotent_set_true_twice() {
 #[should_panic(expected = "KPI already verified: flag is write-once and cannot be unset")]
 fn test_kpi_flag_cannot_be_unset() {
     let env = make_env();
-    let cid = env.register_contract(None, crate::VestingContract);
+    let cid = env.register(crate::VestingContract, ());
     env.as_contract(&cid, || {
         set_kpi_met(&env, 1, true);
         set_kpi_met(&env, 1, false); // must panic
@@ -71,7 +70,7 @@ fn test_kpi_flag_cannot_be_unset() {
 #[test]
 fn test_attach_kpi_gate_stores_config() {
     let env = make_env();
-    let cid = env.register_contract(None, crate::VestingContract);
+    let cid = env.register(crate::VestingContract, ());
     let oracle = dummy_oracle(&env);
 
     env.as_contract(&cid, || {
@@ -94,7 +93,7 @@ fn test_attach_kpi_gate_stores_config() {
 #[should_panic(expected = "KPI threshold must be positive")]
 fn test_attach_kpi_gate_rejects_zero_threshold() {
     let env = make_env();
-    let cid = env.register_contract(None, crate::VestingContract);
+    let cid = env.register(crate::VestingContract, ());
     let oracle = dummy_oracle(&env);
 
     env.as_contract(&cid, || {
@@ -113,7 +112,7 @@ fn test_attach_kpi_gate_rejects_zero_threshold() {
 #[should_panic(expected = "Cannot reconfigure a KPI gate that has already been verified")]
 fn test_cannot_overwrite_verified_gate() {
     let env = make_env();
-    let cid = env.register_contract(None, crate::VestingContract);
+    let cid = env.register(crate::VestingContract, ());
     let oracle = dummy_oracle(&env);
 
     env.as_contract(&cid, || {
@@ -146,7 +145,7 @@ fn test_cannot_overwrite_verified_gate() {
 #[test]
 fn test_require_kpi_gate_passes_when_no_config() {
     let env = make_env();
-    let cid = env.register_contract(None, crate::VestingContract);
+    let cid = env.register(crate::VestingContract, ());
     env.as_contract(&cid, || {
         // No config set — gate is opt-in, must pass silently.
         require_kpi_gate_passed(&env, 99);
@@ -157,7 +156,7 @@ fn test_require_kpi_gate_passes_when_no_config() {
 #[should_panic(expected = "KPI gate not yet verified")]
 fn test_require_kpi_gate_blocks_when_not_met() {
     let env = make_env();
-    let cid = env.register_contract(None, crate::VestingContract);
+    let cid = env.register(crate::VestingContract, ());
     let oracle = dummy_oracle(&env);
 
     env.as_contract(&cid, || {
@@ -178,7 +177,7 @@ fn test_require_kpi_gate_blocks_when_not_met() {
 #[test]
 fn test_require_kpi_gate_passes_when_met() {
     let env = make_env();
-    let cid = env.register_contract(None, crate::VestingContract);
+    let cid = env.register(crate::VestingContract, ());
     let oracle = dummy_oracle(&env);
 
     env.as_contract(&cid, || {
@@ -203,7 +202,7 @@ fn test_require_kpi_gate_passes_when_met() {
 #[test]
 fn test_kpi_threshold_returns_zero_when_no_config() {
     let env = make_env();
-    let cid = env.register_contract(None, crate::VestingContract);
+    let cid = env.register(crate::VestingContract, ());
     env.as_contract(&cid, || {
         assert_eq!(kpi_threshold(&env, 7), 0);
     });
@@ -212,7 +211,7 @@ fn test_kpi_threshold_returns_zero_when_no_config() {
 #[test]
 fn test_kpi_threshold_returns_configured_value() {
     let env = make_env();
-    let cid = env.register_contract(None, crate::VestingContract);
+    let cid = env.register(crate::VestingContract, ());
     let oracle = dummy_oracle(&env);
 
     env.as_contract(&cid, || {
@@ -232,7 +231,7 @@ fn test_kpi_threshold_returns_configured_value() {
 #[test]
 fn test_kpi_status_false_before_verification() {
     let env = make_env();
-    let cid = env.register_contract(None, crate::VestingContract);
+    let cid = env.register(crate::VestingContract, ());
     env.as_contract(&cid, || {
         assert!(!kpi_status(&env, 3));
     });
@@ -241,7 +240,7 @@ fn test_kpi_status_false_before_verification() {
 #[test]
 fn test_kpi_status_true_after_verification() {
     let env = make_env();
-    let cid = env.register_contract(None, crate::VestingContract);
+    let cid = env.register(crate::VestingContract, ());
     env.as_contract(&cid, || {
         set_kpi_met(&env, 3, true);
         assert!(kpi_status(&env, 3));
@@ -253,7 +252,7 @@ fn test_kpi_status_true_after_verification() {
 #[test]
 fn test_verification_log_is_empty_before_verify() {
     let env = make_env();
-    let cid = env.register_contract(None, crate::VestingContract);
+    let cid = env.register(crate::VestingContract, ());
     env.as_contract(&cid, || {
         let log = get_kpi_log(&env, 10);
         assert_eq!(log.len(), 0);
@@ -263,7 +262,7 @@ fn test_verification_log_is_empty_before_verify() {
 #[test]
 fn test_verification_log_appended_on_verify() {
     let env = make_env();
-    let cid = env.register_contract(None, crate::VestingContract);
+    let cid = env.register(crate::VestingContract, ());
     let oracle = dummy_oracle(&env);
     let caller = Address::generate(&env);
 

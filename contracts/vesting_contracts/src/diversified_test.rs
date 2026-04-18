@@ -3,11 +3,11 @@ mod diversified_vesting_tests {
     use crate::{AssetAllocationEntry, VestingContract, VestingContractClient};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
-        token, vec, Address, Env, String, IntoVal,
+        token, vec, Address, Env, String,
     };
 
     fn create_token_contract<'a>(env: &Env, admin: &Address) -> (token::Client<'a>, token::StellarAssetClient<'a>) {
-        let address = env.register_stellar_asset_contract(admin.clone());
+        let address = env.register_stellar_asset_contract_v2(admin.clone()).address();
         (token::Client::new(env, &address), token::StellarAssetClient::new(env, &address))
     }
 
@@ -30,7 +30,7 @@ mod diversified_vesting_tests {
         asset3.mint(&admin, &10000);
 
         // Create vesting contract
-        let contract_id = env.register_contract(None, VestingContract);
+        let contract_id = env.register(VestingContract, ());
         let client = VestingContractClient::new(&env, &contract_id);
 
         // Initialize vesting contract
@@ -129,7 +129,7 @@ mod diversified_vesting_tests {
         let (token1, asset1) = create_token_contract(&env, &admin);
         asset1.mint(&admin, &10000);
 
-        let contract_id = env.register_contract(None, VestingContract);
+        let contract_id = env.register(VestingContract, ());
         let client = VestingContractClient::new(&env, &contract_id);
         client.initialize(&admin, &1_000_000i128);
 

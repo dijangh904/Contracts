@@ -1,12 +1,12 @@
 #![cfg(test)]
 
 use crate::{
-    BatchCreateData, Milestone, PausedVault, VestingContract, VestingContractClient,
+    BatchCreateData, VestingContract, VestingContractClient,
     AssetAllocationEntry,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, vec, Address, Env, String, IntoVal,
+    token, vec, Address, Env,
 };
 
 fn setup() -> (Env, Address, VestingContractClient<'static>, Address, token::Client<'static>) {
@@ -15,11 +15,11 @@ fn setup() -> (Env, Address, VestingContractClient<'static>, Address, token::Cli
 
     let admin = Address::generate(&env);
     let token_admin = Address::generate(&env);
-    let token_address = env.register_stellar_asset_contract(token_admin.clone());
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
     let token = token::Client::new(&env, &token_address);
     let asset_client = token::StellarAssetClient::new(&env, &token_address);
 
-    let contract_id = env.register_contract(None, VestingContract);
+    let contract_id = env.register(VestingContract, ());
     let client = VestingContractClient::new(&env, &contract_id);
 
     client.initialize(&admin, &1_000_000_000i128);

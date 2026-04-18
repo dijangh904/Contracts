@@ -45,11 +45,6 @@ pub struct OracleQuery {
     pub require_all: bool,
 }
 
-#[allow(dead_code)]
-pub trait OracleInterface {
-    fn query_value(env: &Env, oracle_type: OracleType, parameter: Option<Symbol>) -> i128;
-}
-
 pub struct OracleClient;
 
 impl OracleClient {

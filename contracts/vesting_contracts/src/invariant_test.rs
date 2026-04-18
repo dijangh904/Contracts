@@ -1,18 +1,18 @@
 #![cfg(test)]
 
-use crate::{VestingContract, VestingContractClient, Milestone, BatchCreateData, AssetAllocationEntry};
-use soroban_sdk::{testutils::{Address as _, Ledger}, token, vec, Address, Env};
+use crate::{VestingContract, VestingContractClient};
+use soroban_sdk::{testutils::{Address as _, Ledger}, token, Address, Env};
 use proptest::prelude::*;
 
 fn setup_env() -> (Env, Address, VestingContractClient<'static>, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register_contract(None, VestingContract);
+    let contract_id = env.register(VestingContract, ());
     let client = VestingContractClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
     
     let token_admin = Address::generate(&env);
-    let token_addr = env.register_stellar_asset_contract(token_admin.clone());
+    let token_addr = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
     
     client.initialize(&admin, &1_000_000_000i128);
     client.set_token(&token_addr);
@@ -81,12 +81,12 @@ proptest! {
         let env = Env::default();
         env.mock_all_auths();
         
-        let contract_id = env.register_contract(None, VestingContract);
+        let contract_id = env.register(VestingContract, ());
         let client = VestingContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         
         let token_admin = Address::generate(&env);
-        let token_addr = env.register_stellar_asset_contract(token_admin.clone());
+        let token_addr = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
         
         client.initialize(&admin, &amount); // supplying amount for admin balance
         client.set_token(&token_addr);
@@ -113,7 +113,7 @@ proptest! {
             let t = if i == 0 { 0 } 
                    else if i == 1 { start }
                    else if i == 2 { end }
-                   else { (start + (duration * i as u64 / 10)) };
+                   else { start + (duration * i as u64 / 10) };
             
             env.ledger().with_mut(|li| {
                 li.timestamp = t;

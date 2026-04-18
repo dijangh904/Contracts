@@ -1,13 +1,12 @@
 #![cfg(test)]
 
-use soroban_sdk::{symbol_short, vec, Address, Env, String, U256, Vec};
-use soroban_sdk::testutils::{Address as _, Ledger as _};
+use soroban_sdk::{vec, Address, Env, String, U256, Vec};
+use soroban_sdk::testutils::Address as _;
 use crate::{
-    VestingContract, VestingContractClient,
+    VestingContract, VestingContractClient, Vault, AssetAllocationEntry, DataKey,
     certificate_registry::{
-        VestingCertificateRegistry, VestingCertificateRegistryClient, CompletedVestCertificate, CertificateQuery, WorkVerification,
+        VestingCertificateRegistry, VestingCertificateRegistryClient, CertificateQuery,
     },
-    Vault, AssetAllocationEntry, DataKey,
 };
 
 #[test]
@@ -21,7 +20,7 @@ fn test_certificate_registration() {
     let token = Address::generate(&env);
     
     // Setup contract
-    let contract_id = env.register_contract(None, VestingContract);
+    let contract_id = env.register(VestingContract, ());
     let client = VestingContractClient::new(&env, &contract_id);
     
     // Initialize contract
@@ -60,7 +59,7 @@ fn test_certificate_registration() {
     };
     
     // Setup registry
-    let registry_id = env.register_contract(None, VestingCertificateRegistry);
+    let registry_id = env.register(VestingCertificateRegistry, ());
     let registry_client = VestingCertificateRegistryClient::new(&env, &registry_id);
     
     // Register certificate
@@ -95,7 +94,7 @@ fn test_work_verification() {
     let token = Address::generate(&env);
     
     // Setup verifier
-    let contract_id = env.register_contract(None, VestingCertificateRegistry);
+    let contract_id = env.register(VestingCertificateRegistry, ());
     let registry_client = VestingCertificateRegistryClient::new(&env, &contract_id);
     
     registry_client.set_verifier(&verifier);
@@ -147,14 +146,14 @@ fn test_certificate_query_by_beneficiary() {
     let beneficiary2 = Address::generate(&env);
     let token = Address::generate(&env);
     
-    let contract_id = env.register_contract(None, VestingCertificateRegistry);
+    let contract_id = env.register(VestingCertificateRegistry, ());
     let registry_client = VestingCertificateRegistryClient::new(&env, &contract_id);
     
     // Create certificates for two beneficiaries
     let vault1 = create_test_vault(&env, beneficiary1.clone(), token.clone());
     let vault2 = create_test_vault(&env, beneficiary2.clone(), token.clone());
     
-    let cert1_id = registry_client.register_completed_vest(
+    let _cert1_id = registry_client.register_completed_vest(
         &1,
         &beneficiary1,
         &vault1,
@@ -199,7 +198,7 @@ fn test_certificate_query_by_loyalty_score() {
     let beneficiary = Address::generate(&env);
     let token = Address::generate(&env);
     
-    let contract_id = env.register_contract(None, VestingCertificateRegistry);
+    let contract_id = env.register(VestingCertificateRegistry, ());
     let registry_client = VestingCertificateRegistryClient::new(&env, &contract_id);
     
     // Create certificates with different loyalty scores
@@ -251,7 +250,7 @@ fn test_certificate_query_verified_only() {
     let verifier = Address::generate(&env);
     let token = Address::generate(&env);
     
-    let contract_id = env.register_contract(None, VestingCertificateRegistry);
+    let contract_id = env.register(VestingCertificateRegistry, ());
     let registry_client = VestingCertificateRegistryClient::new(&env, &contract_id);
     
     registry_client.set_verifier(&verifier);
@@ -312,7 +311,7 @@ fn test_get_beneficiary_certificates() {
     let beneficiary = Address::generate(&env);
     let token = Address::generate(&env);
     
-    let contract_id = env.register_contract(None, VestingCertificateRegistry);
+    let contract_id = env.register(VestingCertificateRegistry, ());
     let registry_client = VestingCertificateRegistryClient::new(&env, &contract_id);
     
     // Create multiple certificates for the same beneficiary
@@ -370,7 +369,7 @@ fn test_loyalty_score_calculation() {
     let beneficiary = Address::generate(&env);
     let token = Address::generate(&env);
     
-    let contract_id = env.register_contract(None, VestingCertificateRegistry);
+    let contract_id = env.register(VestingCertificateRegistry, ());
     let registry_client = VestingCertificateRegistryClient::new(&env, &contract_id);
     
     // Create a vault with perfect timing (completed exactly at end_time)

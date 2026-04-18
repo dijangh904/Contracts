@@ -7,6 +7,7 @@ use vesting_vault::{VestingVault, VestingVaultClient, PathPaymentConfig, PathPay
 #[test]
 fn test_configure_path_payment() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, VestingVault);
     let client = VestingVaultClient::new(&env, &contract_id);
     
@@ -41,6 +42,7 @@ fn test_configure_path_payment() {
 #[test]
 fn test_disable_path_payment() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, VestingVault);
     let client = VestingVaultClient::new(&env, &contract_id);
     
@@ -63,6 +65,7 @@ fn test_disable_path_payment() {
 #[test]
 fn test_claim_with_path_payment_success() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, VestingVault);
     let client = VestingVaultClient::new(&env, &contract_id);
     
@@ -86,6 +89,7 @@ fn test_claim_with_path_payment_success() {
 #[test]
 fn test_claim_with_path_payment_not_configured() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, VestingVault);
     let client = VestingVaultClient::new(&env, &contract_id);
     
@@ -104,6 +108,7 @@ fn test_claim_with_path_payment_not_configured() {
 #[test]
 fn test_claim_with_path_payment_disabled() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, VestingVault);
     let client = VestingVaultClient::new(&env, &contract_id);
     
@@ -129,6 +134,7 @@ fn test_claim_with_path_payment_disabled() {
 #[test]
 fn test_claim_with_path_payment_insufficient_minimum() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, VestingVault);
     let client = VestingVaultClient::new(&env, &contract_id);
     
@@ -153,6 +159,7 @@ fn test_claim_with_path_payment_insufficient_minimum() {
 #[test]
 fn test_path_payment_zero_minimum_amount() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, VestingVault);
     let client = VestingVaultClient::new(&env, &contract_id);
     

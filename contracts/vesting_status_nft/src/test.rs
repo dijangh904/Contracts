@@ -14,11 +14,11 @@ fn test_nft_minting_and_levels() {
     let user = Address::generate(&env);
 
     // Register Vesting Contract
-    let vesting_id = env.register_contract(None, VestingContract);
+    let vesting_id = env.register(VestingContract, ());
     let vesting_client = VestingContractClient::new(&env, &vesting_id);
 
     // Register NFT Contract
-    let nft_id = env.register_contract(None, VestingStatusNFT);
+    let nft_id = env.register(VestingStatusNFT, ());
     let nft_client = VestingStatusNFTClient::new(&env, &nft_id);
 
     // Initialize contracts
@@ -31,7 +31,7 @@ fn test_nft_minting_and_levels() {
     // Setup Token
     let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
     let token_admin = token::StellarAssetClient::new(&env, &token_id);
-    token_admin.mint(&vesting_id, &1000i128);
+    token_admin.mint(&admin, &1000_000_000_000i128);
     vesting_client.set_token(&token_id);
 
     // Create Vault for user: 100 tokens, 100 seconds

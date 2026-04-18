@@ -408,7 +408,7 @@
                               "symbol": "is_executed"
                             },
                             "val": {
-                              "bool": false
+                              "bool": true
                             }
                           },
                           {
@@ -573,7 +573,7 @@
                         ]
                       },
                       "val": {
-                        "i128": "0"
+                        "i128": "1000"
                       }
                     },
                     {
@@ -592,12 +592,202 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "UserVaults"
+                          },
+                          {
+                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "vec": [
+                          {
+                            "u64": "1"
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "VaultCount"
                           }
                         ]
                       },
                       "val": {
-                        "u64": "0"
+                        "u64": "1"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "VaultData"
+                          },
+                          {
+                            "u64": "1"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "map": [
+                          {
+                            "key": {
+                              "symbol": "allocations"
+                            },
+                            "val": {
+                              "vec": [
+                                {
+                                  "map": [
+                                    {
+                                      "key": {
+                                        "symbol": "asset_id"
+                                      },
+                                      "val": {
+                                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                                      }
+                                    },
+                                    {
+                                      "key": {
+                                        "symbol": "locked_amount"
+                                      },
+                                      "val": {
+                                        "i128": "0"
+                                      }
+                                    },
+                                    {
+                                      "key": {
+                                        "symbol": "percentage"
+                                      },
+                                      "val": {
+                                        "u32": 10000
+                                      }
+                                    },
+                                    {
+                                      "key": {
+                                        "symbol": "released_amount"
+                                      },
+                                      "val": {
+                                        "i128": "0"
+                                      }
+                                    },
+                                    {
+                                      "key": {
+                                        "symbol": "total_amount"
+                                      },
+                                      "val": {
+                                        "i128": "1000"
+                                      }
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "creation_time"
+                            },
+                            "val": {
+                              "u64": "1000"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "delegate"
+                            },
+                            "val": "void"
+                          },
+                          {
+                            "key": {
+                              "symbol": "end_time"
+                            },
+                            "val": {
+                              "u64": "2000"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "is_frozen"
+                            },
+                            "val": {
+                              "bool": false
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "is_initialized"
+                            },
+                            "val": {
+                              "bool": true
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "is_irrevocable"
+                            },
+                            "val": {
+                              "bool": false
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "is_transferable"
+                            },
+                            "val": {
+                              "bool": false
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "keeper_fee"
+                            },
+                            "val": {
+                              "i128": "0"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "owner"
+                            },
+                            "val": {
+                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "staked_amount"
+                            },
+                            "val": {
+                              "i128": "0"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "start_time"
+                            },
+                            "val": {
+                              "u64": "1000"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "step_duration"
+                            },
+                            "val": {
+                              "u64": "0"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "title"
+                            },
+                            "val": {
+                              "string": ""
+                            }
+                          }
+                        ]
                       }
                     }
                   ]

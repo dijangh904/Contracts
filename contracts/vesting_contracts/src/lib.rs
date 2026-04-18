@@ -574,6 +574,10 @@ impl VestingContract {
         }.publish(&env);
 
         if sig_count >= quorum {
+            let mut stored = proposal.clone();
+            stored.is_executed = true;
+            env.storage().instance().set(&DataKey::AdminProposal(proposal_id), &stored);
+            Self::dispatch_admin_action(env.clone(), proposal.action.clone());
             AdminProposalExecuted {
                 proposal_id,
                 action: proposal.action.clone(),
@@ -1376,6 +1380,7 @@ impl VestingContract {
         cliff: PerformanceCliff
     ) -> u64 {
         Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
         let vault_id = Self::create_vault_full_internal(
             &env,
             owner,
@@ -1387,7 +1392,7 @@ impl VestingContract {
             is_transferable,
             step_duration
         );
-        Self::set_performance_cliff(env, vault_id, cliff);
+        env.storage().instance().set(&DataKey::VaultPerformanceCliff(vault_id), &cliff);
         vault_id
     }
 
@@ -2988,3 +2993,7 @@ mod invariant_test;
 mod diversified_test;
 #[cfg(test)]
 mod diversified_simple_test;
+#[cfg(test)]
+mod performance_cliff_test;
+#[cfg(test)]
+mod multisig_admin_test;
