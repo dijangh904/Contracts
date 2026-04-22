@@ -8,7 +8,7 @@ mod audit_exporter;
 mod emergency;
 
 pub use types::*;
-use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_tax_withholding_config, set_tax_withholding_config, get_sep12_identity_oracle, set_sep12_identity_oracle, get_token_metadata, set_token_metadata, get_vesting_grant, set_vesting_grant};
+use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_lockup_config, set_lockup_config, remove_lockup_config, get_reassignment_counter, set_reassignment_counter, get_beneficiary_reassignment, set_beneficiary_reassignment, remove_beneficiary_reassignment, get_veto_votes, set_veto_votes, add_veto_vote, get_token_supply_info, set_token_supply_info, get_governance_veto_threshold, set_governance_veto_threshold, get_governance_veto_period};
 use emergency::{AuditorPauseRequest, EmergencyPause, EmergencyPauseTriggered};
 
 #[contract]
@@ -805,16 +805,434 @@ impl VestingVault {
         simulated_destination_amount
     }
     
-    /// Internal function to simulate path payment result
-    /// In production, this would query the Stellar DEX for real rates
-    fn simulate_path_payment_result(_e: &Env, source_amount: i128, _destination_asset: &Address, _path: &Vec<Address>) -> i128 {
-        // Placeholder: assume 1:1 conversion rate for simulation
-        // In production, this would query the Stellar DEX for actual exchange rates
-        // considering the provided path and current market conditions
+    /// Check if a user's tokens are unlocked for a specific vesting schedule
+    pub fn is_user_unlocked(e: Env, user: Address, vesting_id: u32) -> bool {
+        if let Some(lockup_config) = get_lockup_config(&e, vesting_id) {
+            if lockup_config.enabled {
+                // In a real implementation, this would query the lockup token contract
+                // For now, we'll return false (locked) as a placeholder
+                false
+            } else {
+                true // No lock-up configured
+            }
+        } else {
+            true // No lock-up configured
+        }
+    }
+    
+    /// Get the unlock time for a user's tokens
+    pub fn get_user_unlock_time(e: Env, user: Address, vesting_id: u32) -> Option<u64> {
+        if let Some(lockup_config) = get_lockup_config(&e, vesting_id) {
+            if lockup_config.enabled {
+                // In a real implementation, this would query the lockup token contract
+                // For now, we'll return a placeholder
+                Some(e.ledger().timestamp() + lockup_config.lockup_duration_seconds)
+            } else {
+                None // No lock-up configured
+            }
+        } else {
+            None // No lock-up configured
+        }
+    }
+
+    // ========== ISSUE #211: Lock-Up Periods for Claimed Assets ==========
+
+    /// Configure lock-up period for a vesting schedule
+    /// This enables legal compliance requirements where tokens cannot be sold immediately after vesting
+    pub fn configure_lockup(e: Env, admin: Address, vesting_id: u32, lockup_duration_seconds: u64, lockup_token_address: Address) {
+        admin.require_auth();
         
-        // For USDC destination, we can assume close to 1:1 with small slippage
-        let slippage_factor = 9950; // 99.5% (0.5% slippage)
-        (source_amount * slippage_factor) / 10000
+        let config = LockupConfig {
+            vesting_id,
+            lockup_duration_seconds,
+            enabled: true,
+            lockup_token_address: lockup_token_address.clone(),
+        };
+        
+        set_lockup_config(&e, vesting_id, &config);
+        
+        // Emit configuration event
+        LockupConfigured {
+            vesting_id,
+            lockup_duration_seconds,
+            lockup_token_address,
+            timestamp: e.ledger().timestamp(),
+        }.publish(&e);
+    }
+    
+    /// Disable lock-up period for a vesting schedule
+    /// This allows immediate claims without lock-up restrictions
+    pub fn disable_lockup(e: Env, admin: Address, vesting_id: u32) {
+        admin.require_auth();
+        
+        remove_lockup_config(&e, vesting_id);
+        
+        // Emit disable event
+        LockupDisabled {
+            vesting_id,
+            timestamp: e.ledger().timestamp(),
+        }.publish(&e);
+    }
+    
+    /// Claim tokens with lock-up period handling
+    /// This is the enhanced claim function that handles lock-up periods
+    pub fn claim_with_lockup(e: Env, user: Address, vesting_id: u32, amount: i128) {
+        user.require_auth();
+
+        // Check if contract is under emergency pause
+        if let Some(pause) = get_emergency_pause(&e) {
+            if pause.is_active {
+                let current_time = e.ledger().timestamp();
+                if current_time < pause.expires_at {
+                    panic!("Contract is under emergency pause until {}", pause.expires_at);
+                } else {
+                    // Pause expired, remove it
+                    remove_emergency_pause(&e);
+                }
+            }
+        }
+
+        // Check if user has an authorized payout address
+        if let Some(auth_address) = storage_get_authorized_payout_address(&e, &user) {
+            if auth_address.is_active {
+                let current_time = e.ledger().timestamp();
+                
+                // Check if timelock has passed
+                if current_time < auth_address.effective_at {
+                    panic!("Authorized payout address is still in timelock period");
+                }
+            }
+        }
+
+        // Check milestone vesting if applicable
+        if let Some(_milestone_configs) = get_milestone_configs(&e, vesting_id) {
+            let _milestone_status = get_milestone_status(&e, vesting_id);
+            // Additional milestone logic would go here
+        }
+
+        // Check if lock-up period is configured for this vesting schedule
+        if let Some(lockup_config) = get_lockup_config(&e, vesting_id) {
+            if lockup_config.enabled {
+                // Issue wrapped tokens instead of raw tokens
+                Self::issue_wrapped_tokens(&e, &user, vesting_id, amount, &lockup_config);
+                return;
+            }
+        }
+
+        // Original claim logic for non-lockup cases
+        let mut history = get_claim_history(&e);
+
+        let event = ClaimEvent {
+            beneficiary: user.clone(),
+            amount,
+            timestamp: e.ledger().timestamp(),
+            vesting_id,
+        };
+
+        history.push_back(event);
+
+        set_claim_history(&e, &history);
+    }
+    
+    /// Internal function to issue wrapped tokens during lock-up period
+    fn issue_wrapped_tokens(e: &Env, user: &Address, vesting_id: u32, amount: i128, lockup_config: &LockupConfig) {
+        let current_time = e.ledger().timestamp();
+        let unlock_time = current_time + lockup_config.lockup_duration_seconds;
+        
+        // Call the lockup token contract to issue wrapped tokens
+        // In a real implementation, this would be a cross-contract call
+        // For now, we'll simulate this by emitting an event
+        
+        // Record the lockup claim event
+        let mut history = get_claim_history(e);
+        
+        let claim_event = ClaimEvent {
+            beneficiary: user.clone(),
+            amount,
+            timestamp: current_time,
+            vesting_id,
+        };
+        
+        history.push_back(claim_event);
+        set_claim_history(e, &history);
+        
+        // Emit lockup claim event
+        LockupClaimExecuted {
+            user: user.clone(),
+            vesting_id,
+            amount,
+            lockup_token_address: lockup_config.lockup_token_address.clone(),
+            unlock_time,
+            timestamp: current_time,
+        }.publish(e);
+        
+        // In a real implementation, this would invoke the lockup token contract:
+        // e.invoke_contract::<()>(
+        //     &lockup_config.lockup_token_address,
+        //     &symbol_short!("issue_wrapped_tokens"),
+        //     (e.current_contract_address(), user.clone(), vesting_id, amount)
+        // );
+    }
+
+    // ========== ISSUE #114 & #212: Beneficiary Reassignment with Governance Veto ==========
+
+    /// Initialize total token supply for governance calculations
+    pub fn initialize_token_supply(e: Env, admin: Address, total_supply: i128) {
+        admin.require_auth();
+        
+        let supply_info = TokenSupplyInfo {
+            total_supply,
+            last_updated: e.ledger().timestamp(),
+        };
+        
+        set_token_supply_info(&e, &supply_info);
+    }
+    
+    /// Update total token supply (for dynamic supply tracking)
+    pub fn update_token_supply(e: Env, admin: Address, new_total_supply: i128) {
+        admin.require_auth();
+        
+        let supply_info = TokenSupplyInfo {
+            total_supply: new_total_supply,
+            last_updated: e.ledger().timestamp(),
+        };
+        
+        set_token_supply_info(&e, &supply_info);
+    }
+    
+    /// Set governance veto threshold percentage
+    pub fn set_governance_veto_threshold(e: Env, admin: Address, threshold_percentage: u32) {
+        admin.require_auth();
+        
+        if threshold_percentage > 100 {
+            panic!("Threshold cannot exceed 100%");
+        }
+        
+        set_governance_veto_threshold(&e, threshold_percentage);
+    }
+    
+    /// Request beneficiary reassignment with governance veto protection
+    pub fn request_beneficiary_reassignment(e: Env, current_beneficiary: Address, new_beneficiary: Address, vesting_id: u32, total_amount: i128) {
+        current_beneficiary.require_auth();
+        
+        let current_time = e.ledger().timestamp();
+        let veto_period = get_governance_veto_period();
+        
+        // Check if reassignment exceeds 5% threshold
+        let supply_info = get_token_supply_info(&e);
+        let threshold = get_governance_veto_threshold(&e);
+        let threshold_amount = (supply_info.total_supply * threshold as i128) / 100;
+        
+        let requires_governance_veto = total_amount > threshold_amount;
+        let effective_at = if requires_governance_veto {
+            current_time + veto_period // 7-day timelock for large reassignments
+        } else {
+            current_time + get_timelock_duration() // 48-hour timelock for small reassignments
+        };
+        
+        // Generate reassignment ID
+        let reassignment_id = get_reassignment_counter(&e) + 1;
+        set_reassignment_counter(&e, reassignment_id);
+        
+        let reassignment = BeneficiaryReassignment {
+            vesting_id,
+            current_beneficiary: current_beneficiary.clone(),
+            new_beneficiary: new_beneficiary.clone(),
+            requested_at: current_time,
+            effective_at,
+            total_amount,
+            requires_governance_veto,
+            is_executed: false,
+        };
+        
+        set_beneficiary_reassignment(&e, reassignment_id, &reassignment);
+        
+        // Emit reassignment request event
+        BeneficiaryReassignmentRequested {
+            reassignment_id,
+            vesting_id,
+            current_beneficiary: current_beneficiary.clone(),
+            new_beneficiary: new_beneficiary.clone(),
+            total_amount,
+            effective_at,
+            requires_governance_veto,
+        }.publish(&e);
+        
+        // If governance veto is required, start veto period
+        if requires_governance_veto {
+            VetoPeriodStarted {
+                reassignment_id,
+                vesting_id,
+                veto_deadline: effective_at,
+                threshold_percentage: threshold,
+            }.publish(&e);
+        }
+    }
+    
+    /// Execute beneficiary reassignment after timelock period
+    pub fn execute_beneficiary_reassignment(e: Env, reassignment_id: u32) {
+        let mut reassignment = get_beneficiary_reassignment(&e, reassignment_id)
+            .expect("Reassignment not found");
+        
+        if reassignment.is_executed {
+            panic!("Reassignment already executed");
+        }
+        
+        let current_time = e.ledger().timestamp();
+        
+        if current_time < reassignment.effective_at {
+            panic!("Timelock period has not expired");
+        }
+        
+        // Check if governance veto was triggered
+        if reassignment.requires_governance_veto {
+            let veto_votes = get_veto_votes(&e, reassignment_id);
+            let total_veto_power = veto_votes.iter()
+                .filter(|vote| vote.vote_for_veto)
+                .map(|vote| vote.voting_power)
+                .sum();
+            
+            let threshold = get_governance_veto_threshold(&e);
+            let supply_info = get_token_supply_info(&e);
+            let veto_threshold = (supply_info.total_supply * threshold as i128) / 100;
+            
+            if total_veto_power >= veto_threshold {
+                panic!("Reassignment vetoed by governance");
+            }
+        }
+        
+        // Execute the reassignment
+        reassignment.is_executed = true;
+        set_beneficiary_reassignment(&e, reassignment_id, &reassignment);
+        
+        // In a real implementation, this would update the actual vesting schedule beneficiary
+        // For now, we'll just emit the event
+        
+        // Emit execution event
+        BeneficiaryReassignmentExecuted {
+            reassignment_id,
+            vesting_id: reassignment.vesting_id,
+            old_beneficiary: reassignment.current_beneficiary,
+            new_beneficiary: reassignment.new_beneficiary,
+            executed_at: current_time,
+        }.publish(&e);
+    }
+    
+    /// Cast a vote for or against a beneficiary reassignment
+    pub fn cast_veto_vote(e: Env, voter: Address, reassignment_id: u32, vote_for_veto: bool, voting_power: i128) {
+        voter.require_auth();
+        
+        let reassignment = get_beneficiary_reassignment(&e, reassignment_id)
+            .expect("Reassignment not found");
+        
+        if !reassignment.requires_governance_veto {
+            panic!("This reassignment does not require governance veto");
+        }
+        
+        if reassignment.is_executed {
+            panic!("Reassignment already executed");
+        }
+        
+        let current_time = e.ledger().timestamp();
+        
+        if current_time >= reassignment.effective_at {
+            panic!("Veto period has expired");
+        }
+        
+        // Check if voter has already voted
+        let existing_votes = get_veto_votes(&e, reassignment_id);
+        if existing_votes.iter().any(|vote| vote.voter == voter) {
+            panic!("Voter has already cast a vote");
+        }
+        
+        let vote = VetoVote {
+            voter: voter.clone(),
+            reassignment_id,
+            vote_for_veto,
+            voting_power,
+            voted_at: current_time,
+        };
+        
+        add_veto_vote(&e, reassignment_id, &vote);
+        
+        // Emit vote event
+        VetoVoteCast {
+            voter: voter.clone(),
+            reassignment_id,
+            vote_for_veto,
+            voting_power,
+            voted_at: current_time,
+        }.publish(&e);
+        
+        // Check if veto threshold is reached
+        let all_votes = get_veto_votes(&e, reassignment_id);
+        let total_veto_power = all_votes.iter()
+            .filter(|vote| vote.vote_for_veto)
+            .map(|vote| vote.voting_power)
+            .sum();
+        
+        let threshold = get_governance_veto_threshold(&e);
+        let supply_info = get_token_supply_info(&e);
+        let veto_threshold = (supply_info.total_supply * threshold as i128) / 100;
+        
+        if total_veto_power >= veto_threshold {
+            // Veto threshold reached - cancel the reassignment
+            remove_beneficiary_reassignment(&e, reassignment_id);
+            
+            // Emit veto event
+            ReassignmentVetoed {
+                reassignment_id,
+                veto_triggered_by: voter,
+                veto_power: total_veto_power,
+                vetoed_at: current_time,
+            }.publish(&e);
+        }
+    }
+    
+    /// Get beneficiary reassignment details
+    pub fn get_beneficiary_reassignment(e: Env, reassignment_id: u32) -> Option<BeneficiaryReassignment> {
+        get_beneficiary_reassignment(&e, reassignment_id)
+    }
+    
+    /// Get veto votes for a reassignment
+    pub fn get_veto_votes(e: Env, reassignment_id: u32) -> Vec<VetoVote> {
+        get_veto_votes(&e, reassignment_id)
+    }
+    
+    /// Get current token supply info
+    pub fn get_token_supply_info(e: Env) -> TokenSupplyInfo {
+        get_token_supply_info(&e)
+    }
+    
+    /// Get current governance veto threshold
+    pub fn get_governance_veto_threshold(e: Env) -> u32 {
+        get_governance_veto_threshold(&e)
+    }
+    
+    /// Check if a reassignment requires governance veto
+    pub fn requires_governance_veto(e: Env, amount: i128) -> bool {
+        let supply_info = get_token_supply_info(&e);
+        let threshold = get_governance_veto_threshold(&e);
+        let threshold_amount = (supply_info.total_supply * threshold as i128) / 100;
+        
+        amount > threshold_amount
+    }
+    
+    /// Get veto status for a reassignment
+    pub fn get_veto_status(e: Env, reassignment_id: u32) -> (bool, i128, i128) {
+        let votes = get_veto_votes(&e, reassignment_id);
+        let total_veto_power = votes.iter()
+            .filter(|vote| vote.vote_for_veto)
+            .map(|vote| vote.voting_power)
+            .sum();
+        
+        let threshold = get_governance_veto_threshold(&e);
+        let supply_info = get_token_supply_info(&e);
+        let veto_threshold = (supply_info.total_supply * threshold as i128) / 100;
+        
+        let is_vetoed = total_veto_power >= veto_threshold;
+        
+        (is_vetoed, total_veto_power, veto_threshold)
     }
 
     // ========== ISSUE #205: Automated Tax Withholding Logic ==========
