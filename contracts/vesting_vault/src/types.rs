@@ -219,26 +219,140 @@ pub struct PathPaymentClaimExecuted {
     pub vesting_id: u32,
 }
 
-// Good Leaver / Bad Leaver Termination Types
+// Tax Withholding types for Issue #205
 #[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub enum LeaverType {
-    GoodLeaver,
-    BadLeaver,
+#[derive(Clone)]
+pub struct TaxWithholdingConfig {
+    pub tax_treasury_address: Address, // DAO Tax Treasury address
+    pub tax_withholding_bps: u32,      // Basis points (10000 = 100%)
+    pub enabled: bool,
 }
 
 #[contractevent]
 #[derive(Clone)]
-pub struct ScheduleTerminated {
+pub struct TaxWithholdingExecuted {
+    #[topic]
+    pub beneficiary: Address,
+    #[topic]
+    pub gross_amount: i128,
+    #[topic]
+    pub tax_amount: i128,
+    #[topic]
+    pub net_amount: i128,
+    #[topic]
+    pub tax_treasury: Address,
+    pub timestamp: u64,
+    pub vesting_id: u32,
+}
+
+// SEP-12 KYC types for Issue #204
+#[contracttype]
+#[derive(Clone)]
+pub struct SEP12IdentityOracle {
+    pub contract_address: Address,
+    pub enabled: bool,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct KYCCheckFailed {
+    #[topic]
+    pub beneficiary: Address,
+    pub reason: String,
+    pub timestamp: u64,
+}
+
+// Token Precision types for Issue #203
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenMetadata {
+    pub decimals: u32,
+    pub asset_address: Address,
+}
+
+// Revocability Expiration types for Issue #202
+#[contracttype]
+#[derive(Clone)]
+pub struct VestingGrant {
+    pub vesting_id: u32,
+    pub beneficiary: Address,
+    pub created_at: u64,
+    pub is_revocable: bool,
+    pub revocability_expires_at: u64, // 12 months after creation
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct RevocabilityExpired {
     #[topic]
     pub vesting_id: u32,
     #[topic]
     pub beneficiary: Address,
-    pub leaver_type: LeaverType,
-    pub vested_amount_retained: i128,
-    pub unvested_amount_slashed: i128,
-    pub unclaimed_amount_slashed: i128,
-    pub treasury: Address,
+    pub expired_at: u64,
+}
+
+// Additional event types for the four issues
+#[contractevent]
+#[derive(Clone)]
+pub struct TaxWithholdingConfigured {
+    #[topic]
+    pub tax_treasury_address: Address,
+    #[topic]
+    pub tax_withholding_bps: u32,
     pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct TaxWithholdingDisabled {
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct SEP12OracleConfigured {
+    #[topic]
+    pub oracle_address: Address,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct SEP12KYCDisabled {
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct TokenMetadataRegistered {
+    #[topic]
+    pub asset_address: Address,
+    #[topic]
+    pub decimals: u32,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct VestingGrantCreated {
+    #[topic]
+    pub vesting_id: u32,
+    #[topic]
+    pub beneficiary: Address,
+    #[topic]
+    pub is_revocable: bool,
+    pub revocability_expires_at: u64,
+    pub created_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct VestingGrantRevoked {
+    #[topic]
+    pub vesting_id: u32,
+    #[topic]
+    pub beneficiary: Address,
+    pub reason: String,
+    pub revoked_at: u64,
 }
 
