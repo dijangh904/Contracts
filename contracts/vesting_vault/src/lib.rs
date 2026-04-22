@@ -6,8 +6,10 @@ mod storage;
 pub mod types;
 mod audit_exporter;
 mod emergency;
+pub mod errors;
 
 pub use types::*;
+use errors::Error;
 use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event};
 use emergency::{AuditorPauseRequest, EmergencyPause, EmergencyPauseTriggered};
 
@@ -17,15 +19,118 @@ pub struct VestingVault;
 #[contractimpl]
 impl VestingVault {
 
-    pub fn claim(e: Env, user: Address, vesting_id: u32, amount: i128) {
+    pub fn claim(e: Env, user: Address, vesting_id: u32, amount: i128) -> Result<(), Error> {
         user.require_auth();
+
+        // ========== COMPLIANCE CHECKS ==========
+
+        // KYC Verification Check
+        if !Self::is_kyc_verified(&e, &user) {
+            return Err(Error::KycNotCompleted);
+        }
+
+        // KYC Expiration Check
+        if let Some(kyc_expiry) = Self::get_kyc_expiry(&e, &user) {
+            let current_time = e.ledger().timestamp();
+            if current_time > kyc_expiry {
+                return Err(Error::KycExpired);
+            }
+        }
+
+        // Sanctions Check
+        if Self::is_address_sanctioned(&e, &user) {
+            return Err(Error::AddressSanctioned);
+        }
+
+        // Jurisdiction Restriction Check
+        if Self::is_jurisdiction_restricted(&e, &user) {
+            return Err(Error::JurisdictionRestricted);
+        }
+
+        // Legal Signature Verification
+        if !Self::has_valid_legal_signature(&e, &user, vesting_id) {
+            return Err(Error::LegalSignatureMissing);
+        }
+
+        // AML Threshold Check
+        if amount > Self::get_aml_threshold(&e) {
+            return Err(Error::AmlThresholdExceeded);
+        }
+
+        // Risk Rating Check
+        if Self::get_user_risk_rating(&e, &user) > Self::get_max_allowed_risk(&e) {
+            return Err(Error::RiskRatingTooHigh);
+        }
+
+        // Document Verification Check
+        if !Self::are_documents_verified(&e, &user) {
+            return Err(Error::DocumentVerificationFailed);
+        }
+
+        // Accreditation Status Check (for regulated claims)
+        if Self::is_accreditation_required(&e, vesting_id) && !Self::is_user_accredited(&e, &user) {
+            return Err(Error::AccreditationStatusInvalid);
+        }
+
+        // Tax Compliance Check
+        if !Self::is_tax_compliant(&e, &user) {
+            return Err(Error::TaxComplianceFailed);
+        }
+
+        // Regulatory Block Check
+        if Self::is_regulatory_block_active(&e) {
+            return Err(Error::RegulatoryBlockActive);
+        }
+
+        // Whitelist Approval Check
+        if !Self::is_whitelist_approved(&e, &user) {
+            return Err(Error::WhitelistNotApproved);
+        }
+
+        // Blacklist Violation Check
+        if Self::is_on_blacklist(&e, &user) {
+            return Err(Error::BlacklistViolation);
+        }
+
+        // Geofencing Restriction Check
+        if Self::is_geofencing_restricted(&e, &user) {
+            return Err(Error::GeofencingRestriction);
+        }
+
+        // Identity Verification Expiration Check
+        if let Some(identity_expiry) = Self::get_identity_expiry(&e, &user) {
+            let current_time = e.ledger().timestamp();
+            if current_time > identity_expiry {
+                return Err(Error::IdentityVerificationExpired);
+            }
+        }
+
+        // Source of Funds Verification Check
+        if !Self::is_source_of_funds_verified(&e, &user) {
+            return Err(Error::SourceOfFundsNotVerified);
+        }
+
+        // Beneficial Owner Verification Check
+        if !Self::is_beneficial_owner_verified(&e, &user) {
+            return Err(Error::BeneficialOwnerNotVerified);
+        }
+
+        // Politically Exposed Person Check
+        if Self::is_politically_exposed_person(&e, &user) {
+            return Err(Error::PoliticallyExposedPerson);
+        }
+
+        // Sanctions List Hit Check
+        if Self::is_on_sanctions_list(&e, &user) {
+            return Err(Error::SanctionsListHit);
+        }
 
         // Check if contract is under emergency pause
         if let Some(pause) = get_emergency_pause(&e) {
             if pause.is_active {
                 let current_time = e.ledger().timestamp();
                 if current_time < pause.expires_at {
-                    panic!("Contract is under emergency pause until {}", pause.expires_at);
+                    return Err(Error::RegulatoryBlockActive);
                 } else {
                     // Pause expired, remove it
                     remove_emergency_pause(&e);
@@ -37,12 +142,12 @@ impl VestingVault {
         if let Some(auth_address) = storage_get_authorized_payout_address(&e, &user) {
             if auth_address.is_active {
                 let current_time = e.ledger().timestamp();
-                
+
                 // Check if timelock has passed
                 if current_time < auth_address.effective_at {
-                    panic!("Authorized payout address is still in timelock period");
+                    return Err(Error::WhitelistNotApproved);
                 }
-                
+
                 // Verify the claim is being made to the authorized address
                 // In a real implementation, this would check the destination of the transfer
                 // For now, we'll assume the claim function includes a destination parameter
@@ -70,6 +175,8 @@ impl VestingVault {
         history.push_back(event);
 
         set_claim_history(&e, &history);
+
+        Ok(())
     }
 
     /// Sets an authorized payout address with a 48-hour timelock
@@ -815,5 +922,175 @@ impl VestingVault {
         // For USDC destination, we can assume close to 1:1 with small slippage
         let slippage_factor = 9950; // 99.5% (0.5% slippage)
         (source_amount * slippage_factor) / 10000
+    }
+
+    // ========== COMPLIANCE HELPER FUNCTIONS ==========
+
+    /// Check if user has completed KYC verification
+    fn is_kyc_verified(_e: &Env, _user: &Address) -> bool {
+        // TODO: Implement actual KYC verification check
+        // This would typically integrate with a KYC provider oracle
+        // For now, return true as placeholder
+        true
+    }
+    
+    /// Get KYC expiration timestamp for user
+    fn get_kyc_expiry(_e: &Env, _user: &Address) -> Option<u64> {
+        // TODO: Implement actual KYC expiry check
+        // This would typically be stored from KYC provider data
+        // For now, return None (no expiry)
+        None
+    }
+    
+    /// Check if address is on sanctions list
+    fn is_address_sanctioned(_e: &Env, _user: &Address) -> bool {
+        // TODO: Implement actual sanctions check
+        // This would integrate with sanctions screening oracle
+        // For now, return false as placeholder
+        false
+    }
+    
+    /// Check if user's jurisdiction is restricted
+    fn is_jurisdiction_restricted(_e: &Env, _user: &Address) -> bool {
+        // TODO: Implement actual jurisdiction check
+        // This would check user's location against restricted jurisdictions
+        // For now, return false as placeholder
+        false
+    }
+    
+    /// Check if user has valid legal signature for this vesting
+    fn has_valid_legal_signature(_e: &Env, _user: &Address, _vesting_id: u32) -> bool {
+        // TODO: Implement actual legal signature verification
+        // This would verify digital signatures against legal documents
+        // For now, return true as placeholder
+        true
+    }
+    
+    /// Get AML threshold for the contract
+    fn get_aml_threshold(_e: &Env) -> i128 {
+        // TODO: Implement actual AML threshold
+        // This would be configurable based on regulatory requirements
+        // For now, return a high threshold
+        1000000i128
+    }
+    
+    /// Get user's risk rating (lower is better)
+    fn get_user_risk_rating(_e: &Env, _user: &Address) -> u32 {
+        // TODO: Implement actual risk rating calculation
+        // This would integrate with risk assessment oracle
+        // For now, return low risk
+        1u32
+    }
+    
+    /// Get maximum allowed risk rating
+    fn get_max_allowed_risk(_e: &Env) -> u32 {
+        // TODO: Implement actual max risk configuration
+        // This would be configurable based on risk appetite
+        // For now, allow moderate risk
+        5u32
+    }
+    
+    /// Check if user's documents are verified
+    fn are_documents_verified(_e: &Env, _user: &Address) -> bool {
+        // TODO: Implement actual document verification check
+        // This would check verification status of required documents
+        // For now, return true as placeholder
+        true
+    }
+    
+    /// Check if accreditation is required for this vesting
+    fn is_accreditation_required(_e: &Env, _vesting_id: u32) -> bool {
+        // TODO: Implement actual accreditation requirement check
+        // This would check if this vesting requires accredited investor status
+        // For now, return false as placeholder
+        false
+    }
+    
+    /// Check if user is accredited investor
+    fn is_user_accredited(_e: &Env, _user: &Address) -> bool {
+        // TODO: Implement actual accreditation check
+        // This would verify accredited investor status
+        // For now, return true as placeholder
+        true
+    }
+    
+    /// Check if user is tax compliant
+    fn is_tax_compliant(_e: &Env, _user: &Address) -> bool {
+        // TODO: Implement actual tax compliance check
+        // This would check tax withholding and reporting status
+        // For now, return true as placeholder
+        true
+    }
+    
+    /// Check if regulatory block is active
+    fn is_regulatory_block_active(_e: &Env) -> bool {
+        // TODO: Implement actual regulatory block check
+        // This would check for regulatory holds or blocks
+        // For now, return false as placeholder
+        false
+    }
+    
+    /// Check if user is approved on whitelist
+    fn is_whitelist_approved(_e: &Env, _user: &Address) -> bool {
+        // TODO: Implement actual whitelist approval check
+        // This would check against approved investor whitelist
+        // For now, return true as placeholder
+        true
+    }
+    
+    /// Check if user is on blacklist
+    fn is_on_blacklist(_e: &Env, _user: &Address) -> bool {
+        // TODO: Implement actual blacklist check
+        // This would check against prohibited persons list
+        // For now, return false as placeholder
+        false
+    }
+    
+    /// Check if user is subject to geofencing restrictions
+    fn is_geofencing_restricted(_e: &Env, _user: &Address) -> bool {
+        // TODO: Implement actual geofencing check
+        // This would check IP/location-based restrictions
+        // For now, return false as placeholder
+        false
+    }
+    
+    /// Get identity verification expiration for user
+    fn get_identity_expiry(_e: &Env, _user: &Address) -> Option<u64> {
+        // TODO: Implement actual identity expiry check
+        // This would check when identity verification expires
+        // For now, return None (no expiry)
+        None
+    }
+    
+    /// Check if user's source of funds is verified
+    fn is_source_of_funds_verified(_e: &Env, _user: &Address) -> bool {
+        // TODO: Implement actual source of funds verification
+        // This would verify origin of funds for AML compliance
+        // For now, return true as placeholder
+        true
+    }
+    
+    /// Check if user's beneficial owners are verified
+    fn is_beneficial_owner_verified(_e: &Env, _user: &Address) -> bool {
+        // TODO: Implement actual beneficial owner verification
+        // This would verify ultimate beneficial ownership
+        // For now, return true as placeholder
+        true
+    }
+    
+    /// Check if user is a politically exposed person
+    fn is_politically_exposed_person(_e: &Env, _user: &Address) -> bool {
+        // TODO: Implement actual PEP check
+        // This would screen against PEP lists
+        // For now, return false as placeholder
+        false
+    }
+    
+    /// Check if user appears on sanctions lists
+    fn is_on_sanctions_list(_e: &Env, _user: &Address) -> bool {
+        // TODO: Implement actual sanctions list screening
+        // This would check multiple sanctions databases
+        // For now, return false as placeholder
+        false
     }
 }
