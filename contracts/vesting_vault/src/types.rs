@@ -260,3 +260,119 @@ pub struct LockupClaimExecuted {
     pub timestamp: u64,
 }
 
+// Beneficiary reassignment types (Issue 114)
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryReassignment {
+    pub vesting_id: u32,
+    pub current_beneficiary: Address,
+    pub new_beneficiary: Address,
+    pub requested_at: u64,
+    pub effective_at: u64,
+    pub total_amount: i128,
+    pub requires_governance_veto: bool,
+    pub is_executed: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct GovernanceVeto {
+    pub reassignment_id: u32,
+    pub veto_by: Address,
+    pub veto_at: u64,
+    pub reason: String,
+    pub voting_power: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct VetoVote {
+    pub voter: Address,
+    pub reassignment_id: u32,
+    pub vote_for_veto: bool,
+    pub voting_power: i128,
+    pub voted_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenSupplyInfo {
+    pub total_supply: i128,
+    pub last_updated: u64,
+}
+
+// Governance veto events
+#[contractevent]
+#[derive(Clone)]
+pub struct BeneficiaryReassignmentRequested {
+    #[topic]
+    pub reassignment_id: u32,
+    #[topic]
+    pub vesting_id: u32,
+    #[topic]
+    pub current_beneficiary: Address,
+    #[topic]
+    pub new_beneficiary: Address,
+    pub total_amount: i128,
+    pub effective_at: u64,
+    pub requires_governance_veto: bool,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct BeneficiaryReassignmentExecuted {
+    #[topic]
+    pub reassignment_id: u32,
+    #[topic]
+    pub vesting_id: u32,
+    #[topic]
+    pub old_beneficiary: Address,
+    #[topic]
+    pub new_beneficiary: Address,
+    pub executed_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct VetoPeriodStarted {
+    #[topic]
+    pub reassignment_id: u32,
+    #[topic]
+    pub vesting_id: u32,
+    pub veto_deadline: u64,
+    pub threshold_percentage: u32,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct VetoVoteCast {
+    #[topic]
+    pub voter: Address,
+    #[topic]
+    pub reassignment_id: u32,
+    pub vote_for_veto: bool,
+    pub voting_power: i128,
+    pub voted_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct ReassignmentVetoed {
+    #[topic]
+    pub reassignment_id: u32,
+    #[topic]
+    pub veto_triggered_by: Address,
+    pub veto_power: i128,
+    pub vetoed_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct ReassignmentApproved {
+    #[topic]
+    pub reassignment_id: u32,
+    #[topic]
+    pub approved_at: u64,
+    pub total_veto_power: i128,
+}
+
