@@ -219,3 +219,44 @@ pub struct PathPaymentClaimExecuted {
     pub vesting_id: u32,
 }
 
+// Lock-up period types
+#[contracttype]
+#[derive(Clone)]
+pub struct LockupConfig {
+    pub vesting_id: u32,
+    pub lockup_duration_seconds: u64,
+    pub enabled: bool,
+    pub lockup_token_address: Address,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct LockupConfigured {
+    #[topic]
+    pub vesting_id: u32,
+    pub lockup_duration_seconds: u64,
+    pub lockup_token_address: Address,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct LockupDisabled {
+    #[topic]
+    pub vesting_id: u32,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct LockupClaimExecuted {
+    #[topic]
+    pub user: Address,
+    #[topic]
+    pub vesting_id: u32,
+    pub amount: i128,
+    pub lockup_token_address: Address,
+    pub unlock_time: u64,
+    pub timestamp: u64,
+}
+

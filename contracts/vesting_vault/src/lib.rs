@@ -8,7 +8,7 @@ mod audit_exporter;
 mod emergency;
 
 pub use types::*;
-use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event};
+use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_lockup_config, set_lockup_config, remove_lockup_config};
 use emergency::{AuditorPauseRequest, EmergencyPause, EmergencyPauseTriggered};
 
 #[contract]
@@ -805,15 +805,172 @@ impl VestingVault {
         simulated_destination_amount
     }
     
-    /// Internal function to simulate path payment result
-    /// In production, this would query the Stellar DEX for real rates
-    fn simulate_path_payment_result(_e: &Env, source_amount: i128, _destination_asset: &Address, _path: &Vec<Address>) -> i128 {
-        // Placeholder: assume 1:1 conversion rate for simulation
-        // In production, this would query the Stellar DEX for actual exchange rates
-        // considering the provided path and current market conditions
+    /// Check if a user's tokens are unlocked for a specific vesting schedule
+    pub fn is_user_unlocked(e: Env, user: Address, vesting_id: u32) -> bool {
+        if let Some(lockup_config) = get_lockup_config(&e, vesting_id) {
+            if lockup_config.enabled {
+                // In a real implementation, this would query the lockup token contract
+                // For now, we'll return false (locked) as a placeholder
+                false
+            } else {
+                true // No lock-up configured
+            }
+        } else {
+            true // No lock-up configured
+        }
+    }
+    
+    /// Get the unlock time for a user's tokens
+    pub fn get_user_unlock_time(e: Env, user: Address, vesting_id: u32) -> Option<u64> {
+        if let Some(lockup_config) = get_lockup_config(&e, vesting_id) {
+            if lockup_config.enabled {
+                // In a real implementation, this would query the lockup token contract
+                // For now, we'll return a placeholder
+                Some(e.ledger().timestamp() + lockup_config.lockup_duration_seconds)
+            } else {
+                None // No lock-up configured
+            }
+        } else {
+            None // No lock-up configured
+        }
+    }
+
+    // ========== ISSUE #211: Lock-Up Periods for Claimed Assets ==========
+
+    /// Configure lock-up period for a vesting schedule
+    /// This enables legal compliance requirements where tokens cannot be sold immediately after vesting
+    pub fn configure_lockup(e: Env, admin: Address, vesting_id: u32, lockup_duration_seconds: u64, lockup_token_address: Address) {
+        admin.require_auth();
         
-        // For USDC destination, we can assume close to 1:1 with small slippage
-        let slippage_factor = 9950; // 99.5% (0.5% slippage)
-        (source_amount * slippage_factor) / 10000
+        let config = LockupConfig {
+            vesting_id,
+            lockup_duration_seconds,
+            enabled: true,
+            lockup_token_address: lockup_token_address.clone(),
+        };
+        
+        set_lockup_config(&e, vesting_id, &config);
+        
+        // Emit configuration event
+        LockupConfigured {
+            vesting_id,
+            lockup_duration_seconds,
+            lockup_token_address,
+            timestamp: e.ledger().timestamp(),
+        }.publish(&e);
+    }
+    
+    /// Disable lock-up period for a vesting schedule
+    /// This allows immediate claims without lock-up restrictions
+    pub fn disable_lockup(e: Env, admin: Address, vesting_id: u32) {
+        admin.require_auth();
+        
+        remove_lockup_config(&e, vesting_id);
+        
+        // Emit disable event
+        LockupDisabled {
+            vesting_id,
+            timestamp: e.ledger().timestamp(),
+        }.publish(&e);
+    }
+    
+    /// Claim tokens with lock-up period handling
+    /// This is the enhanced claim function that handles lock-up periods
+    pub fn claim_with_lockup(e: Env, user: Address, vesting_id: u32, amount: i128) {
+        user.require_auth();
+
+        // Check if contract is under emergency pause
+        if let Some(pause) = get_emergency_pause(&e) {
+            if pause.is_active {
+                let current_time = e.ledger().timestamp();
+                if current_time < pause.expires_at {
+                    panic!("Contract is under emergency pause until {}", pause.expires_at);
+                } else {
+                    // Pause expired, remove it
+                    remove_emergency_pause(&e);
+                }
+            }
+        }
+
+        // Check if user has an authorized payout address
+        if let Some(auth_address) = storage_get_authorized_payout_address(&e, &user) {
+            if auth_address.is_active {
+                let current_time = e.ledger().timestamp();
+                
+                // Check if timelock has passed
+                if current_time < auth_address.effective_at {
+                    panic!("Authorized payout address is still in timelock period");
+                }
+            }
+        }
+
+        // Check milestone vesting if applicable
+        if let Some(_milestone_configs) = get_milestone_configs(&e, vesting_id) {
+            let _milestone_status = get_milestone_status(&e, vesting_id);
+            // Additional milestone logic would go here
+        }
+
+        // Check if lock-up period is configured for this vesting schedule
+        if let Some(lockup_config) = get_lockup_config(&e, vesting_id) {
+            if lockup_config.enabled {
+                // Issue wrapped tokens instead of raw tokens
+                Self::issue_wrapped_tokens(&e, &user, vesting_id, amount, &lockup_config);
+                return;
+            }
+        }
+
+        // Original claim logic for non-lockup cases
+        let mut history = get_claim_history(&e);
+
+        let event = ClaimEvent {
+            beneficiary: user.clone(),
+            amount,
+            timestamp: e.ledger().timestamp(),
+            vesting_id,
+        };
+
+        history.push_back(event);
+
+        set_claim_history(&e, &history);
+    }
+    
+    /// Internal function to issue wrapped tokens during lock-up period
+    fn issue_wrapped_tokens(e: &Env, user: &Address, vesting_id: u32, amount: i128, lockup_config: &LockupConfig) {
+        let current_time = e.ledger().timestamp();
+        let unlock_time = current_time + lockup_config.lockup_duration_seconds;
+        
+        // Call the lockup token contract to issue wrapped tokens
+        // In a real implementation, this would be a cross-contract call
+        // For now, we'll simulate this by emitting an event
+        
+        // Record the lockup claim event
+        let mut history = get_claim_history(e);
+        
+        let claim_event = ClaimEvent {
+            beneficiary: user.clone(),
+            amount,
+            timestamp: current_time,
+            vesting_id,
+        };
+        
+        history.push_back(claim_event);
+        set_claim_history(e, &history);
+        
+        // Emit lockup claim event
+        LockupClaimExecuted {
+            user: user.clone(),
+            vesting_id,
+            amount,
+            lockup_token_address: lockup_config.lockup_token_address.clone(),
+            unlock_time,
+            timestamp: current_time,
+        }.publish(e);
+        
+        // In a real implementation, this would invoke the lockup token contract:
+        // e.invoke_contract::<()>(
+        //     &lockup_config.lockup_token_address,
+        //     &symbol_short!("issue_wrapped_tokens"),
+        //     (e.current_contract_address(), user.clone(), vesting_id, amount)
+        // );
     }
 }

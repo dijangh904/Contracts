@@ -1,5 +1,5 @@
 use soroban_sdk::{Env, Vec, Address, Map, BytesN};
-use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent};
+use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, LockupConfig};
 
 pub const CLAIM_HISTORY: &str = "CLAIM_HISTORY";
 pub const AUTHORIZED_PAYOUT_ADDRESS: &str = "AUTHORIZED_PAYOUT_ADDRESS";
@@ -27,6 +27,9 @@ pub const MERKLE_ROOTS: &str = "MERKLE_ROOTS";
 // Stellar Horizon Path Payment Claim storage keys
 pub const PATH_PAYMENT_CONFIG: &str = "PATH_PAYMENT_CONFIG";
 pub const PATH_PAYMENT_CLAIM_HISTORY: &str = "PATH_PAYMENT_CLAIM_HISTORY";
+
+// Lock-up period storage keys
+pub const LOCKUP_CONFIGS: &str = "LOCKUP_CONFIGS";
 
 // 48 hours in seconds
 const TIMELOCK_DURATION: u64 = 172_800;
@@ -235,4 +238,17 @@ pub fn add_path_payment_claim_event(e: &Env, event: &PathPaymentClaimEvent) {
     let mut history = get_path_payment_claim_history(e);
     history.push_back(event.clone());
     e.storage().instance().set(&PATH_PAYMENT_CLAIM_HISTORY, &history);
-}
+}
+
+// Lock-up period storage functions
+pub fn get_lockup_config(e: &Env, vesting_id: u32) -> Option<LockupConfig> {
+    e.storage().instance().get(&(LOCKUP_CONFIGS, vesting_id))
+}
+
+pub fn set_lockup_config(e: &Env, vesting_id: u32, config: &LockupConfig) {
+    e.storage().instance().set(&(LOCKUP_CONFIGS, vesting_id), config);
+}
+
+pub fn remove_lockup_config(e: &Env, vesting_id: u32) {
+    e.storage().instance().remove(&(LOCKUP_CONFIGS, vesting_id));
+}
