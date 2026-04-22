@@ -219,3 +219,26 @@ pub struct PathPaymentClaimExecuted {
     pub vesting_id: u32,
 }
 
+// Good Leaver / Bad Leaver Termination Types
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum LeaverType {
+    GoodLeaver,
+    BadLeaver,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct ScheduleTerminated {
+    #[topic]
+    pub vesting_id: u32,
+    #[topic]
+    pub beneficiary: Address,
+    pub leaver_type: LeaverType,
+    pub vested_amount_retained: i128,
+    pub unvested_amount_slashed: i128,
+    pub unclaimed_amount_slashed: i128,
+    pub treasury: Address,
+    pub timestamp: u64,
+}
+
