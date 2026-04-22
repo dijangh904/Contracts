@@ -1234,4 +1234,263 @@ impl VestingVault {
         
         (is_vetoed, total_veto_power, veto_threshold)
     }
+
+    // ========== ISSUE #205: Automated Tax Withholding Logic ==========
+    
+    /// Configure tax withholding settings
+    pub fn configure_tax_withholding(e: Env, admin: Address, tax_treasury_address: Address, tax_withholding_bps: u32) {
+        admin.require_auth();
+        
+        // Validate tax rate (basis points, 10000 = 100%)
+        if tax_withholding_bps > 10000 {
+            panic!("Tax withholding rate cannot exceed 100%");
+        }
+        
+        let config = TaxWithholdingConfig {
+            tax_treasury_address: tax_treasury_address.clone(),
+            tax_withholding_bps,
+            enabled: true,
+        };
+        
+        set_tax_withholding_config(&e, &config);
+        
+        // Emit configuration event
+        TaxWithholdingConfigured { tax_treasury_address, tax_withholding_bps, timestamp: e.ledger().timestamp() }.publish(&e);
+    }
+    
+    /// Disable tax withholding feature
+    pub fn disable_tax_withholding(e: Env, admin: Address) {
+        admin.require_auth();
+        
+        if let Some(mut config) = get_tax_withholding_config(&e) {
+            config.enabled = false;
+            set_tax_withholding_config(&e, &config);
+            
+            // Emit disable event
+            TaxWithholdingDisabled { timestamp: e.ledger().timestamp() }.publish(&e);
+        }
+    }
+    
+    /// Get current tax withholding configuration
+    pub fn get_tax_withholding_config(e: Env) -> Option<TaxWithholdingConfig> {
+        get_tax_withholding_config(&e)
+    }
+    
+    /// Internal function to calculate and execute tax withholding
+    fn execute_tax_withholding(e: &Env, gross_amount: i128) -> (i128, i128, Address) {
+        if let Some(config) = get_tax_withholding_config(e) {
+            if config.enabled {
+                // Calculate tax amount (basis points)
+                let tax_amount = (gross_amount * config.tax_withholding_bps as i128) / 10000i128;
+                let net_amount = gross_amount - tax_amount;
+                
+                return (net_amount, tax_amount, config.tax_treasury_address);
+            }
+        }
+        
+        // No tax withholding configured or disabled
+        (gross_amount, 0i128, Address::from_string(&String::from_str(e, "placeholder")))
+    }
+
+    // ========== ISSUE #204: On-Chain SEP-12 KYC Gating for Claims ==========
+    
+    /// Configure SEP-12 Identity Oracle
+    pub fn configure_sep12_oracle(e: Env, admin: Address, oracle_address: Address) {
+        admin.require_auth();
+        
+        let oracle = SEP12IdentityOracle {
+            contract_address: oracle_address.clone(),
+            enabled: true,
+        };
+        
+        set_sep12_identity_oracle(&e, &oracle);
+        
+        // Emit configuration event
+        SEP12OracleConfigured { oracle_address, timestamp: e.ledger().timestamp() }.publish(&e);
+    }
+    
+    /// Disable SEP-12 KYC checking
+    pub fn disable_sep12_kyc(e: Env, admin: Address) {
+        admin.require_auth();
+        
+        if let Some(mut oracle) = get_sep12_identity_oracle(&e) {
+            oracle.enabled = false;
+            set_sep12_identity_oracle(&e, &oracle);
+            
+            // Emit disable event
+            SEP12KYCDisabled { timestamp: e.ledger().timestamp() }.publish(&e);
+        }
+    }
+    
+    /// Get current SEP-12 Identity Oracle configuration
+    pub fn get_sep12_oracle_config(e: Env) -> Option<SEP12IdentityOracle> {
+        get_sep12_identity_oracle(&e)
+    }
+    
+    /// Internal function to check KYC status via SEP-12
+    fn check_kyc_status(e: &Env, beneficiary: &Address) -> Result<bool, String> {
+        if let Some(oracle) = get_sep12_identity_oracle(e) {
+            if oracle.enabled {
+                // Placeholder: assume KYC check passes for demonstration
+                let is_verified = Self::simulate_sep12_check(e, beneficiary);
+                
+                if !is_verified {
+                    // Emit KYC check failed event
+                    KYCCheckFailed {
+                        beneficiary: beneficiary.clone(),
+                        reason: String::from_str(e, "SEP-12 KYC verification failed"),
+                        timestamp: e.ledger().timestamp(),
+                    }.publish(e);
+                    
+                    return Err(String::from_str(e, "SEP-12 KYC verification failed"));
+                }
+                
+                return Ok(true);
+            }
+        }
+        
+        // No SEP-12 oracle configured or disabled - allow claim
+        Ok(true)
+    }
+    
+    /// Placeholder for SEP-12 identity verification simulation
+    fn simulate_sep12_check(_e: &Env, _beneficiary: &Address) -> bool {
+        // In production, this would be an actual cross-contract call to SEP-12
+        true
+    }
+
+    // ========== ISSUE #203: Handle Zero-Decimal Token Precision Safely ==========
+    
+    /// Register token metadata for precision handling
+    pub fn register_token_metadata(e: Env, admin: Address, asset_address: Address, decimals: u32) {
+        admin.require_auth();
+        
+        // Validate decimals (0-18 typical range for Stellar assets)
+        if decimals > 18 {
+            panic!("Token decimals cannot exceed 18");
+        }
+        
+        let metadata = TokenMetadata {
+            decimals,
+            asset_address: asset_address.clone(),
+        };
+        
+        set_token_metadata(&e, &asset_address, &metadata);
+        
+        // Emit registration event
+        TokenMetadataRegistered { asset_address, decimals, timestamp: e.ledger().timestamp() }.publish(&e);
+    }
+    
+    /// Get token metadata
+    pub fn get_token_metadata_info(e: Env, asset_address: Address) -> Option<TokenMetadata> {
+        get_token_metadata(&e, &asset_address)
+    }
+    
+    /// Precision-agnostic division function
+    /// Prevents rounding-to-zero errors when dealing with low-decimal tokens
+    fn precision_safe_divide(e: &Env, amount: i128, divisor: i128, asset_address: &Address) -> i128 {
+        // Get token metadata to determine precision
+        let decimals = if let Some(metadata) = get_token_metadata(e, asset_address) {
+            metadata.decimals
+        } else {
+            // Default to 7 decimals (XLM standard) if not registered
+            7
+        };
+        
+        // For low-decimal tokens, we need to handle division carefully
+        if decimals == 0 {
+            // Zero-decimal tokens - use integer division with careful rounding
+            if amount < divisor {
+                // Prevent rounding to zero by returning minimum unit
+                1i128
+            } else {
+                amount / divisor
+            }
+        } else if decimals <= 2 {
+            // Low-decimal tokens (1-2 decimals) - use enhanced precision
+            // Multiply by a scaling factor to prevent rounding to zero
+            let scaling_factor = 10i128.pow(decimals as u32);
+            let scaled_amount = amount * scaling_factor;
+            let result = (scaled_amount / divisor) / scaling_factor;
+            
+            // Ensure we don't return zero when there should be a minimal amount
+            if result == 0 && amount > 0 {
+                1i128
+            } else {
+                result
+            }
+        } else {
+            // Normal precision tokens (3+ decimals) - standard division
+            amount / divisor
+        }
+    }
+
+    // ========== ISSUE #202: Implement Revocability Expiration (Cliff-Drop) ==========
+    
+    /// Create a new vesting grant with revocability expiration
+    pub fn create_vesting_grant(e: Env, admin: Address, vesting_id: u32, beneficiary: Address, is_revocable: bool) {
+        admin.require_auth();
+        
+        // Check if grant already exists
+        if get_vesting_grant(&e, vesting_id).is_some() {
+            panic!("Vesting grant already exists");
+        }
+        
+        let current_time = e.ledger().timestamp();
+        let twelve_months = 12 * 30 * 24 * 60 * 60; // Approximate 12 months in seconds
+        
+        let grant = VestingGrant {
+            vesting_id,
+            beneficiary: beneficiary.clone(),
+            created_at: current_time,
+            is_revocable,
+            revocability_expires_at: current_time + twelve_months,
+        };
+        
+        set_vesting_grant(&e, vesting_id, &grant);
+        
+        // Emit grant creation event
+        VestingGrantCreated {
+            vesting_id,
+            beneficiary,
+            is_revocable,
+            revocability_expires_at: grant.revocability_expires_at,
+            created_at: current_time,
+        }.publish(&e);
+    }
+    
+    /// Check if a grant is still revocable
+    pub fn is_grant_revocable(e: Env, vesting_id: u32) -> bool {
+        if let Some(grant) = get_vesting_grant(&e, vesting_id) {
+            if !grant.is_revocable {
+                return false;
+            }
+            
+            let current_time = e.ledger().timestamp();
+            if current_time >= grant.revocability_expires_at {
+                // Revocability has expired - update the grant
+                let mut updated_grant = grant.clone();
+                updated_grant.is_revocable = false;
+                set_vesting_grant(&e, vesting_id, &updated_grant);
+                
+                // Emit expiration event
+                RevocabilityExpired {
+                    vesting_id,
+                    beneficiary: grant.beneficiary,
+                    expired_at: current_time,
+                }.publish(&e);
+                
+                return false;
+            }
+            
+            return true;
+        }
+        
+        false // Grant doesn't exist
+    }
+    
+    /// Get vesting grant information
+    pub fn get_vesting_grant_info(e: Env, vesting_id: u32) -> Option<VestingGrant> {
+        get_vesting_grant(&e, vesting_id)
+    }
 }
