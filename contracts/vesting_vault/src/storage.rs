@@ -1,5 +1,5 @@
 use soroban_sdk::{Env, Vec, Address, Map, BytesN};
-use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent};
+use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, TaxWithholdingConfig, SEP12IdentityOracle, TokenMetadata, VestingGrant};
 
 pub const CLAIM_HISTORY: &str = "CLAIM_HISTORY";
 pub const AUTHORIZED_PAYOUT_ADDRESS: &str = "AUTHORIZED_PAYOUT_ADDRESS";
@@ -27,6 +27,18 @@ pub const MERKLE_ROOTS: &str = "MERKLE_ROOTS";
 // Stellar Horizon Path Payment Claim storage keys
 pub const PATH_PAYMENT_CONFIG: &str = "PATH_PAYMENT_CONFIG";
 pub const PATH_PAYMENT_CLAIM_HISTORY: &str = "PATH_PAYMENT_CLAIM_HISTORY";
+
+// Issue #205: Tax Withholding storage keys
+pub const TAX_WITHHOLDING_CONFIG: &str = "TAX_WITHHOLDING_CONFIG";
+
+// Issue #204: SEP-12 KYC storage keys
+pub const SEP12_IDENTITY_ORACLE: &str = "SEP12_IDENTITY_ORACLE";
+
+// Issue #203: Token Precision storage keys
+pub const TOKEN_METADATA: &str = "TOKEN_METADATA";
+
+// Issue #202: Revocability Expiration storage keys
+pub const VESTING_GRANTS: &str = "VESTING_GRANTS";
 
 // 48 hours in seconds
 const TIMELOCK_DURATION: u64 = 172_800;
@@ -235,4 +247,46 @@ pub fn add_path_payment_claim_event(e: &Env, event: &PathPaymentClaimEvent) {
     let mut history = get_path_payment_claim_history(e);
     history.push_back(event.clone());
     e.storage().instance().set(&PATH_PAYMENT_CLAIM_HISTORY, &history);
-}
+}
+
+// Issue #205: Tax Withholding storage functions
+pub fn get_tax_withholding_config(e: &Env) -> Option<TaxWithholdingConfig> {
+    e.storage().instance().get(&TAX_WITHHOLDING_CONFIG)
+}
+
+pub fn set_tax_withholding_config(e: &Env, config: &TaxWithholdingConfig) {
+    e.storage().instance().set(&TAX_WITHHOLDING_CONFIG, config);
+}
+
+// Issue #204: SEP-12 KYC storage functions
+pub fn get_sep12_identity_oracle(e: &Env) -> Option<SEP12IdentityOracle> {
+    e.storage().instance().get(&SEP12_IDENTITY_ORACLE)
+}
+
+pub fn set_sep12_identity_oracle(e: &Env, oracle: &SEP12IdentityOracle) {
+    e.storage().instance().set(&SEP12_IDENTITY_ORACLE, oracle);
+}
+
+// Issue #203: Token Precision storage functions
+pub fn get_token_metadata(e: &Env, asset_address: &Address) -> Option<TokenMetadata> {
+    e.storage().instance().get(&(TOKEN_METADATA, asset_address))
+}
+
+pub fn set_token_metadata(e: &Env, asset_address: &Address, metadata: &TokenMetadata) {
+    e.storage().instance().set(&(TOKEN_METADATA, asset_address), metadata);
+}
+
+// Issue #202: Revocability Expiration storage functions
+pub fn get_vesting_grant(e: &Env, vesting_id: u32) -> Option<VestingGrant> {
+    e.storage().instance().get(&(VESTING_GRANTS, vesting_id))
+}
+
+pub fn set_vesting_grant(e: &Env, vesting_id: u32, grant: &VestingGrant) {
+    e.storage().instance().set(&(VESTING_GRANTS, vesting_id), grant);
+}
+
+pub fn get_all_vesting_grants(e: &Env) -> Vec<VestingGrant> {
+    // This is a simplified implementation - in production, you might want
+    // to use a more efficient data structure for storing and retrieving all grants
+    Vec::new(e) // Placeholder - would need proper implementation
+}
