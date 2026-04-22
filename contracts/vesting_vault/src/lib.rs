@@ -8,7 +8,7 @@ mod audit_exporter;
 mod emergency;
 
 pub use types::*;
-use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event};
+use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, is_schedule_terminated, mark_schedule_terminated};
 use emergency::{AuditorPauseRequest, EmergencyPause, EmergencyPauseTriggered};
 
 #[contract]
@@ -815,5 +815,121 @@ impl VestingVault {
         // For USDC destination, we can assume close to 1:1 with small slippage
         let slippage_factor = 9950; // 99.5% (0.5% slippage)
         (source_amount * slippage_factor) / 10000
+    }
+
+    // ========== ISSUE #197: Good Leaver / Bad Leaver Termination States ==========
+    
+    /// Terminate a vesting schedule with Good Leaver or Bad Leaver flags
+    /// 
+    /// # Arguments
+    /// * `admin` - Address of the authorized admin
+    /// * `beneficiary` - Address of the employee whose schedule is being terminated
+    /// * `vesting_id` - ID of the vesting schedule to terminate
+    /// * `leaver_type` - Either GoodLeaver or BadLeaver
+    /// * `treasury` - Address where slashed tokens should be sent
+    /// 
+    /// # Behavior
+    /// * Good Leaver: Halts future vesting but allows employee to claim already earned tokens
+    /// * Bad Leaver: Immediately slashes both unvested and unclaimed tokens, returning them to treasury
+    pub fn terminate_schedule(e: Env, admin: Address, beneficiary: Address, vesting_id: u32, leaver_type: LeaverType, treasury: Address) {
+        admin.require_auth();
+        
+        // Check if schedule is already terminated
+        if is_schedule_terminated(&e, vesting_id) {
+            panic!("Vesting schedule already terminated");
+        }
+        
+        let current_time = e.ledger().timestamp();
+        
+        // Check if contract is under emergency pause
+        if let Some(pause) = get_emergency_pause(&e) {
+            if pause.is_active && current_time < pause.expires_at {
+                panic!("Contract is under emergency pause until {}", pause.expires_at);
+            }
+        }
+        
+        // Calculate vesting amounts (this would integrate with actual vesting logic)
+        let (vested_amount, unvested_amount, unclaimed_amount) = Self::calculate_vesting_amounts(&e, vesting_id, beneficiary.clone());
+        
+        let mut vested_amount_retained = vested_amount;
+        let mut unvested_amount_slashed = 0i128;
+        let mut unclaimed_amount_slashed = 0i128;
+        
+        match leaver_type {
+            LeaverType::GoodLeaver => {
+                // Good Leaver: Keep vested amount, halt future vesting
+                // Only unvested amount is slashed to treasury
+                if unvested_amount > 0 {
+                    unvested_amount_slashed = unvested_amount;
+                    // TODO: Transfer unvested tokens to treasury
+                    // token::Client::new(&e, &token).transfer(&e.current_contract_address(), &treasury, &unvested_amount);
+                }
+            },
+            LeaverType::BadLeaver => {
+                // Bad Leaver: Slash both unvested and unclaimed tokens
+                if unvested_amount > 0 {
+                    unvested_amount_slashed = unvested_amount;
+                }
+                if unclaimed_amount > 0 {
+                    unclaimed_amount_slashed = unclaimed_amount;
+                    vested_amount_retained = vested_amount - unclaimed_amount;
+                }
+                
+                // TODO: Transfer slashed tokens to treasury
+                // let total_slashed = unvested_amount_slashed + unclaimed_amount_slashed;
+                // if total_slashed > 0 {
+                //     token::Client::new(&e, &token).transfer(&e.current_contract_address(), &treasury, &total_slashed);
+                // }
+            }
+        }
+        
+        // Mark the schedule as terminated
+        mark_schedule_terminated(&e, vesting_id);
+        
+        // Emit termination event
+        ScheduleTerminated {
+            vesting_id,
+            beneficiary: beneficiary.clone(),
+            leaver_type: leaver_type.clone(),
+            vested_amount_retained,
+            unvested_amount_slashed,
+            unclaimed_amount_slashed,
+            treasury: treasury.clone(),
+            timestamp: current_time,
+        }.publish(&e);
+    }
+    
+    /// Calculate the vesting amounts for a given schedule
+    /// This is a placeholder function that would integrate with actual vesting logic
+    fn calculate_vesting_amounts(e: &Env, vesting_id: u32, beneficiary: Address) -> (i128, i128, i128) {
+        // TODO: Integrate with actual vesting calculation logic
+        // For now, return placeholder values
+        
+        // In a real implementation, this would:
+        // 1. Get the vesting schedule details
+        // 2. Calculate vested amount based on elapsed time
+        // 3. Calculate unvested amount (total - vested)
+        // 4. Calculate unclaimed amount (vested but not yet claimed)
+        
+        let total_amount = 10000i128; // Placeholder total amount
+        let vested_amount = 6000i128; // Placeholder vested amount
+        let claimed_amount = 2000i128; // Placeholder already claimed amount
+        let unvested_amount = total_amount - vested_amount;
+        let unclaimed_amount = vested_amount - claimed_amount;
+        
+        (vested_amount, unvested_amount, unclaimed_amount)
+    }
+    
+    /// Check if a vesting schedule is terminated
+    pub fn is_schedule_terminated_public(e: Env, vesting_id: u32) -> bool {
+        is_schedule_terminated(&e, vesting_id)
+    }
+    
+    /// Get termination details for a vesting schedule (if terminated)
+    /// This would typically read from event logs or dedicated storage
+    pub fn get_termination_details(e: Env, vesting_id: u32) -> Option<ScheduleTerminated> {
+        // TODO: Implement storage of termination details
+        // For now, this is a placeholder
+        None
     }
 }

@@ -28,6 +28,9 @@ pub const MERKLE_ROOTS: &str = "MERKLE_ROOTS";
 pub const PATH_PAYMENT_CONFIG: &str = "PATH_PAYMENT_CONFIG";
 pub const PATH_PAYMENT_CLAIM_HISTORY: &str = "PATH_PAYMENT_CLAIM_HISTORY";
 
+// Good Leaver / Bad Leaver termination storage keys
+pub const TERMINATED_SCHEDULES: &str = "TERMINATED_SCHEDULES";
+
 // 48 hours in seconds
 const TIMELOCK_DURATION: u64 = 172_800;
 
@@ -235,4 +238,16 @@ pub fn add_path_payment_claim_event(e: &Env, event: &PathPaymentClaimEvent) {
     let mut history = get_path_payment_claim_history(e);
     history.push_back(event.clone());
     e.storage().instance().set(&PATH_PAYMENT_CLAIM_HISTORY, &history);
-}
+}
+
+// Good Leaver / Bad Leaver termination storage functions
+pub fn is_schedule_terminated(e: &Env, vesting_id: u32) -> bool {
+    e.storage()
+        .instance()
+        .get(&(TERMINATED_SCHEDULES, vesting_id))
+        .unwrap_or(false)
+}
+
+pub fn mark_schedule_terminated(e: &Env, vesting_id: u32) {
+    e.storage().instance().set(&(TERMINATED_SCHEDULES, vesting_id), &true);
+}
