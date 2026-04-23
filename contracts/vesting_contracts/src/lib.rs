@@ -76,6 +76,13 @@ pub use beneficiary_reassignment::{
     REASSIGNMENT_REQUESTS, DAO_MEMBERS, REASSIGNMENT_CONFIG, VAULT_REASSIGNMENTS,
 };
 
+pub mod regulated_asset;
+pub use regulated_asset::{
+    RegulatedAssetManager, RegulatedAssetError, AssetRegulation, SEP08Authorization,
+    AuthorizationStatus, FreezeEvent, ClawbackEvent, RegulatedAssetTrait,
+    ASSET_REGULATIONS, SEP08_AUTHORIZATIONS, FREEZE_EVENTS, CLAWBACK_EVENTS,
+};
+
 #[cfg(test)]
 mod certificate_registry_test;
 
@@ -147,7 +154,23 @@ pub enum DataKey {
     MarketplaceLock(u64),
     XLMAddress,
     // Certificate Registry
-    CertificateRegistry(U256),
+    CertificateRegistry(Address),
+    CertificateData(BytesN<32>),
+    // Legal SAFT Document Hash Anchoring
+    LegalDocumentHash(BytesN<32>),
+    DocumentSignature(Address, BytesN<32>),
+    VaultLegalDocuments(u64),
+    // Beneficiary Reassignment
+    ReassignmentRequest(u64),
+    ReassignmentApproval(u64, Address),
+    // SEP-08 Regulated Assets
+    VaultAuthorization(u64),
+    // ZK Verifier
+    ZKVerificationKey(BytesN<32>),
+    AccreditationRecord(Address, BytesN<32>),
+    NullifierMap(BytesN<32>),
+    VerificationKey(BytesN<32>),
+    SupportedCircuit(BytesN<32>),
     BeneficiaryCertificates(Address),
     WorkTypeIndex(String),
     LoyaltyIndex(u32),
@@ -4028,34 +4051,262 @@ impl VestingContract {
         Ok(())
     }
 
+    // --- SEP-08 Regulated Asset Functions ---
+
+    /// Register a regulated asset with SEP-08 compliance
+    pub fn register_regulated_asset(
+        env: Env,
+        asset_id: Address,
+        issuer: Address,
+        requires_authorization: bool,
+        supports_freeze: bool,
+        supports_clawback: bool,
+        max_authorization_duration: u64,
+        compliance_requirements: Vec<String>,
+    ) -> Result<(), RegulatedAssetError> {
+        Self::require_admin(&env);
+        RegulatedAssetManager::register_regulated_asset(
+            &env,
+            asset_id,
+            issuer,
+            requires_authorization,
+            supports_freeze,
+            supports_clawback,
+            max_authorization_duration,
+            compliance_requirements,
+        )
+    }
+
+    /// Create SEP-08 authorization for regulated asset
+    pub fn create_sep08_authorization(
+        env: Env,
+        asset_id: Address,
+        holder: Address,
+        authorized_amount: i128,
+        authorization_id: BytesN<32>,
+        expires_at: u64,
+        issuer: Address,
+        compliance_flags: u32,
+    ) -> Result<(), RegulatedAssetError> {
+        RegulatedAssetManager::create_authorization(
+            &env,
+            asset_id,
+            holder,
+            authorized_amount,
+            authorization_id,
+            expires_at,
+            issuer,
+            compliance_flags,
+        )
+    }
+
+    /// Handle asset freeze event from issuer (SEP-08)
+    pub fn handle_asset_freeze(
+        env: Env,
+        asset_id: Address,
+        holder: Address,
+        amount: i128,
+        reason: String,
+        issuer_signature: BytesN<32>,
+    ) -> Result<(), RegulatedAssetError> {
+        RegulatedAssetManager::handle_freeze_event(
+            &env,
+            asset_id,
+            holder,
+            amount,
+            reason,
+            issuer_signature,
+        )
+    }
+
+    /// Handle asset clawback event from issuer (SEP-08)
+    pub fn handle_asset_clawback(
+        env: Env,
+        asset_id: Address,
+        from_holder: Address,
+        amount: i128,
+        reason: String,
+        issuer_signature: BytesN<32>,
+    ) -> Result<(), RegulatedAssetError> {
+        RegulatedAssetManager::handle_clawback_event(
+            &env,
+            asset_id,
+            from_holder,
+            amount,
+            reason,
+            issuer_signature,
+        )
+    }
+
+    /// Check if asset requires SEP-08 authorization
+    pub fn asset_requires_authorization(env: Env, asset_id: Address) -> bool {
+        RegulatedAssetManager::requires_authorization(&env, asset_id)
+    }
+
+    /// Get asset regulation info
+    pub fn get_asset_regulation(env: Env, asset_id: Address) -> Option<AssetRegulation> {
+        RegulatedAssetManager::get_asset_regulation(&env, asset_id)
+    }
+
+    /// Create vault with regulated asset support
+    pub fn create_vault_regulated(
+        env: Env,
+        owner: Address,
+        amount: i128,
+        asset_id: Address,
+        start_time: u64,
+        end_time: u64,
+        keeper_fee: i128,
+        is_revocable: bool,
+        is_transferable: bool,
+        step_duration: u64,
+        authorization_id: Option<BytesN<32>>,
+    ) -> Result<u64, RegulatedAssetError> {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+
+        // Check if asset requires authorization
+        if RegulatedAssetManager::requires_authorization(&env, asset_id.clone()) {
+            // Validate authorization if provided
+            if let Some(auth_id) = authorization_id {
+                RegulatedAssetManager::validate_authorization(
+                    &env,
+                    asset_id.clone(),
+                    owner.clone(),
+                    amount,
+                    auth_id,
+                )?;
+            } else {
+                return Err(RegulatedAssetError::AuthorizationRequired);
+            }
+        }
+
+        let vault_id = Self::create_vault_full_internal(
+            &env,
+            owner,
+            amount,
+            asset_id,
+            start_time,
+            end_time,
+            keeper_fee,
+            is_revocable,
+            is_transferable,
+            step_duration,
+        );
+
+        // Store authorization reference if provided
+        if let Some(auth_id) = authorization_id {
+            let auth_key = (DataKey::VaultAuthorization, vault_id);
+            env.storage().instance().set(&auth_key, &auth_id);
+        }
+
+        Ok(vault_id)
+    }
+
+    /// Claim tokens with SEP-08 authorization validation
+    pub fn claim_tokens_regulated(
+        env: Env,
+        vault_id: u64,
+        claim_amount: i128,
+        authorization_id: BytesN<32>,
+    ) -> Result<i128, RegulatedAssetError> {
+        Self::require_not_paused(&env);
+        let mut vault = Self::get_vault_internal(&env, vault_id);
+        if vault.is_frozen {
+            panic!("Vault frozen");
+        }
+        if !vault.is_initialized {
+            panic!("Vault not initialized");
+        }
+
+        // Check if this specific vault schedule is paused
+        if Self::is_vault_paused(env.clone(), vault_id) {
+            panic!("Vault schedule paused");
+        }
+
+        // Check legal document signatures
+        if vault.requires_legal_signatures && !vault.legal_documents_signed {
+            panic!("Legal document signatures required before claiming tokens");
+        }
+
+        // Check beneficiary reassignment status
+        if let Some(reassignment) = BeneficiaryReassignment::get_reassignment_status(&env, vault_id) {
+            match &reassignment.status {
+                ReassignmentStatus::Pending(_) => {
+                    panic!("Beneficiary reassignment in progress - claims paused");
+                }
+                ReassignmentStatus::Approved => {
+                    panic!("Beneficiary reassignment approved - claims paused");
+                }
+                ReassignmentStatus::Completed => {
+                    if reassignment.new_beneficiary != vault.owner {
+                        panic!("Vault owner mismatch after reassignment");
+                    }
+                }
+                ReassignmentStatus::Rejected => {}
+                ReassignmentStatus::None => {}
+            }
+        }
+
+        // Get the asset allocation
+        if vault.allocations.len() != 1 {
+            panic!("Use claim_tokens_diversified_regulated for multi-asset vaults");
+        }
+
+        let allocation = vault.allocations.get(0).unwrap();
+        let asset_id = allocation.asset_id.clone();
+
+        // Check if asset requires SEP-08 authorization
+        if RegulatedAssetManager::requires_authorization(&env, asset_id.clone()) {
+            // Validate authorization
+            RegulatedAssetManager::validate_authorization(
+                &env,
+                asset_id.clone(),
+                vault.owner.clone(),
+                claim_amount,
+                authorization_id.clone(),
+            )?;
+
+            // Consume authorization amount
+            RegulatedAssetManager::consume_authorization(&env, authorization_id, claim_amount);
+        }
+
+        vault.owner.require_auth();
+
+        // Heartbeat: reset Dead-Man's Switch on every primary interaction
+        update_activity(&env, vault_id);
+
+        let vested = Self::calculate_claimable_for_asset(&env, vault_id, &vault, 0);
+        if claim_amount > vested - allocation.released_amount {
+            panic!("Insufficient vested tokens");
+        }
+
+        let mut updated_allocation = allocation.clone();
+        updated_allocation.released_amount += claim_amount;
+        vault.allocations.set(0, updated_allocation);
+
+        env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
+
+        // Check if vault is fully completed and register certificate
+        Self::check_and_register_certificate(&env, vault_id, &vault);
+
+        // Mint NFT if configured
+        if let Some(nft_minter) = env.storage().instance().get::<_, Address>(&DataKey::NFTMinter) {
+            env.invoke_contract::<()>(
+                &nft_minter,
+                &Symbol::new(&env, "mint"),
+                (&vault.owner,).into_val(&env),
+            );
+        }
+
+        // Transfer tokens
+        token::Client::new(&env, &asset_id)
+            .transfer(&env.current_contract_address(), &vault.owner, &claim_amount);
+
+        Ok(claim_amount)
+    }
+
     // Private helper methods for legal document integration
-
-    fn set_vault_legal_requirement(env: &Env, vault_id: u64, requires_signatures: bool) {
-        let mut vault = Self::get_vault_internal(env, vault_id);
-        vault.requires_legal_signatures = requires_signatures;
-        
-        // If requiring signatures, set initial state to not signed
-        if requires_signatures {
-            vault.legal_documents_signed = false;
-        }
-        
-        env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
-    }
-
-    fn set_vault_legal_status(env: &Env, vault_id: u64, all_signed: bool) {
-        let mut vault = Self::get_vault_internal(env, vault_id);
-        vault.legal_documents_signed = all_signed;
-        env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
-
-        // Emit event when all documents are signed
-        if all_signed {
-            VaultLegalDocumentsSigned {
-                vault_id,
-                beneficiary: vault.owner,
-            }.publish(env);
-        }
-    }
-}
 
 // Redefinition removed
 
@@ -4071,6 +4322,8 @@ mod zk_verifier_test;
 mod legal_saft_test;
 #[cfg(test)]
 mod beneficiary_reassignment_test;
+#[cfg(test)]
+mod regulated_asset_test;
 #[cfg(test)]
 mod diversified_simple_test;
 #[cfg(test)]
