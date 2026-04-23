@@ -13,6 +13,7 @@ use soroban_sdk::{
     Vec,
     String,
     U256,
+    BytesN,
 };
 
 mod errors;
@@ -55,6 +56,9 @@ pub use certificate_registry::{
 
 #[cfg(test)]
 mod certificate_registry_test;
+
+#[cfg(test)]
+mod merkle_bulk_test;
 
 pub mod diversified_core;
 pub use diversified_core::{AssetAllocation as DiversifiedAllocation, DiversifiedVault};
@@ -134,6 +138,9 @@ pub enum DataKey {
     ApprovedStakingContracts,
     // Dynamic emission rate for partial clawback
     ClawbackAdjustment(u64),
+    // Merkle Tree Bulk Initialization (Issue #199)
+    MerkleRoot,
+    ActivatedSchedule(Address), // beneficiary -> vault_id
 }
 
 #[contracttype]
@@ -165,6 +172,28 @@ pub struct ClawbackAdjustment {
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
+pub struct MerkleProof {
+    pub leaf_hash: BytesN<32>,
+    pub proof: Vec<BytesN<32>>,
+    pub leaf_index: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VestingScheduleLeaf {
+    pub beneficiary: Address,
+    pub vault_id: u64,
+    pub asset_basket: Vec<AssetAllocationEntry>,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub keeper_fee: i128,
+    pub is_revocable: bool,
+    pub is_transferable: bool,
+    pub step_duration: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
 pub enum AdminAction {
     RevokeSchedule(u64, Address),
     AddBeneficiary(Address, ScheduleConfig),
@@ -187,6 +216,7 @@ pub enum AdminAction {
     GrantManagerRights(Address, Address, i128), // Manager, Asset, Amount
     RenewSchedule(u64, u64, i128), // VaultID, AdditionalDuration, AdditionalAmount
     SetXLMAddress(Address),
+    InitializeMerkleRoot(BytesN<32>, u32), // Merkle root, total schedules
 }
 
 #[contracttype]
@@ -452,6 +482,25 @@ pub struct PartialClawbackDynamic {
     pub clawback_time: u64,
 }
 
+#[contractevent]
+pub struct MerkleRootInitialized {
+    #[topic]
+    pub merkle_root: BytesN<32>,
+    pub total_schedules: u32,
+    pub initialized_at: u64,
+}
+
+#[contractevent]
+pub struct ScheduleActivatedWithProof {
+    #[topic]
+    pub beneficiary: Address,
+    #[topic]
+    pub vault_id: u64,
+    #[topic]
+    pub merkle_root: BytesN<32>,
+    pub activated_at: u64,
+}
+
 #[contract]
 pub struct VestingContract;
 
@@ -525,6 +574,17 @@ impl VestingContract {
             },
             AdminAction::SetXLMAddress(xlm) => {
                 env.storage().instance().set(&DataKey::XLMAddress, &xlm);
+            },
+            AdminAction::InitializeMerkleRoot(merkle_root, total_schedules) => {
+                if env.storage().instance().has(&DataKey::MerkleRoot) {
+                    panic!("Merkle root already initialized");
+                }
+                env.storage().instance().set(&DataKey::MerkleRoot, &merkle_root);
+                MerkleRootInitialized {
+                    merkle_root,
+                    total_schedules,
+                    initialized_at: env.ledger().timestamp(),
+                }.publish(&env);
             },
             _ => {}
         }
@@ -944,6 +1004,154 @@ impl VestingContract {
             ids.push_back(id);
         }
         ids
+    }
+
+    /// Initialize Merkle root for bulk vesting schedule activation (Issue #199)
+    /// Stores a single 32-byte root hash that represents thousands of vesting schedules
+    pub fn initialize_merkle_root(env: Env, merkle_root: BytesN<32>, total_schedules: u32) {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        
+        // Check if Merkle root already exists
+        if env.storage().instance().has(&DataKey::MerkleRoot) {
+            panic!("Merkle root already initialized");
+        }
+        
+        // Store the Merkle root
+        env.storage().instance().set(&DataKey::MerkleRoot, &merkle_root);
+        
+        MerkleRootInitialized {
+            merkle_root,
+            total_schedules,
+            initialized_at: env.ledger().timestamp(),
+        }.publish(&env);
+    }
+
+    /// Activate an individual vesting schedule using Merkle proof
+    /// Users provide proof that their schedule is included in the Merkle tree
+    pub fn activate_schedule_with_proof(
+        env: Env,
+        beneficiary: Address,
+        leaf: VestingScheduleLeaf,
+        proof: MerkleProof,
+    ) -> u64 {
+        beneficiary.require_auth();
+        
+        // Get stored Merkle root
+        let stored_root: BytesN<32> = env.storage().instance()
+            .get(&DataKey::MerkleRoot)
+            .expect("Merkle root not initialized");
+        
+        // Verify the Merkle proof
+        if !Self::verify_merkle_proof(&env, &proof, &stored_root) {
+            panic!("Invalid Merkle proof");
+        }
+        
+        // Check if schedule already activated for this beneficiary
+        if env.storage().instance().has(&DataKey::ActivatedSchedule(beneficiary.clone())) {
+            panic!("Schedule already activated for beneficiary");
+        }
+        
+        // Verify leaf data matches proof
+        let computed_leaf_hash = Self::hash_vesting_leaf(&env, &leaf);
+        if computed_leaf_hash != proof.leaf_hash {
+            panic!("Leaf data does not match proof");
+        }
+        
+        // Create the vault with the leaf data
+        let vault_id = Self::create_vault_prefunded_internal(
+            &env,
+            leaf.beneficiary.clone(),
+            leaf.asset_basket,
+            leaf.start_time,
+            leaf.end_time,
+            leaf.keeper_fee,
+            leaf.is_revocable,
+            leaf.is_transferable,
+            leaf.step_duration,
+            true, // is_initialized
+        );
+        
+        // Mark schedule as activated for this beneficiary
+        env.storage().instance().set(&DataKey::ActivatedSchedule(beneficiary.clone()), &vault_id);
+        
+        ScheduleActivatedWithProof {
+            beneficiary: beneficiary.clone(),
+            vault_id,
+            merkle_root: stored_root,
+            activated_at: env.ledger().timestamp(),
+        }.publish(&env);
+        
+        vault_id
+    }
+
+    /// Verify a Merkle proof against a stored root
+    fn verify_merkle_proof(env: &Env, proof: &MerkleProof, root: &BytesN<32>) -> bool {
+        let mut current_hash = proof.leaf_hash.clone();
+        let mut index = proof.leaf_index;
+        
+        for sibling_hash in proof.proof.iter() {
+            if (index & 1) == 0 {
+                // Current hash is left sibling
+                current_hash = Self::hash_pair(&env, &current_hash, sibling_hash);
+            } else {
+                // Current hash is right sibling
+                current_hash = Self::hash_pair(&env, sibling_hash, &current_hash);
+            }
+            index >>= 1;
+        }
+        
+        current_hash == *root
+    }
+    
+    /// Hash two bytes arrays together (simplified SHA-256 behavior)
+    fn hash_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
+        let mut combined = Vec::new(env);
+        combined.extend_from_slice(left.as_slice());
+        combined.extend_from_slice(right.as_slice());
+        env.crypto().sha256(&combined.into())
+    }
+    
+    /// Hash a vesting schedule leaf into a 32-byte array
+    fn hash_vesting_leaf(env: &Env, leaf: &VestingScheduleLeaf) -> BytesN<32> {
+        let mut data = Vec::new(env);
+        
+        // Serialize leaf data
+        data.extend_from_slice(leaf.beneficiary.to_xdr(env).as_slice());
+        data.extend_from_slice(&leaf.vault_id.to_le_bytes());
+        
+        // Hash asset basket
+        for allocation in leaf.asset_basket.iter() {
+            data.extend_from_slice(allocation.asset_id.to_xdr(env).as_slice());
+            data.extend_from_slice(&allocation.total_amount.to_le_bytes());
+            data.extend_from_slice(&allocation.released_amount.to_le_bytes());
+            data.extend_from_slice(&allocation.locked_amount.to_le_bytes());
+            data.extend_from_slice(&allocation.percentage.to_le_bytes());
+        }
+        
+        data.extend_from_slice(&leaf.start_time.to_le_bytes());
+        data.extend_from_slice(&leaf.end_time.to_le_bytes());
+        data.extend_from_slice(&leaf.keeper_fee.to_le_bytes());
+        data.extend_from_slice(&[if leaf.is_revocable { 1u8 } else { 0u8 }]);
+        data.extend_from_slice(&[if leaf.is_transferable { 1u8 } else { 0u8 }]);
+        data.extend_from_slice(&leaf.step_duration.to_le_bytes());
+        
+        env.crypto().sha256(&data.into())
+    }
+
+    /// Get the current Merkle root
+    pub fn get_merkle_root(env: Env) -> Option<BytesN<32>> {
+        env.storage().instance().get(&DataKey::MerkleRoot)
+    }
+    
+    /// Check if a beneficiary has already activated their schedule
+    pub fn is_schedule_activated(env: Env, beneficiary: Address) -> bool {
+        env.storage().instance().has(&DataKey::ActivatedSchedule(beneficiary))
+    }
+    
+    /// Get the vault ID for an activated schedule
+    pub fn get_activated_vault_id(env: Env, beneficiary: Address) -> Option<u64> {
+        env.storage().instance().get(&DataKey::ActivatedSchedule(beneficiary))
     }
 
     /// Creates a vault with a diversified asset basket (pre-funded)
