@@ -132,6 +132,8 @@ pub enum DataKey {
     AntiDilutionConfig(u64),
     NetworkGrowthSnapshot(u64),
     ApprovedStakingContracts,
+    // Dynamic emission rate for partial clawback
+    ClawbackAdjustment(u64),
 }
 
 #[contracttype]
@@ -148,6 +150,17 @@ pub struct SubAdminPool {
 pub struct MarketplaceLock {
     pub marketplace: Address,
     pub authorized_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClawbackAdjustment {
+    pub clawback_time: u64,
+    pub clawback_amount: i128,
+    pub original_total_amount: i128,
+    pub original_rate: i128,
+    pub new_rate: i128,
+    pub remaining_tokens: i128,
 }
 
 #[contracttype]
@@ -426,6 +439,17 @@ pub struct PartialRevocation {
     pub penalty_amount: i128,
     pub severance_amount: i128,
     pub treasury: Address,
+}
+
+#[contractevent]
+pub struct PartialClawbackDynamic {
+    #[topic]
+    pub vault_id: u64,
+    pub clawback_amount: i128,
+    pub remaining_tokens: i128,
+    #[topic]
+    pub treasury: Address,
+    pub clawback_time: u64,
 }
 
 #[contract]
@@ -2325,6 +2349,137 @@ impl VestingContract {
         }.publish(&env);
     }
 
+    /// Partial clawback with dynamic emission rate recalculation.
+    ///
+    /// When a schedule is partially clawed back by the DAO, this function dynamically
+    /// recalculates the ongoing emission rate for the remaining tokens so the schedule
+    /// still ends on the original designated date, rather than ending early.
+    ///
+    /// # Parameters
+    /// - `vault_id`: ID of the vault to partially clawback
+    /// - `clawback_amount`: Amount of tokens to clawback from unvested portion
+    /// - `treasury`: Address where clawed tokens will be sent
+    ///
+    /// # Behavior
+    /// - Calculates how much should have been vested by current time
+    /// - Removes clawback amount from remaining unvested tokens
+    /// - Recalculates emission rate to distribute remaining tokens over remaining time
+    /// - Preserves original end_time so schedule completes on schedule
+    ///
+    /// # Panics
+    /// - If vault is irrevocable
+    /// - If clawback_amount exceeds available unvested tokens
+    /// - If caller is not an admin
+    pub fn partial_clawback_dynamic(env: Env, vault_id: u64, clawback_amount: i128, treasury: Address) {
+        Self::require_admin(&env);
+
+        if clawback_amount <= 0 {
+            panic!("clawback_amount must be positive");
+        }
+
+        let mut vault = Self::get_vault_internal(&env, vault_id);
+
+        if vault.is_irrevocable {
+            panic!("Vault is irrevocable");
+        }
+        if vault.is_frozen {
+            panic!("Vault is frozen");
+        }
+        if vault.allocations.len() != 1 {
+            panic!("Use diversified variant for multi-asset vaults");
+        }
+
+        // Auto-unstake if staked
+        let stake_info = get_stake_info(&env, vault_id);
+        if stake_info.stake_state != StakeState::Unstaked {
+            Self::do_unstake(&env, vault_id, &mut vault);
+            stake::emit_revocation_unstaked(&env, vault_id, &vault.owner);
+        }
+
+        let allocation = vault.allocations.get(0).unwrap();
+        let current_time = env.ledger().timestamp();
+
+        // Calculate current vested amount based on original schedule
+        let vested_amount = Self::calculate_claimable_for_asset(&env, vault_id, &vault, 0);
+        let unvested_amount = allocation.total_amount - vested_amount;
+
+        if clawback_amount > unvested_amount {
+            panic!("clawback_amount exceeds available unvested tokens");
+        }
+
+        // Transfer clawback amount to treasury
+        let token: Address = env.storage().instance().get(&DataKey::Token).expect("Token not set");
+        let token_client = token::Client::new(&env, &token);
+        
+        if clawback_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &treasury, &clawback_amount);
+        }
+
+        // Calculate new emission rate to ensure remaining tokens vest by original end_time
+        let remaining_tokens = unvested_amount - clawback_amount;
+        let remaining_time = vault.end_time.saturating_sub(current_time);
+
+        if remaining_tokens > 0 && remaining_time > 0 {
+            // Update allocation with reduced total amount and preserved released amount
+            let mut updated_allocation = allocation.clone();
+            updated_allocation.total_amount = vested_amount + remaining_tokens;
+            
+            // Store the original emission rate for reference
+            let original_total = allocation.total_amount;
+            let original_duration = vault.end_time - vault.start_time;
+            let original_rate = original_total / (original_duration as i128);
+            
+            // Calculate new emission rate
+            let new_rate = remaining_tokens / (remaining_time as i128);
+            
+            // Update vault structure
+            vault.allocations.set(0, updated_allocation);
+            
+            // Store clawback adjustment data for emission rate calculation
+            let clawback_data = ClawbackAdjustment {
+                clawback_time: current_time,
+                clawback_amount,
+                original_total_amount: original_total,
+                original_rate,
+                new_rate,
+                remaining_tokens,
+            };
+            
+            env.storage().instance().set(&DataKey::ClawbackAdjustment(vault_id), &clawback_data);
+        }
+
+        // Update total shares
+        let total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TotalShares, &(total_shares - clawback_amount));
+
+        // Save updated vault
+        env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
+
+        // Emit event
+        PartialClawbackDynamic {
+            vault_id,
+            clawback_amount,
+            remaining_tokens,
+            treasury: treasury.clone(),
+            clawback_time: current_time,
+        }.publish(&env);
+    }
+
+    /// Get clawback adjustment data for a vault (for testing and inspection)
+    pub fn get_clawback_adjustment(env: Env, vault_id: u64) -> ClawbackAdjustment {
+        env.storage()
+            .instance()
+            .get(&DataKey::ClawbackAdjustment(vault_id))
+            .unwrap_or(ClawbackAdjustment {
+                clawback_time: 0,
+                clawback_amount: 0,
+                original_total_amount: 0,
+                original_rate: 0,
+                new_rate: 0,
+                remaining_tokens: 0,
+            })
+    }
+
     /// Return the current stake status for a vault.
     pub fn get_stake_status(env: Env, vault_id: u64) -> StakeStatusView {
         let info = get_stake_info(&env, vault_id);
@@ -2839,6 +2994,32 @@ impl VestingContract {
         if now <= vault.start_time { return 0; }
         if now >= vault.end_time { return allocation.total_amount; }
 
+        // Check if there's a clawback adjustment that requires dynamic emission rate
+        if let Some(clawback_adj) = env.storage().instance().get::<DataKey, ClawbackAdjustment>(&DataKey::ClawbackAdjustment(id)) {
+            // Use dynamic emission rate calculation
+            if now <= clawback_adj.clawback_time {
+                // Before clawback: use original rate
+                let elapsed = (now - vault.start_time) as i128;
+                return (clawback_adj.original_total_amount * elapsed) / ((vault.end_time - vault.start_time) as i128);
+            } else {
+                // After clawback: vested amount before clawback + new rate for remaining time
+                let elapsed_before_clawback = (clawback_adj.clawback_time - vault.start_time) as i128;
+                let vested_before_clawback = (clawback_adj.original_total_amount * elapsed_before_clawback) / ((vault.end_time - vault.start_time) as i128);
+                
+                let elapsed_after_clawback = (now - clawback_adj.clawback_time) as i128;
+                let remaining_time = (vault.end_time - clawback_adj.clawback_time) as i128;
+                
+                let vested_after_clawback = if remaining_time > 0 {
+                    (clawback_adj.remaining_tokens * elapsed_after_clawback) / remaining_time
+                } else {
+                    0
+                };
+                
+                return vested_before_clawback + vested_after_clawback;
+            }
+        }
+
+        // Original calculation for vaults without clawback adjustment
         let duration = (vault.end_time - vault.start_time) as i128;
         let elapsed = (now - vault.start_time) as i128;
 
