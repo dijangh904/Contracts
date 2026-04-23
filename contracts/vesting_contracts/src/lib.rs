@@ -13,7 +13,11 @@ use soroban_sdk::{
     Vec,
     String,
     U256,
+    BytesN,
 };
+
+mod errors;
+pub use errors::Error;
 
 mod factory;
 pub use factory::{ VestingFactory, VestingFactoryClient };
@@ -74,6 +78,9 @@ pub use beneficiary_reassignment::{
 
 #[cfg(test)]
 mod certificate_registry_test;
+
+#[cfg(test)]
+mod merkle_bulk_test;
 
 pub mod diversified_core;
 pub use diversified_core::{AssetAllocation as DiversifiedAllocation, DiversifiedVault};
@@ -151,6 +158,11 @@ pub enum DataKey {
     AntiDilutionConfig(u64),
     NetworkGrowthSnapshot(u64),
     ApprovedStakingContracts,
+    // Dynamic emission rate for partial clawback
+    ClawbackAdjustment(u64),
+    // Merkle Tree Bulk Initialization (Issue #199)
+    MerkleRoot,
+    ActivatedSchedule(Address), // beneficiary -> vault_id
 }
 
 #[contracttype]
@@ -167,6 +179,39 @@ pub struct SubAdminPool {
 pub struct MarketplaceLock {
     pub marketplace: Address,
     pub authorized_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClawbackAdjustment {
+    pub clawback_time: u64,
+    pub clawback_amount: i128,
+    pub original_total_amount: i128,
+    pub original_rate: i128,
+    pub new_rate: i128,
+    pub remaining_tokens: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MerkleProof {
+    pub leaf_hash: BytesN<32>,
+    pub proof: Vec<BytesN<32>>,
+    pub leaf_index: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VestingScheduleLeaf {
+    pub beneficiary: Address,
+    pub vault_id: u64,
+    pub asset_basket: Vec<AssetAllocationEntry>,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub keeper_fee: i128,
+    pub is_revocable: bool,
+    pub is_transferable: bool,
+    pub step_duration: u64,
 }
 
 #[contracttype]
@@ -193,6 +238,7 @@ pub enum AdminAction {
     GrantManagerRights(Address, Address, i128), // Manager, Asset, Amount
     RenewSchedule(u64, u64, i128), // VaultID, AdditionalDuration, AdditionalAmount
     SetXLMAddress(Address),
+    InitializeMerkleRoot(BytesN<32>, u32), // Merkle root, total schedules
 }
 
 #[contracttype]
@@ -542,6 +588,17 @@ impl VestingContract {
             },
             AdminAction::SetXLMAddress(xlm) => {
                 env.storage().instance().set(&DataKey::XLMAddress, &xlm);
+            },
+            AdminAction::InitializeMerkleRoot(merkle_root, total_schedules) => {
+                if env.storage().instance().has(&DataKey::MerkleRoot) {
+                    panic!("Merkle root already initialized");
+                }
+                env.storage().instance().set(&DataKey::MerkleRoot, &merkle_root);
+                MerkleRootInitialized {
+                    merkle_root,
+                    total_schedules,
+                    initialized_at: env.ledger().timestamp(),
+                }.publish(&env);
             },
             _ => {}
         }
@@ -963,6 +1020,154 @@ impl VestingContract {
         ids
     }
 
+    /// Initialize Merkle root for bulk vesting schedule activation (Issue #199)
+    /// Stores a single 32-byte root hash that represents thousands of vesting schedules
+    pub fn initialize_merkle_root(env: Env, merkle_root: BytesN<32>, total_schedules: u32) {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        
+        // Check if Merkle root already exists
+        if env.storage().instance().has(&DataKey::MerkleRoot) {
+            panic!("Merkle root already initialized");
+        }
+        
+        // Store the Merkle root
+        env.storage().instance().set(&DataKey::MerkleRoot, &merkle_root);
+        
+        MerkleRootInitialized {
+            merkle_root,
+            total_schedules,
+            initialized_at: env.ledger().timestamp(),
+        }.publish(&env);
+    }
+
+    /// Activate an individual vesting schedule using Merkle proof
+    /// Users provide proof that their schedule is included in the Merkle tree
+    pub fn activate_schedule_with_proof(
+        env: Env,
+        beneficiary: Address,
+        leaf: VestingScheduleLeaf,
+        proof: MerkleProof,
+    ) -> u64 {
+        beneficiary.require_auth();
+        
+        // Get stored Merkle root
+        let stored_root: BytesN<32> = env.storage().instance()
+            .get(&DataKey::MerkleRoot)
+            .expect("Merkle root not initialized");
+        
+        // Verify the Merkle proof
+        if !Self::verify_merkle_proof(&env, &proof, &stored_root) {
+            panic!("Invalid Merkle proof");
+        }
+        
+        // Check if schedule already activated for this beneficiary
+        if env.storage().instance().has(&DataKey::ActivatedSchedule(beneficiary.clone())) {
+            panic!("Schedule already activated for beneficiary");
+        }
+        
+        // Verify leaf data matches proof
+        let computed_leaf_hash = Self::hash_vesting_leaf(&env, &leaf);
+        if computed_leaf_hash != proof.leaf_hash {
+            panic!("Leaf data does not match proof");
+        }
+        
+        // Create the vault with the leaf data
+        let vault_id = Self::create_vault_prefunded_internal(
+            &env,
+            leaf.beneficiary.clone(),
+            leaf.asset_basket,
+            leaf.start_time,
+            leaf.end_time,
+            leaf.keeper_fee,
+            leaf.is_revocable,
+            leaf.is_transferable,
+            leaf.step_duration,
+            true, // is_initialized
+        );
+        
+        // Mark schedule as activated for this beneficiary
+        env.storage().instance().set(&DataKey::ActivatedSchedule(beneficiary.clone()), &vault_id);
+        
+        ScheduleActivatedWithProof {
+            beneficiary: beneficiary.clone(),
+            vault_id,
+            merkle_root: stored_root,
+            activated_at: env.ledger().timestamp(),
+        }.publish(&env);
+        
+        vault_id
+    }
+
+    /// Verify a Merkle proof against a stored root
+    fn verify_merkle_proof(env: &Env, proof: &MerkleProof, root: &BytesN<32>) -> bool {
+        let mut current_hash = proof.leaf_hash.clone();
+        let mut index = proof.leaf_index;
+        
+        for sibling_hash in proof.proof.iter() {
+            if (index & 1) == 0 {
+                // Current hash is left sibling
+                current_hash = Self::hash_pair(&env, &current_hash, sibling_hash);
+            } else {
+                // Current hash is right sibling
+                current_hash = Self::hash_pair(&env, sibling_hash, &current_hash);
+            }
+            index >>= 1;
+        }
+        
+        current_hash == *root
+    }
+    
+    /// Hash two bytes arrays together (simplified SHA-256 behavior)
+    fn hash_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
+        let mut combined = Vec::new(env);
+        combined.extend_from_slice(left.as_slice());
+        combined.extend_from_slice(right.as_slice());
+        env.crypto().sha256(&combined.into())
+    }
+    
+    /// Hash a vesting schedule leaf into a 32-byte array
+    fn hash_vesting_leaf(env: &Env, leaf: &VestingScheduleLeaf) -> BytesN<32> {
+        let mut data = Vec::new(env);
+        
+        // Serialize leaf data
+        data.extend_from_slice(leaf.beneficiary.to_xdr(env).as_slice());
+        data.extend_from_slice(&leaf.vault_id.to_le_bytes());
+        
+        // Hash asset basket
+        for allocation in leaf.asset_basket.iter() {
+            data.extend_from_slice(allocation.asset_id.to_xdr(env).as_slice());
+            data.extend_from_slice(&allocation.total_amount.to_le_bytes());
+            data.extend_from_slice(&allocation.released_amount.to_le_bytes());
+            data.extend_from_slice(&allocation.locked_amount.to_le_bytes());
+            data.extend_from_slice(&allocation.percentage.to_le_bytes());
+        }
+        
+        data.extend_from_slice(&leaf.start_time.to_le_bytes());
+        data.extend_from_slice(&leaf.end_time.to_le_bytes());
+        data.extend_from_slice(&leaf.keeper_fee.to_le_bytes());
+        data.extend_from_slice(&[if leaf.is_revocable { 1u8 } else { 0u8 }]);
+        data.extend_from_slice(&[if leaf.is_transferable { 1u8 } else { 0u8 }]);
+        data.extend_from_slice(&leaf.step_duration.to_le_bytes());
+        
+        env.crypto().sha256(&data.into())
+    }
+
+    /// Get the current Merkle root
+    pub fn get_merkle_root(env: Env) -> Option<BytesN<32>> {
+        env.storage().instance().get(&DataKey::MerkleRoot)
+    }
+    
+    /// Check if a beneficiary has already activated their schedule
+    pub fn is_schedule_activated(env: Env, beneficiary: Address) -> bool {
+        env.storage().instance().has(&DataKey::ActivatedSchedule(beneficiary))
+    }
+    
+    /// Get the vault ID for an activated schedule
+    pub fn get_activated_vault_id(env: Env, beneficiary: Address) -> Option<u64> {
+        env.storage().instance().get(&DataKey::ActivatedSchedule(beneficiary))
+    }
+
     /// Creates a vault with a diversified asset basket (pre-funded)
     pub fn create_vault_diversified_full(
         env: Env,
@@ -1109,20 +1314,20 @@ impl VestingContract {
     }
 
     /// Claims tokens from a diversified vesting vault
-    /// Returns a vector of (asset_id, claimed_amount) pairs
-    pub fn claim_tokens_diversified(env: Env, vault_id: u64) -> Vec<(Address, i128)> {
+    /// Main diversified claim function that claims all available tokens across all assets
+    pub fn claim_tokens_diversified(env: Env, vault_id: u64) -> Result<Vec<(Address, i128)>, Error> {
         Self::require_not_paused(&env);
         let mut vault = Self::get_vault_internal(&env, vault_id);
         if vault.is_frozen {
-            panic!("Vault frozen");
+            return Err(Error::VaultFrozen);
         }
         if !vault.is_initialized {
-            panic!("Vault not initialized");
+            return Err(Error::VaultNotInitialized);
         }
 
         // Check if this specific vault schedule is paused
         if Self::is_vault_paused(env.clone(), vault_id) {
-            panic!("Vault schedule paused");
+            return Err(Error::ContractPaused);
         }
 
         // Check if legal document signatures are required and verified
@@ -1156,12 +1361,85 @@ impl VestingContract {
 
         vault.owner.require_auth();
 
+        // ========== COMPLIANCE CHECKS ==========
+
+        // KYC Verification Check
+        if !Self::is_kyc_verified(&env, &vault.owner) {
+            return Err(Error::KycNotCompleted);
+        }
+        
+        // KYC Expiration Check
+        if let Some(kyc_expiry) = Self::get_kyc_expiry(&env, &vault.owner) {
+            let current_time = env.ledger().timestamp();
+            if current_time > kyc_expiry {
+                return Err(Error::KycExpired);
+            }
+        }
+        
+        // Sanctions Check
+        if Self::is_address_sanctioned(&env, &vault.owner) {
+            return Err(Error::AddressSanctioned);
+        }
+        
+        // Jurisdiction Restriction Check
+        if Self::is_jurisdiction_restricted(&env, &vault.owner) {
+            return Err(Error::JurisdictionRestricted);
+        }
+        
+        // Legal Signature Verification
+        if !Self::has_valid_legal_signature(&env, &vault.owner, vault_id) {
+            return Err(Error::LegalSignatureMissing);
+        }
+        
+        // Document Verification Check
+        if !Self::are_documents_verified(&env, &vault.owner) {
+            return Err(Error::DocumentVerificationFailed);
+        }
+        
+        // Tax Compliance Check
+        if !Self::is_tax_compliant(&env, &vault.owner) {
+            return Err(Error::TaxComplianceFailed);
+        }
+        
+        // Whitelist Approval Check
+        if !Self::is_whitelist_approved(&env, &vault.owner) {
+            return Err(Error::WhitelistNotApproved);
+        }
+        
+        // Blacklist Violation Check
+        if Self::is_on_blacklist(&env, &vault.owner) {
+            return Err(Error::BlacklistViolation);
+        }
+        
+        // Geofencing Restriction Check
+        if Self::is_geofencing_restricted(&env, &vault.owner) {
+            return Err(Error::GeofencingRestriction);
+        }
+        
+        // Identity Verification Expiration Check
+        if let Some(identity_expiry) = Self::get_identity_expiry(&env, &vault.owner) {
+            let current_time = env.ledger().timestamp();
+            if current_time > identity_expiry {
+                return Err(Error::IdentityVerificationExpired);
+            }
+        }
+        
+        // Politically Exposed Person Check
+        if Self::is_politically_exposed_person(&env, &vault.owner) {
+            return Err(Error::PoliticallyExposedPerson);
+        }
+        
+        // Sanctions List Hit Check
+        if Self::is_on_sanctions_list(&env, &vault.owner) {
+            return Err(Error::SanctionsListHit);
+        }
+
         // Heartbeat: reset Dead-Man's Switch on every primary interaction
         update_activity(&env, vault_id);
 
-        // Validate asset basket
-        if !Self::validate_asset_basket(&vault.allocations) {
-            panic!("Invalid asset basket percentages");
+        // KPI Gate check (#145/#92)
+        if !crate::kpi_vesting::kpi_status(&env, vault_id) {
+            return Err(Error::ComplianceCheckFailed);
         }
 
         let mut claimed_assets = Vec::new(&env);
@@ -1211,6 +1489,119 @@ impl VestingContract {
                 &Symbol::new(&env, "mint"),
                 (&vault.owner,).into_val(&env),
             );
+        }
+
+        claimed_assets
+    }
+
+    /// Batch claim tokens from all user's vaults in a single transaction
+    /// Aggregates available tokens across all schedules linked to a single Address
+    /// Returns a vector of (asset_id, total_claimed_amount) pairs
+    pub fn batch_claim(env: Env, user: Address) -> Vec<(Address, i128)> {
+        Self::require_not_paused(&env);
+        user.require_auth();
+
+        // Get all vaults for this user
+        let user_vaults = Self::get_user_vaults(env.clone(), user.clone());
+        
+        if user_vaults.is_empty() {
+            return Vec::new(&env);
+        }
+
+        let mut aggregated_claims = Vec::new(&env);
+        let mut processed_vaults = Vec::new(&env);
+
+        // Process each vault and aggregate claimable amounts by asset
+        for vault_id in user_vaults.iter() {
+            let mut vault = Self::get_vault_internal(&env, *vault_id);
+            
+            // Skip frozen, uninitialized, or paused vaults
+            if vault.is_frozen || !vault.is_initialized || Self::is_vault_paused(env.clone(), *vault_id) {
+                continue;
+            }
+
+            // Heartbeat: reset Dead-Man's Switch on every primary interaction
+            update_activity(&env, *vault_id);
+
+            // Validate asset basket
+            if !Self::validate_asset_basket(&vault.allocations) {
+                continue;
+            }
+
+            let mut vault_has_claims = false;
+
+            // Calculate claimable amounts for each asset in this vault
+            for (i, allocation) in vault.allocations.iter().enumerate() {
+                let vested_amount = Self::calculate_claimable_for_asset(&env, *vault_id, &vault, i);
+                let mut claimable_amount = vested_amount - allocation.released_amount;
+
+                // #90: XLM Minimum Reserve Check (2 XLM = 20,000,000 Stroops)
+                let xlm: Option<Address> = env.storage().instance().get(&DataKey::XLMAddress);
+                if let Some(xlm_addr) = xlm {
+                    if allocation.asset_id == xlm_addr {
+                        let total_unreleased = allocation.total_amount - allocation.released_amount;
+                        if total_unreleased <= 20_000_000 {
+                            claimable_amount = 0;
+                        } else if (total_unreleased - claimable_amount) < 20_000_000 {
+                            claimable_amount = total_unreleased - 20_000_000;
+                        }
+                    }
+                }
+
+                if claimable_amount > 0 {
+                    // Update the allocation's released amount
+                    let mut updated_allocation = allocation.clone();
+                    updated_allocation.released_amount += claimable_amount;
+                    vault.allocations.set(i.try_into().unwrap(), updated_allocation);
+
+                    // Aggregate by asset ID (check if asset already exists in aggregated_claims)
+                    let mut found_asset = false;
+                    for j in 0..aggregated_claims.len() {
+                        let (existing_asset_id, existing_amount) = aggregated_claims.get(j).unwrap();
+                        if *existing_asset_id == allocation.asset_id {
+                            let new_amount = *existing_amount + claimable_amount;
+                            aggregated_claims.set(j, (allocation.asset_id.clone(), new_amount));
+                            found_asset = true;
+                            break;
+                        }
+                    }
+                    
+                    if !found_asset {
+                        aggregated_claims.push_back((allocation.asset_id.clone(), claimable_amount));
+                    }
+                    
+                    vault_has_claims = true;
+                }
+            }
+
+            // Save updated vault if it had claims
+            if vault_has_claims {
+                env.storage().instance().set(&DataKey::VaultData(*vault_id), &vault);
+                processed_vaults.push_back(*vault_id);
+
+                // Check if vault is fully completed and register certificate
+                Self::check_and_register_certificate(&env, *vault_id, &vault);
+            }
+        }
+
+        // Execute aggregated token transfers
+        for (asset_id, total_amount) in aggregated_claims.iter() {
+            if *total_amount > 0 {
+                // Single transfer per asset type
+                token::Client::new(&env, asset_id)
+                    .transfer(&env.current_contract_address(), &user, total_amount);
+            }
+        }
+
+        // Mint NFT if configured (only once per batch claim)
+        if !processed_vaults.is_empty() {
+            if let Some(nft_minter) = env.storage().instance().get::<_, Address>(&DataKey::NFTMinter) {
+                env.invoke_contract::<()>(
+                    &nft_minter,
+                    &Symbol::new(&env, "mint"),
+                    (&user,).into_val(&env),
+                );
+            }
         }
 
         claimed_assets
@@ -2238,6 +2629,137 @@ impl VestingContract {
         }.publish(&env);
     }
 
+    /// Partial clawback with dynamic emission rate recalculation.
+    ///
+    /// When a schedule is partially clawed back by the DAO, this function dynamically
+    /// recalculates the ongoing emission rate for the remaining tokens so the schedule
+    /// still ends on the original designated date, rather than ending early.
+    ///
+    /// # Parameters
+    /// - `vault_id`: ID of the vault to partially clawback
+    /// - `clawback_amount`: Amount of tokens to clawback from unvested portion
+    /// - `treasury`: Address where clawed tokens will be sent
+    ///
+    /// # Behavior
+    /// - Calculates how much should have been vested by current time
+    /// - Removes clawback amount from remaining unvested tokens
+    /// - Recalculates emission rate to distribute remaining tokens over remaining time
+    /// - Preserves original end_time so schedule completes on schedule
+    ///
+    /// # Panics
+    /// - If vault is irrevocable
+    /// - If clawback_amount exceeds available unvested tokens
+    /// - If caller is not an admin
+    pub fn partial_clawback_dynamic(env: Env, vault_id: u64, clawback_amount: i128, treasury: Address) {
+        Self::require_admin(&env);
+
+        if clawback_amount <= 0 {
+            panic!("clawback_amount must be positive");
+        }
+
+        let mut vault = Self::get_vault_internal(&env, vault_id);
+
+        if vault.is_irrevocable {
+            panic!("Vault is irrevocable");
+        }
+        if vault.is_frozen {
+            panic!("Vault is frozen");
+        }
+        if vault.allocations.len() != 1 {
+            panic!("Use diversified variant for multi-asset vaults");
+        }
+
+        // Auto-unstake if staked
+        let stake_info = get_stake_info(&env, vault_id);
+        if stake_info.stake_state != StakeState::Unstaked {
+            Self::do_unstake(&env, vault_id, &mut vault);
+            stake::emit_revocation_unstaked(&env, vault_id, &vault.owner);
+        }
+
+        let allocation = vault.allocations.get(0).unwrap();
+        let current_time = env.ledger().timestamp();
+
+        // Calculate current vested amount based on original schedule
+        let vested_amount = Self::calculate_claimable_for_asset(&env, vault_id, &vault, 0);
+        let unvested_amount = allocation.total_amount - vested_amount;
+
+        if clawback_amount > unvested_amount {
+            panic!("clawback_amount exceeds available unvested tokens");
+        }
+
+        // Transfer clawback amount to treasury
+        let token: Address = env.storage().instance().get(&DataKey::Token).expect("Token not set");
+        let token_client = token::Client::new(&env, &token);
+        
+        if clawback_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &treasury, &clawback_amount);
+        }
+
+        // Calculate new emission rate to ensure remaining tokens vest by original end_time
+        let remaining_tokens = unvested_amount - clawback_amount;
+        let remaining_time = vault.end_time.saturating_sub(current_time);
+
+        if remaining_tokens > 0 && remaining_time > 0 {
+            // Update allocation with reduced total amount and preserved released amount
+            let mut updated_allocation = allocation.clone();
+            updated_allocation.total_amount = vested_amount + remaining_tokens;
+            
+            // Store the original emission rate for reference
+            let original_total = allocation.total_amount;
+            let original_duration = vault.end_time - vault.start_time;
+            let original_rate = original_total / (original_duration as i128);
+            
+            // Calculate new emission rate
+            let new_rate = remaining_tokens / (remaining_time as i128);
+            
+            // Update vault structure
+            vault.allocations.set(0, updated_allocation);
+            
+            // Store clawback adjustment data for emission rate calculation
+            let clawback_data = ClawbackAdjustment {
+                clawback_time: current_time,
+                clawback_amount,
+                original_total_amount: original_total,
+                original_rate,
+                new_rate,
+                remaining_tokens,
+            };
+            
+            env.storage().instance().set(&DataKey::ClawbackAdjustment(vault_id), &clawback_data);
+        }
+
+        // Update total shares
+        let total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TotalShares, &(total_shares - clawback_amount));
+
+        // Save updated vault
+        env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
+
+        // Emit event
+        PartialClawbackDynamic {
+            vault_id,
+            clawback_amount,
+            remaining_tokens,
+            treasury: treasury.clone(),
+            clawback_time: current_time,
+        }.publish(&env);
+    }
+
+    /// Get clawback adjustment data for a vault (for testing and inspection)
+    pub fn get_clawback_adjustment(env: Env, vault_id: u64) -> ClawbackAdjustment {
+        env.storage()
+            .instance()
+            .get(&DataKey::ClawbackAdjustment(vault_id))
+            .unwrap_or(ClawbackAdjustment {
+                clawback_time: 0,
+                clawback_amount: 0,
+                original_total_amount: 0,
+                original_rate: 0,
+                new_rate: 0,
+                remaining_tokens: 0,
+            })
+    }
+
     /// Return the current stake status for a vault.
     pub fn get_stake_status(env: Env, vault_id: u64) -> StakeStatusView {
         let info = get_stake_info(&env, vault_id);
@@ -2754,6 +3276,32 @@ impl VestingContract {
         if now <= vault.start_time { return 0; }
         if now >= vault.end_time { return allocation.total_amount; }
 
+        // Check if there's a clawback adjustment that requires dynamic emission rate
+        if let Some(clawback_adj) = env.storage().instance().get::<DataKey, ClawbackAdjustment>(&DataKey::ClawbackAdjustment(id)) {
+            // Use dynamic emission rate calculation
+            if now <= clawback_adj.clawback_time {
+                // Before clawback: use original rate
+                let elapsed = (now - vault.start_time) as i128;
+                return (clawback_adj.original_total_amount * elapsed) / ((vault.end_time - vault.start_time) as i128);
+            } else {
+                // After clawback: vested amount before clawback + new rate for remaining time
+                let elapsed_before_clawback = (clawback_adj.clawback_time - vault.start_time) as i128;
+                let vested_before_clawback = (clawback_adj.original_total_amount * elapsed_before_clawback) / ((vault.end_time - vault.start_time) as i128);
+                
+                let elapsed_after_clawback = (now - clawback_adj.clawback_time) as i128;
+                let remaining_time = (vault.end_time - clawback_adj.clawback_time) as i128;
+                
+                let vested_after_clawback = if remaining_time > 0 {
+                    (clawback_adj.remaining_tokens * elapsed_after_clawback) / remaining_time
+                } else {
+                    0
+                };
+                
+                return vested_before_clawback + vested_after_clawback;
+            }
+        }
+
+        // Original calculation for vaults without clawback adjustment
         let duration = (vault.end_time - vault.start_time) as i128;
         let elapsed = (now - vault.start_time) as i128;
 
