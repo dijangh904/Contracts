@@ -1219,6 +1219,119 @@ impl VestingContract {
         claimed_assets
     }
 
+    /// Batch claim tokens from all user's vaults in a single transaction
+    /// Aggregates available tokens across all schedules linked to a single Address
+    /// Returns a vector of (asset_id, total_claimed_amount) pairs
+    pub fn batch_claim(env: Env, user: Address) -> Vec<(Address, i128)> {
+        Self::require_not_paused(&env);
+        user.require_auth();
+
+        // Get all vaults for this user
+        let user_vaults = Self::get_user_vaults(env.clone(), user.clone());
+        
+        if user_vaults.is_empty() {
+            return Vec::new(&env);
+        }
+
+        let mut aggregated_claims = Vec::new(&env);
+        let mut processed_vaults = Vec::new(&env);
+
+        // Process each vault and aggregate claimable amounts by asset
+        for vault_id in user_vaults.iter() {
+            let mut vault = Self::get_vault_internal(&env, *vault_id);
+            
+            // Skip frozen, uninitialized, or paused vaults
+            if vault.is_frozen || !vault.is_initialized || Self::is_vault_paused(env.clone(), *vault_id) {
+                continue;
+            }
+
+            // Heartbeat: reset Dead-Man's Switch on every primary interaction
+            update_activity(&env, *vault_id);
+
+            // Validate asset basket
+            if !Self::validate_asset_basket(&vault.allocations) {
+                continue;
+            }
+
+            let mut vault_has_claims = false;
+
+            // Calculate claimable amounts for each asset in this vault
+            for (i, allocation) in vault.allocations.iter().enumerate() {
+                let vested_amount = Self::calculate_claimable_for_asset(&env, *vault_id, &vault, i);
+                let mut claimable_amount = vested_amount - allocation.released_amount;
+
+                // #90: XLM Minimum Reserve Check (2 XLM = 20,000,000 Stroops)
+                let xlm: Option<Address> = env.storage().instance().get(&DataKey::XLMAddress);
+                if let Some(xlm_addr) = xlm {
+                    if allocation.asset_id == xlm_addr {
+                        let total_unreleased = allocation.total_amount - allocation.released_amount;
+                        if total_unreleased <= 20_000_000 {
+                            claimable_amount = 0;
+                        } else if (total_unreleased - claimable_amount) < 20_000_000 {
+                            claimable_amount = total_unreleased - 20_000_000;
+                        }
+                    }
+                }
+
+                if claimable_amount > 0 {
+                    // Update the allocation's released amount
+                    let mut updated_allocation = allocation.clone();
+                    updated_allocation.released_amount += claimable_amount;
+                    vault.allocations.set(i.try_into().unwrap(), updated_allocation);
+
+                    // Aggregate by asset ID (check if asset already exists in aggregated_claims)
+                    let mut found_asset = false;
+                    for j in 0..aggregated_claims.len() {
+                        let (existing_asset_id, existing_amount) = aggregated_claims.get(j).unwrap();
+                        if *existing_asset_id == allocation.asset_id {
+                            let new_amount = *existing_amount + claimable_amount;
+                            aggregated_claims.set(j, (allocation.asset_id.clone(), new_amount));
+                            found_asset = true;
+                            break;
+                        }
+                    }
+                    
+                    if !found_asset {
+                        aggregated_claims.push_back((allocation.asset_id.clone(), claimable_amount));
+                    }
+                    
+                    vault_has_claims = true;
+                }
+            }
+
+            // Save updated vault if it had claims
+            if vault_has_claims {
+                env.storage().instance().set(&DataKey::VaultData(*vault_id), &vault);
+                processed_vaults.push_back(*vault_id);
+
+                // Check if vault is fully completed and register certificate
+                Self::check_and_register_certificate(&env, *vault_id, &vault);
+            }
+        }
+
+        // Execute aggregated token transfers
+        for (asset_id, total_amount) in aggregated_claims.iter() {
+            if *total_amount > 0 {
+                // Single transfer per asset type
+                token::Client::new(&env, asset_id)
+                    .transfer(&env.current_contract_address(), &user, total_amount);
+            }
+        }
+
+        // Mint NFT if configured (only once per batch claim)
+        if !processed_vaults.is_empty() {
+            if let Some(nft_minter) = env.storage().instance().get::<_, Address>(&DataKey::NFTMinter) {
+                env.invoke_contract::<()>(
+                    &nft_minter,
+                    &Symbol::new(&env, "mint"),
+                    (&user,).into_val(&env),
+                );
+            }
+        }
+
+        claimed_assets
+    }
+
     /// Legacy single-asset claim function for backward compatibility
     pub fn claim_tokens(env: Env, vault_id: u64, claim_amount: i128) -> i128 {
         Self::require_not_paused(&env);
