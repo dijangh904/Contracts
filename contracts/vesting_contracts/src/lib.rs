@@ -54,6 +54,14 @@ pub use certificate_registry::{
     CertificateQuery, CertificateQueryResult,
 };
 
+pub mod zk_verifier;
+pub use zk_verifier::{
+    ZKVerifier, ZKVerifierError, ZKProof, VerificationKey, AccreditationRecord,
+    AccreditedInvestorInputs, ZKVerifierTrait,
+    ACCREDITED_INVESTOR_CIRCUIT, QUALIFIED_BUYER_CIRCUIT,
+    US_JURISDICTION, EU_JURISDICTION, UK_JURISDICTION,
+};
+
 #[cfg(test)]
 mod certificate_registry_test;
 
@@ -3560,110 +3568,102 @@ impl VestingContract {
         crate::kpi_vesting::kpi_verification_log(&env, vault_id)
     }
 
-    // ========== COMPLIANCE HELPER FUNCTIONS ==========
-    
-    /// Check if user has completed KYC verification
-    fn is_kyc_verified(_e: &Env, _user: &Address) -> bool {
-        // TODO: Implement actual KYC verification check
-        // This would typically integrate with a KYC provider oracle
-        // For now, return true as placeholder
-        true
+    // --- Zero-Knowledge Accredited Investor Verification Functions ---
+
+    /// Verify accredited investor status using ZK proof
+    /// This allows investors to prove they meet accreditation requirements without revealing sensitive information
+    pub fn verify_accredited_investor_proof(
+        env: Env,
+        investor: Address,
+        proof: ZKProof,
+    ) -> Result<(), ZKVerifierError> {
+        investor.require_auth();
+        ZKVerifier::verify_accredited_investor(&env, proof, investor)
     }
-    
-    /// Get KYC expiration timestamp for user
-    fn get_kyc_expiry(_e: &Env, _user: &Address) -> Option<u64> {
-        // TODO: Implement actual KYC expiry check
-        // This would typically be stored from KYC provider data
-        // For now, return None (no expiry)
-        None
+
+    /// Check if an investor has valid accredited investor status
+    pub fn is_accredited_investor(env: Env, investor: Address) -> bool {
+        ZKVerifier::has_valid_accreditation(&env, investor)
     }
-    
-    /// Check if address is on sanctions list
-    fn is_address_sanctioned(_e: &Env, _user: &Address) -> bool {
-        // TODO: Implement actual sanctions check
-        // This would integrate with sanctions screening oracle
-        // For now, return false as placeholder
-        false
+
+    /// Get accreditation record for an investor
+    pub fn get_accreditation_record(env: Env, investor: Address) -> Option<AccreditationRecord> {
+        ZKVerifier::get_accreditation_record(&env, investor)
     }
-    
-    /// Check if user's jurisdiction is restricted
-    fn is_jurisdiction_restricted(_e: &Env, _user: &Address) -> bool {
-        // TODO: Implement actual jurisdiction check
-        // This would check user's location against restricted jurisdictions
-        // For now, return false as placeholder
-        false
+
+    /// Create a vault with accredited investor verification requirement
+    /// Only accredited investors can create or receive these vaults
+    pub fn create_vault_accredited_only(
+        env: Env,
+        owner: Address,
+        amount: i128,
+        asset_id: Address,
+        start_time: u64,
+        end_time: u64,
+        keeper_fee: i128,
+        is_revocable: bool,
+        is_transferable: bool,
+        step_duration: u64,
+    ) -> u64 {
+        // Verify the creator is an accredited investor
+        if !ZKVerifier::has_valid_accreditation(&env, owner.clone()) {
+            panic!("Creator must be an accredited investor");
+        }
+
+        owner.require_auth();
+        Self::create_vault_full_internal(
+            &env,
+            owner,
+            amount,
+            asset_id,
+            start_time,
+            end_time,
+            keeper_fee,
+            is_revocable,
+            is_transferable,
+            step_duration,
+        )
     }
-    
-    /// Check if user has valid legal signature for this vault
-    fn has_valid_legal_signature(_e: &Env, _user: &Address, _vault_id: u64) -> bool {
-        // TODO: Implement actual legal signature verification
-        // This would verify digital signatures against legal documents
-        // For now, return true as placeholder
-        true
+
+    /// Transfer vault with accredited investor verification
+    /// Both sender and receiver must be accredited investors
+    pub fn transfer_vault_accredited(
+        env: Env,
+        vault_id: u64,
+        from: Address,
+        to: Address,
+    ) {
+        // Verify both parties are accredited investors
+        if !ZKVerifier::has_valid_accreditation(&env, from.clone()) {
+            panic!("Sender must be an accredited investor");
+        }
+        if !ZKVerifier::has_valid_accreditation(&env, to.clone()) {
+            panic!("Receiver must be an accredited investor");
+        }
+
+        from.require_auth();
+        Self::transfer_vault_internal(&env, vault_id, from, to);
     }
-    
-    /// Check if user's documents are verified
-    fn are_documents_verified(_e: &Env, _user: &Address) -> bool {
-        // TODO: Implement actual document verification check
-        // This would check verification status of required documents
-        // For now, return true as placeholder
-        true
+
+    /// Admin function to add verification key for ZK proofs
+    pub fn add_zk_verification_key(
+        env: Env,
+        admin: Address,
+        verification_key: VerificationKey,
+    ) -> Result<(), ZKVerifierError> {
+        Self::require_admin(&env);
+        ZKVerifier::add_verification_key(&env, admin, verification_key)
     }
-    
-    /// Check if user is tax compliant
-    fn is_tax_compliant(_e: &Env, _user: &Address) -> bool {
-        // TODO: Implement actual tax compliance check
-        // This would check tax withholding and reporting status
-        // For now, return true as placeholder
-        true
-    }
-    
-    /// Check if user is approved on whitelist
-    fn is_whitelist_approved(_e: &Env, _user: &Address) -> bool {
-        // TODO: Implement actual whitelist approval check
-        // This would check against approved investor whitelist
-        // For now, return true as placeholder
-        true
-    }
-    
-    /// Check if user is on blacklist
-    fn is_on_blacklist(_e: &Env, _user: &Address) -> bool {
-        // TODO: Implement actual blacklist check
-        // This would check against prohibited persons list
-        // For now, return false as placeholder
-        false
-    }
-    
-    /// Check if user is subject to geofencing restrictions
-    fn is_geofencing_restricted(_e: &Env, _user: &Address) -> bool {
-        // TODO: Implement actual geofencing check
-        // This would check IP/location-based restrictions
-        // For now, return false as placeholder
-        false
-    }
-    
-    /// Get identity verification expiration for user
-    fn get_identity_expiry(_e: &Env, _user: &Address) -> Option<u64> {
-        // TODO: Implement actual identity expiry check
-        // This would check when identity verification expires
-        // For now, return None (no expiry)
-        None
-    }
-    
-    /// Check if user is a politically exposed person
-    fn is_politically_exposed_person(_e: &Env, _user: &Address) -> bool {
-        // TODO: Implement actual PEP check
-        // This would screen against PEP lists
-        // For now, return false as placeholder
-        false
-    }
-    
-    /// Check if user appears on sanctions lists
-    fn is_on_sanctions_list(_e: &Env, _user: &Address) -> bool {
-        // TODO: Implement actual sanctions list screening
-        // This would check multiple sanctions databases
-        // For now, return false as placeholder
-        false
+
+    /// Admin function to add supported circuit
+    pub fn add_zk_supported_circuit(
+        env: Env,
+        admin: Address,
+        circuit_id: BytesN<32>,
+        circuit_type: Bytes,
+    ) -> Result<(), ZKVerifierError> {
+        Self::require_admin(&env);
+        ZKVerifier::add_supported_circuit(&env, admin, circuit_id, circuit_type)
     }
 }
 
@@ -3675,6 +3675,8 @@ mod test;
 mod invariant_test;
 #[cfg(test)]
 mod diversified_test;
+#[cfg(test)]
+mod zk_verifier_test;
 #[cfg(test)]
 mod diversified_simple_test;
 #[cfg(test)]
