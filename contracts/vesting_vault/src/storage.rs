@@ -1,5 +1,5 @@
 use soroban_sdk::{Env, Vec, Address, Map, BytesN};
-use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent};
+use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, LockupConfig, BeneficiaryReassignment, VetoVote, TokenSupplyInfo};
 
 pub const CLAIM_HISTORY: &str = "CLAIM_HISTORY";
 pub const AUTHORIZED_PAYOUT_ADDRESS: &str = "AUTHORIZED_PAYOUT_ADDRESS";
@@ -27,6 +27,16 @@ pub const MERKLE_ROOTS: &str = "MERKLE_ROOTS";
 // Stellar Horizon Path Payment Claim storage keys
 pub const PATH_PAYMENT_CONFIG: &str = "PATH_PAYMENT_CONFIG";
 pub const PATH_PAYMENT_CLAIM_HISTORY: &str = "PATH_PAYMENT_CLAIM_HISTORY";
+
+// Lock-up period storage keys
+pub const LOCKUP_CONFIGS: &str = "LOCKUP_CONFIGS";
+
+// Beneficiary reassignment and governance veto storage keys
+pub const BENEFICIARY_REASSIGNMENTS: &str = "BENEFICIARY_REASSIGNMENTS";
+pub const VETO_VOTES: &str = "VETO_VOTES";
+pub const TOKEN_SUPPLY_INFO: &str = "TOKEN_SUPPLY_INFO";
+pub const REASSIGNMENT_COUNTER: &str = "REASSIGNMENT_COUNTER";
+pub const GOVERNANCE_VETO_THRESHOLD: &str = "GOVERNANCE_VETO_THRESHOLD"; // Percentage (e.g., 5 for 5%)
 
 // 48 hours in seconds
 const TIMELOCK_DURATION: u64 = 172_800;
@@ -235,4 +245,90 @@ pub fn add_path_payment_claim_event(e: &Env, event: &PathPaymentClaimEvent) {
     let mut history = get_path_payment_claim_history(e);
     history.push_back(event.clone());
     e.storage().instance().set(&PATH_PAYMENT_CLAIM_HISTORY, &history);
-}
+}
+
+// Lock-up period storage functions
+pub fn get_lockup_config(e: &Env, vesting_id: u32) -> Option<LockupConfig> {
+    e.storage().instance().get(&(LOCKUP_CONFIGS, vesting_id))
+}
+
+pub fn set_lockup_config(e: &Env, vesting_id: u32, config: &LockupConfig) {
+    e.storage().instance().set(&(LOCKUP_CONFIGS, vesting_id), config);
+}
+
+pub fn remove_lockup_config(e: &Env, vesting_id: u32) {
+    e.storage().instance().remove(&(LOCKUP_CONFIGS, vesting_id));
+}
+
+// Beneficiary reassignment and governance veto storage functions
+pub fn get_reassignment_counter(e: &Env) -> u32 {
+    e.storage()
+        .instance()
+        .get(&REASSIGNMENT_COUNTER)
+        .unwrap_or(0)
+}
+
+pub fn set_reassignment_counter(e: &Env, counter: u32) {
+    e.storage().instance().set(&REASSIGNMENT_COUNTER, &counter);
+}
+
+pub fn get_beneficiary_reassignment(e: &Env, reassignment_id: u32) -> Option<BeneficiaryReassignment> {
+    e.storage().instance().get(&(BENEFICIARY_REASSIGNMENTS, reassignment_id))
+}
+
+pub fn set_beneficiary_reassignment(e: &Env, reassignment_id: u32, reassignment: &BeneficiaryReassignment) {
+    e.storage().instance().set(&(BENEFICIARY_REASSIGNMENTS, reassignment_id), reassignment);
+}
+
+pub fn remove_beneficiary_reassignment(e: &Env, reassignment_id: u32) {
+    e.storage().instance().remove(&(BENEFICIARY_REASSIGNMENTS, reassignment_id));
+}
+
+pub fn get_veto_votes(e: &Env, reassignment_id: u32) -> Vec<VetoVote> {
+    e.storage()
+        .instance()
+        .get(&(VETO_VOTES, reassignment_id))
+        .unwrap_or(Vec::new(e))
+}
+
+pub fn set_veto_votes(e: &Env, reassignment_id: u32, votes: &Vec<VetoVote>) {
+    e.storage().instance().set(&(VETO_VOTES, reassignment_id), votes);
+}
+
+pub fn add_veto_vote(e: &Env, reassignment_id: u32, vote: &VetoVote) {
+    let mut votes = get_veto_votes(e, reassignment_id);
+    votes.push_back(vote.clone());
+    set_veto_votes(e, reassignment_id, &votes);
+}
+
+pub fn get_token_supply_info(e: &Env) -> TokenSupplyInfo {
+    e.storage()
+        .instance()
+        .get(&TOKEN_SUPPLY_INFO)
+        .unwrap_or(TokenSupplyInfo {
+            total_supply: 0,
+            last_updated: 0,
+        })
+}
+
+pub fn set_token_supply_info(e: &Env, supply_info: &TokenSupplyInfo) {
+    e.storage().instance().set(&TOKEN_SUPPLY_INFO, supply_info);
+}
+
+pub fn get_governance_veto_threshold(e: &Env) -> u32 {
+    e.storage()
+        .instance()
+        .get(&GOVERNANCE_VETO_THRESHOLD)
+        .unwrap_or(5) // Default 5% threshold
+}
+
+pub fn set_governance_veto_threshold(e: &Env, threshold: u32) {
+    e.storage().instance().set(&GOVERNANCE_VETO_THRESHOLD, &threshold);
+}
+
+// 7 days in seconds for governance veto period
+const GOVERNANCE_VETO_PERIOD: u64 = 604_800;
+
+pub fn get_governance_veto_period() -> u64 {
+    GOVERNANCE_VETO_PERIOD
+}
