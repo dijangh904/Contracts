@@ -4,20 +4,21 @@ use soroban_sdk::contracterror;
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Error {
-    // 🔐 General (100s)
+    // // General (100s)
     Unauthorized = 100,
     InvalidInput = 101,
 
-    // ⏳ Vesting (200s)
-    VestingNotFound = 200,
-    CliffNotReached = 205,
+    // Grant (200s)
+    GrantNotFound = 200,
     NothingToClaim = 206,
     AlreadyFullyClaimed = 207,
+    GrantExpired = 208,
+    DurationExceedsMaximum = 209,
 
-    // 💰 Financial (300s)
+    // Financial (300s)
     InsufficientBalance = 300,
 
-    // 📜 Compliance (400s)
+    // Compliance (400s)
     KycNotCompleted = 400,
     KycExpired = 401,
     AddressSanctioned = 402,
@@ -40,6 +41,6 @@ pub enum Error {
     PoliticallyExposedPerson = 419,
     SanctionsListHit = 420,
 
-    // ⚙️ System (900s)
+    // System (900s)
     Overflow = 900,
 }
