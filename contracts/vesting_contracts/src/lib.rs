@@ -62,6 +62,13 @@ pub use zk_verifier::{
     US_JURISDICTION, EU_JURISDICTION, UK_JURISDICTION,
 };
 
+pub mod legal_saft;
+pub use legal_saft::{
+    LegalSAFTManager, LegalSAFTError, LegalDocument, DocumentSignature, 
+    VaultLegalDocuments, DocumentType, LegalSAFTTrait,
+    LEGAL_DOCUMENTS, DOCUMENT_SIGNATURES, VAULT_LEGAL_DOCS, DOCUMENT_INDEX,
+};
+
 #[cfg(test)]
 mod certificate_registry_test;
 
@@ -294,6 +301,8 @@ pub struct Vault {
     pub is_irrevocable: bool,
     pub is_transferable: bool,
     pub is_frozen: bool,
+    pub requires_legal_signatures: bool,     // Whether legal signatures are required
+    pub legal_documents_signed: bool,         // Whether all legal documents are signed
 }
 
 #[contracttype]
@@ -460,6 +469,14 @@ pub struct MarketplaceSold {
     #[topic]
     pub new_owner: Address,
     pub marketplace: Address,
+}
+
+#[contractevent]
+pub struct VaultLegalDocumentsSigned {
+    #[topic]
+    pub vault_id: u64,
+    #[topic]
+    pub beneficiary: Address,
 }
 
 #[contractevent]
@@ -1324,6 +1341,11 @@ impl VestingContract {
             return Err(Error::ContractPaused);
         }
 
+        // Check if legal document signatures are required and verified
+        if vault.requires_legal_signatures && !vault.legal_documents_signed {
+            panic!("Legal document signatures required before claiming tokens");
+        }
+
         vault.owner.require_auth();
 
         // ========== COMPLIANCE CHECKS ==========
@@ -1586,6 +1608,11 @@ impl VestingContract {
         // Check if this specific vault schedule is paused
         if Self::is_vault_paused(env.clone(), vault_id) {
             panic!("Vault schedule paused");
+        }
+
+        // Check if legal document signatures are required and verified
+        if vault.requires_legal_signatures && !vault.legal_documents_signed {
+            panic!("Legal document signatures required before claiming tokens");
         }
 
         vault.owner.require_auth();
@@ -2934,6 +2961,8 @@ impl VestingContract {
             is_irrevocable: !is_revocable,
             is_transferable,
             is_frozen: false,
+            requires_legal_signatures: false,
+            legal_documents_signed: true, // Default to true for backward compatibility
         };
         env.storage().instance().set(&DataKey::VaultData(id), &vault);
         if is_initialized {
@@ -3665,6 +3694,177 @@ impl VestingContract {
         Self::require_admin(&env);
         ZKVerifier::add_supported_circuit(&env, admin, circuit_id, circuit_type)
     }
+
+    // --- Legal SAFT Document Hash Anchoring Functions ---
+
+    /// Store legal document hash for a vault (admin only)
+    /// Anchors IPFS CID of physical SAFT or Grant Agreement
+    pub fn store_legal_hash(
+        env: Env,
+        admin: Address,
+        vault_id: u64,
+        document_type: DocumentType,
+        ipfs_cid: String,
+        document_hash: BytesN<32>,
+        jurisdiction: String,
+        version: String,
+        expires_at: Option<u64>,
+    ) -> Result<(), LegalSAFTError> {
+        Self::require_admin(&env);
+        
+        // Store the legal document
+        LegalSAFTManager::store_legal_hash(
+            &env,
+            admin,
+            vault_id,
+            document_type,
+            ipfs_cid,
+            document_hash,
+            jurisdiction,
+            version,
+            expires_at,
+        )?;
+
+        // Update vault to require legal signatures
+        Self::set_vault_legal_requirement(&env, vault_id, true);
+
+        Ok(())
+    }
+
+    /// Beneficiary signs a legal document hash
+    /// Cryptographically signs the document hash on-chain before vesting clock starts
+    pub fn sign_legal_document(
+        env: Env,
+        beneficiary: Address,
+        vault_id: u64,
+        document_hash: BytesN<32>,
+        signature: Bytes,
+        message: String,
+    ) -> Result<(), LegalSAFTError> {
+        beneficiary.require_auth();
+
+        // Sign the document
+        LegalSAFTManager::sign_legal_document(
+            &env,
+            beneficiary,
+            vault_id,
+            document_hash,
+            signature,
+            message,
+        )?;
+
+        // Check if all documents are now signed and update vault
+        if LegalSAFTManager::are_all_documents_signed(&env, vault_id) {
+            Self::set_vault_legal_status(&env, vault_id, true);
+        }
+
+        Ok(())
+    }
+
+    /// Create vault with legal document requirements
+    /// Vesting clock only starts after legal documents are signed
+    pub fn create_vault_with_legal_requirements(
+        env: Env,
+        owner: Address,
+        amount: i128,
+        asset_id: Address,
+        start_time: u64,
+        end_time: u64,
+        keeper_fee: i128,
+        is_revocable: bool,
+        is_transferable: bool,
+        step_duration: u64,
+        requires_legal_signatures: bool,
+    ) -> u64 {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        
+        let vault_id = Self::create_vault_full_internal(
+            &env,
+            owner,
+            amount,
+            asset_id,
+            start_time,
+            end_time,
+            keeper_fee,
+            is_revocable,
+            is_transferable,
+            step_duration,
+        );
+
+        // Set legal requirements
+        Self::set_vault_legal_requirement(&env, vault_id, requires_legal_signatures);
+
+        vault_id
+    }
+
+    /// Check if vault has all legal documents signed
+    pub fn are_legal_documents_signed(env: Env, vault_id: u64) -> bool {
+        LegalSAFTManager::are_all_documents_signed(&env, vault_id)
+    }
+
+    /// Get legal document by hash
+    pub fn get_legal_document(env: Env, document_hash: BytesN<32>) -> Option<LegalDocument> {
+        LegalSAFTManager::get_legal_document(&env, document_hash)
+    }
+
+    /// Get document signature
+    pub fn get_document_signature(
+        env: Env,
+        beneficiary: Address,
+        document_hash: BytesN<32>,
+    ) -> Option<DocumentSignature> {
+        LegalSAFTManager::get_document_signature(&env, beneficiary, document_hash)
+    }
+
+    /// Get vault legal documents status
+    pub fn get_vault_legal_documents(env: Env, vault_id: u64) -> Option<VaultLegalDocuments> {
+        LegalSAFTManager::get_vault_legal_documents(&env, vault_id)
+    }
+
+    /// Get all documents for a vault
+    pub fn get_vault_documents(env: Env, vault_id: u64) -> Vec<LegalDocument> {
+        LegalSAFTManager::get_vault_documents(&env, vault_id)
+    }
+
+    /// Revoke legal document (admin only)
+    pub fn revoke_legal_document(
+        env: Env,
+        admin: Address,
+        document_hash: BytesN<32>,
+        reason: String,
+    ) -> Result<(), LegalSAFTError> {
+        Self::require_admin(&env);
+        LegalSAFTManager::revoke_legal_document(&env, admin, document_hash, reason)
+    }
+
+    // Private helper methods for legal document integration
+
+    fn set_vault_legal_requirement(env: &Env, vault_id: u64, requires_signatures: bool) {
+        let mut vault = Self::get_vault_internal(env, vault_id);
+        vault.requires_legal_signatures = requires_signatures;
+        
+        // If requiring signatures, set initial state to not signed
+        if requires_signatures {
+            vault.legal_documents_signed = false;
+        }
+        
+        env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
+    }
+
+    fn set_vault_legal_status(env: &Env, vault_id: u64, all_signed: bool) {
+        let mut vault = Self::get_vault_internal(env, vault_id);
+        vault.legal_documents_signed = all_signed;
+        env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
+
+        // Emit event when all documents are signed
+        if all_signed {
+            VaultLegalDocumentsSigned {
+                vault_id,
+                beneficiary: vault.owner,
+            }.publish(env);
+        }
+    }
 }
 
 // Redefinition removed
@@ -3677,6 +3877,8 @@ mod invariant_test;
 mod diversified_test;
 #[cfg(test)]
 mod zk_verifier_test;
+#[cfg(test)]
+mod legal_saft_test;
 #[cfg(test)]
 mod diversified_simple_test;
 #[cfg(test)]
