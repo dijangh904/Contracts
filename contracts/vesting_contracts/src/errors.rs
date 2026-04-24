@@ -84,6 +84,12 @@ pub enum Error {
     InvalidCertificate = 802,
     CertificateExpired = 803,
 
+    // Path Payment (1000s)
+    PathPaymentNotConfigured = 1000,
+    PathPaymentDisabled = 1001,
+    InsufficientLiquidity = 1002,
+    PathPaymentFailed = 1003,
+
     // System (900s)
     Overflow = 900,
     Underflow = 901,
