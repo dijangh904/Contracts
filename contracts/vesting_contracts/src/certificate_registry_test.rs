@@ -56,6 +56,9 @@ fn test_certificate_registration() {
         is_irrevocable: false,
         is_transferable: false,
         is_frozen: false,
+        requires_legal_signatures: false,
+        legal_documents_signed: true,
+        yield_destination: crate::YieldDestination::Beneficiary,
     };
     
     // Setup registry
@@ -402,6 +405,9 @@ fn test_loyalty_score_calculation() {
         is_irrevocable: false,
         is_transferable: false,
         is_frozen: false,
+        requires_legal_signatures: false,
+        legal_documents_signed: true,
+        yield_destination: crate::YieldDestination::Beneficiary,
     };
     
     let certificate_id = registry_client.register_completed_vest(
@@ -451,5 +457,8 @@ fn create_test_vault(env: &Env, beneficiary: Address, token: Address) -> Vault {
         is_irrevocable: false,
         is_transferable: false,
         is_frozen: false,
+        requires_legal_signatures: false,
+        legal_documents_signed: true,
+        yield_destination: crate::YieldDestination::Beneficiary,
     }
 }
