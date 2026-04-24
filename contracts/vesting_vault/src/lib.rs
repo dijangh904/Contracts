@@ -10,7 +10,7 @@ pub mod errors;
 
 pub use types::*;
 use errors::Error;
-use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event};
+use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_lst_config, set_lst_config};
 use emergency::{AuditorPauseRequest, EmergencyPause, EmergencyPauseTriggered};
 
 #[contract]
@@ -161,7 +161,28 @@ impl VestingVault {
             // Additional milestone logic would go here
         }
 
-        // TODO: your vesting logic here
+        // Check LST configuration
+        if let Some(lst_config) = get_lst_config(&e, vesting_id) {
+            if lst_config.enabled {
+                let exchange_rate = Self::get_lst_exchange_rate(&e, &lst_config.lst_token_address);
+                // Rebasing math: exchange rate has 7 decimal precision (e.g. 1 LST = 1 Base -> 10,000,000)
+                // LST amount = (Base amount * exchange rate) / 10_000_000
+                let lst_amount = (amount * exchange_rate) / 10_000_000i128;
+                
+                LSTClaimExecuted {
+                    user: user.clone(),
+                    vesting_id,
+                    base_amount: amount,
+                    lst_amount,
+                    lst_token_address: lst_config.lst_token_address.clone(),
+                    timestamp: e.ledger().timestamp(),
+                }.publish(&e);
+                
+                // TODO: Execute actual LST token transfer here using lst_amount
+            }
+        }
+
+        // TODO: your base token vesting logic here
 
         let mut history = get_claim_history(&e);
 
@@ -1770,4 +1791,36 @@ impl VestingVault {
         // For now, return false as placeholder
         false
     }
-}
+
+    // ========== LST SUPPORT ==========
+
+    /// Configure LST support for a vesting schedule
+    pub fn configure_lst(e: Env, admin: Address, vesting_id: u32, lst_token_address: Address, base_token_address: Address) {
+        admin.require_auth();
+
+        let config = LSTConfig {
+            vesting_id,
+            enabled: true,
+            lst_token_address: lst_token_address.clone(),
+            base_token_address: base_token_address.clone(),
+        };
+
+        set_lst_config(&e, vesting_id, &config);
+
+        LSTConfigured {
+            vesting_id,
+            lst_token_address,
+            base_token_address,
+            timestamp: e.ledger().timestamp(),
+        }.publish(&e);
+    }
+
+    /// Fetch the current exchange rate between base token and LST
+    /// For simulation purposes, we assume 1 base token = 0.9 LST (or similar)
+    /// In production, this would call the LST contract's exchange rate oracle
+    fn get_lst_exchange_rate(_e: &Env, _lst_token: &Address) -> i128 {
+        // Exchange rate with 7 decimals precision (e.g., 1 LST = 1.1 Base Token -> rate is 0.9090909)
+        // Returning a mocked constant for rebasing math: 0.9 LST per base token (9_000_000)
+        9_000_000i128
+    }
+}
