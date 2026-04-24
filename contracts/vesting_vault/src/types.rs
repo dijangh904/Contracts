@@ -376,3 +376,35 @@ pub struct ReassignmentApproved {
     pub total_veto_power: i128,
 }
 
+// LST Deposit support
+#[contracttype]
+#[derive(Clone)]
+pub struct LSTConfig {
+    pub vesting_id: u32,
+    pub enabled: bool,
+    pub lst_token_address: Address,
+    pub base_token_address: Address,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct LSTConfigured {
+    #[topic]
+    pub vesting_id: u32,
+    pub lst_token_address: Address,
+    pub base_token_address: Address,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct LSTClaimExecuted {
+    #[topic]
+    pub user: Address,
+    #[topic]
+    pub vesting_id: u32,
+    pub base_amount: i128,
+    pub lst_amount: i128,
+    pub lst_token_address: Address,
+    pub timestamp: u64,
+}

@@ -1,5 +1,5 @@
 use soroban_sdk::{Env, Vec, Address, Map, BytesN};
-use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, LockupConfig, BeneficiaryReassignment, VetoVote, TokenSupplyInfo};
+use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, LockupConfig, BeneficiaryReassignment, VetoVote, TokenSupplyInfo, LSTConfig};
 
 pub const CLAIM_HISTORY: &str = "CLAIM_HISTORY";
 pub const AUTHORIZED_PAYOUT_ADDRESS: &str = "AUTHORIZED_PAYOUT_ADDRESS";
@@ -37,6 +37,7 @@ pub const VETO_VOTES: &str = "VETO_VOTES";
 pub const TOKEN_SUPPLY_INFO: &str = "TOKEN_SUPPLY_INFO";
 pub const REASSIGNMENT_COUNTER: &str = "REASSIGNMENT_COUNTER";
 pub const GOVERNANCE_VETO_THRESHOLD: &str = "GOVERNANCE_VETO_THRESHOLD"; // Percentage (e.g., 5 for 5%)
+pub const LST_CONFIGS: &str = "LST_CONFIGS";
 
 // 48 hours in seconds
 const TIMELOCK_DURATION: u64 = 172_800;
@@ -331,4 +332,13 @@ const GOVERNANCE_VETO_PERIOD: u64 = 604_800;
 
 pub fn get_governance_veto_period() -> u64 {
     GOVERNANCE_VETO_PERIOD
+}
+
+// LST Deposit support
+pub fn get_lst_config(e: &Env, vesting_id: u32) -> Option<LSTConfig> {
+    e.storage().instance().get(&(LST_CONFIGS, vesting_id))
+}
+
+pub fn set_lst_config(e: &Env, vesting_id: u32, config: &LSTConfig) {
+    e.storage().instance().set(&(LST_CONFIGS, vesting_id), config);
 }
