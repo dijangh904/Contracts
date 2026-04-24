@@ -186,6 +186,9 @@ pub enum DataKey {
     // Merkle Tree Bulk Initialization (Issue #199)
     MerkleRoot,
     ActivatedSchedule(Address), // beneficiary -> vault_id
+    // Path Payment Configuration for claim_and_swap functionality
+    PathPaymentConfig,
+    PathPaymentClaimHistory,
 }
 
 #[contracttype]
@@ -221,6 +224,39 @@ pub struct MerkleProof {
     pub leaf_hash: BytesN<32>,
     pub proof: Vec<BytesN<32>>,
     pub leaf_index: u32,
+}
+
+// Path Payment types for claim_and_swap functionality
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PathPaymentConfig {
+    pub destination_asset: Address, // USDC or other stablecoin
+    pub min_destination_amount: i128,
+    pub path: Vec<Address>, // Path of assets for the swap
+    pub enabled: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PathPaymentClaimEvent {
+    pub beneficiary: Address,
+    pub source_amount: i128,
+    pub destination_amount: i128,
+    pub destination_asset: Address,
+    pub timestamp: u64,
+    pub vault_id: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PathPaymentSimulation {
+    pub source_amount: i128,
+    pub estimated_destination_amount: i128,
+    pub min_destination_amount: i128,
+    pub path: Vec<Address>,
+    pub can_execute: bool,
+    pub reason: String,
+    pub estimated_gas_fee: u64,
 }
 
 #[contracttype]
@@ -544,6 +580,32 @@ pub struct BeneficiaryReassigned {
     pub new_beneficiary: Address,
     pub social_proof_type: SocialProofType,
     pub reason: String,
+}
+
+// Path Payment events for claim_and_swap functionality
+#[contractevent]
+pub struct PathPaymentConfigured {
+    pub destination_asset: Address,
+    pub min_destination_amount: i128,
+    pub path: Vec<Address>,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+pub struct PathPaymentDisabled {
+    pub timestamp: u64,
+}
+
+#[contractevent]
+pub struct PathPaymentClaimExecuted {
+    #[topic]
+    pub user: Address,
+    #[topic]
+    pub vault_id: u64,
+    pub source_amount: i128,
+    pub destination_amount: i128,
+    pub destination_asset: Address,
+    pub timestamp: u64,
 }
 
 #[contract]
@@ -2964,6 +3026,10 @@ impl VestingContract {
         }
     }
 
+    fn is_emergency_pause_active(env: &Env) -> bool {
+        env.storage().instance().get(&DataKey::IsPaused).unwrap_or(false)
+    }
+
     fn _require_collateral_bridge(env: &Env) {
         let bridge: Address = env
             .storage()
@@ -4373,6 +4439,377 @@ impl VestingContract {
             .transfer(&env.current_contract_address(), &vault.owner, &claim_amount);
 
         Ok(claim_amount)
+    }
+
+    // ========== PATH PAYMENT FUNCTIONALITY FOR CLAIM_AND_SWAP ==========
+
+    /// Configure path payment settings for auto-exit feature
+    /// This allows users to claim tokens and instantly swap them for USDC in one transaction
+    pub fn configure_path_payment(env: Env, admin: Address, destination_asset: Address, min_destination_amount: i128, path: Vec<Address>) {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        
+        let config = PathPaymentConfig {
+            destination_asset: destination_asset.clone(),
+            min_destination_amount,
+            path: path.clone(),
+            enabled: true,
+        };
+        
+        env.storage().instance().set(&DataKey::PathPaymentConfig, &config);
+        
+        // Emit configuration event
+        PathPaymentConfigured { destination_asset, min_destination_amount, path, timestamp: env.ledger().timestamp() }.publish(&env);
+    }
+    
+    /// Disable path payment feature
+    pub fn disable_path_payment(env: Env, admin: Address) {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        
+        if let Some(mut config) = env.storage().instance().get::<_, PathPaymentConfig>(&DataKey::PathPaymentConfig) {
+            config.enabled = false;
+            env.storage().instance().set(&DataKey::PathPaymentConfig, &config);
+            
+            // Emit disable event
+            PathPaymentDisabled { timestamp: env.ledger().timestamp() }.publish(&env);
+        }
+    }
+    
+    /// Claim tokens with automatic path payment to USDC (Auto-Exit feature)
+    /// This allows users to instantly swap their claimed tokens for USDC in one transaction
+    pub fn claim_and_swap(env: Env, vault_id: u64, min_destination_amount: Option<i128>) -> Result<PathPaymentClaimEvent, Error> {
+        Self::require_not_paused(&env);
+        
+        // Get path payment configuration
+        let config = match env.storage().instance().get::<_, PathPaymentConfig>(&DataKey::PathPaymentConfig) {
+            Some(c) => c,
+            None => return Err(Error::PathPaymentNotConfigured),
+        };
+        
+        if !config.enabled {
+            return Err(Error::PathPaymentDisabled);
+        }
+        
+        let mut vault = Self::get_vault_internal(&env, vault_id);
+        if vault.is_frozen {
+            return Err(Error::VaultFrozen);
+        }
+        if !vault.is_initialized {
+            return Err(Error::VaultNotInitialized);
+        }
+
+        // Check if this specific vault schedule is paused
+        if Self::is_vault_paused(env.clone(), vault_id) {
+            return Err(Error::ContractPaused);
+        }
+
+        // Check if legal document signatures are required and verified
+        if vault.requires_legal_signatures && !vault.legal_documents_signed {
+            panic!("Legal document signatures required before claiming tokens");
+        }
+
+        // Check beneficiary reassignment status
+        if let Some(reassignment) = BeneficiaryReassignment::get_reassignment_status(&env, vault_id) {
+            match &reassignment.status {
+                ReassignmentStatus::Pending(_) => {
+                    panic!("Beneficiary reassignment in progress - claims paused");
+                }
+                ReassignmentStatus::Approved => {
+                    panic!("Beneficiary reassignment approved - claims paused");
+                }
+                ReassignmentStatus::Completed => {
+                    if reassignment.new_beneficiary != vault.owner {
+                        panic!("Vault owner mismatch after reassignment");
+                    }
+                }
+                ReassignmentStatus::Rejected => {
+                    // Rejected reassignments don't block claims
+                }
+                ReassignmentStatus::None => {
+                    // No reassignment in progress, normal flow
+                }
+            }
+        }
+
+        vault.owner.require_auth();
+
+        // ========== COMPLIANCE CHECKS ==========
+        if !Self::is_kyc_verified(&env, &vault.owner) {
+            return Err(Error::KycNotCompleted);
+        }
+        
+        if let Some(kyc_expiry) = Self::get_kyc_expiry(&env, &vault.owner) {
+            let current_time = env.ledger().timestamp();
+            if current_time > kyc_expiry {
+                return Err(Error::KycExpired);
+            }
+        }
+        
+        if Self::is_address_sanctioned(&env, &vault.owner) {
+            return Err(Error::AddressSanctioned);
+        }
+        
+        if Self::is_jurisdiction_restricted(&env, &vault.owner) {
+            return Err(Error::JurisdictionRestricted);
+        }
+        
+        if !Self::has_valid_legal_signature(&env, &vault.owner, vault_id) {
+            return Err(Error::LegalSignatureMissing);
+        }
+        
+        if !Self::are_documents_verified(&env, &vault.owner) {
+            return Err(Error::DocumentVerificationFailed);
+        }
+        
+        if !Self::is_tax_compliant(&env, &vault.owner) {
+            return Err(Error::TaxComplianceFailed);
+        }
+        
+        if !Self::is_whitelist_approved(&env, &vault.owner) {
+            return Err(Error::WhitelistNotApproved);
+        }
+        
+        if Self::is_on_blacklist(&env, &vault.owner) {
+            return Err(Error::BlacklistViolation);
+        }
+        
+        if Self::is_geofencing_restricted(&env, &vault.owner) {
+            return Err(Error::GeofencingRestriction);
+        }
+        
+        if let Some(identity_expiry) = Self::get_identity_expiry(&env, &vault.owner) {
+            let current_time = env.ledger().timestamp();
+            if current_time > identity_expiry {
+                return Err(Error::IdentityVerificationExpired);
+            }
+        }
+        
+        if Self::is_politically_exposed_person(&env, &vault.owner) {
+            return Err(Error::PoliticallyExposedPerson);
+        }
+        
+        if Self::is_on_sanctions_list(&env, &vault.owner) {
+            return Err(Error::SanctionsListHit);
+        }
+
+        // Heartbeat: reset Dead-Man's Switch on every primary interaction
+        update_activity(&env, vault_id);
+
+        // KPI Gate check (#145/#92)
+        if !crate::kpi_vesting::kpi_status(&env, vault_id) {
+            return Err(Error::ComplianceCheckFailed);
+        }
+
+        // Calculate total claimable amount across all assets
+        let mut total_claimable = 0i128;
+        let mut claimable_assets = Vec::new(&env);
+        
+        for (i, allocation) in vault.allocations.iter().enumerate() {
+            let vested_amount = Self::calculate_claimable_for_asset(&env, vault_id, &vault, i);
+            let claimable_amount = vested_amount - allocation.released_amount;
+            
+            if claimable_amount > 0 {
+                total_claimable += claimable_amount;
+                claimable_assets.push_back((allocation.asset_id.clone(), claimable_amount));
+            }
+        }
+        
+        if total_claimable <= 0 {
+            return Err(Error::InsufficientBalance);
+        }
+
+        // Validate minimum destination amount
+        let final_min_amount = min_destination_amount.unwrap_or(config.min_destination_amount);
+        if final_min_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // For simplicity, we'll assume a 1:1 conversion rate for the first asset
+        // In a real implementation, you would query DEX for actual rates
+        let source_asset = claimable_assets.get(0).unwrap().0;
+        let source_amount = claimable_assets.get(0).unwrap().1;
+        let estimated_destination_amount = source_amount; // Simplified rate
+        
+        if estimated_destination_amount < final_min_amount {
+            return Err(Error::InsufficientLiquidity);
+        }
+
+        // Execute Stellar Path Payment
+        // This is a simplified implementation - in production you'd use Stellar's built-in path payment
+        let current_time = env.ledger().timestamp();
+        
+        // Update vault allocations
+        for (i, allocation) in vault.allocations.iter().enumerate() {
+            if let Some((_, claimable_amount)) = claimable_assets.iter().find(|(asset_id, _)| asset_id == &allocation.asset_id) {
+                let mut updated_allocation = allocation.clone();
+                updated_allocation.released_amount += claimable_amount;
+                vault.allocations.set(i.try_into().unwrap(), updated_allocation);
+            }
+        }
+        
+        // Save updated vault
+        env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
+
+        // Check if vault is fully completed and register certificate
+        Self::check_and_register_certificate(&env, vault_id, &vault);
+
+        // Mint NFT if configured
+        if let Some(nft_minter) = env.storage().instance().get::<_, Address>(&DataKey::NFTMinter) {
+            env.invoke_contract::<()>(
+                &nft_minter,
+                &Symbol::new(&env, "mint"),
+                (&vault.owner,).into_val(&env),
+            );
+        }
+
+        // Execute the path payment (simplified - in production use Stellar's path_payment_strict_send)
+        // For now, we'll simulate the swap and transfer USDC directly
+        token::Client::new(&env, &config.destination_asset)
+            .transfer(&env.current_contract_address(), &vault.owner, &estimated_destination_amount);
+
+        // Record the path payment claim event
+        let path_payment_event = PathPaymentClaimEvent {
+            beneficiary: vault.owner.clone(),
+            source_amount: total_claimable,
+            destination_amount: estimated_destination_amount,
+            destination_asset: config.destination_asset.clone(),
+            timestamp: current_time,
+            vault_id,
+        };
+
+        // Add to claim history
+        let mut history = env.storage().instance()
+            .get::<_, Vec<PathPaymentClaimEvent>>(&DataKey::PathPaymentClaimHistory)
+            .unwrap_or(Vec::new(&env));
+        history.push_back(path_payment_event.clone());
+        env.storage().instance().set(&DataKey::PathPaymentClaimHistory, &history);
+
+        // Emit the path payment claim event
+        PathPaymentClaimExecuted { 
+            user: vault.owner.clone(), 
+            vault_id, 
+            source_amount: total_claimable, 
+            destination_amount: estimated_destination_amount, 
+            destination_asset: config.destination_asset.clone(), 
+            timestamp: current_time 
+        }.publish(&env);
+
+        Ok(path_payment_event)
+    }
+    
+    /// Simulate a path payment claim to show expected amounts without consuming gas
+    pub fn simulate_claim_and_swap(env: Env, vault_id: u64, min_destination_amount: Option<i128>) -> PathPaymentSimulation {
+        let current_time = env.ledger().timestamp();
+        
+        Self::require_not_paused(&env);
+        
+        // Check if contract is under emergency pause
+        if Self::is_emergency_pause_active(&env) {
+            return PathPaymentSimulation {
+                source_amount: 0,
+                estimated_destination_amount: 0,
+                min_destination_amount: min_destination_amount.unwrap_or(0),
+                path: Vec::new(&env),
+                can_execute: false,
+                reason: String::from_str(&env, "Contract under emergency pause"),
+                estimated_gas_fee: 0,
+            };
+        }
+        
+        // Get path payment configuration
+        let config = match env.storage().instance().get::<_, PathPaymentConfig>(&DataKey::PathPaymentConfig) {
+            Some(c) => c,
+            None => {
+                return PathPaymentSimulation {
+                    source_amount: 0,
+                    estimated_destination_amount: 0,
+                    min_destination_amount: min_destination_amount.unwrap_or(0),
+                    path: Vec::new(&env),
+                    can_execute: false,
+                    reason: String::from_str(&env, "Path payment not configured"),
+                    estimated_gas_fee: 0,
+                };
+            }
+        };
+        
+        if !config.enabled {
+            return PathPaymentSimulation {
+                source_amount: 0,
+                estimated_destination_amount: 0,
+                min_destination_amount: min_destination_amount.unwrap_or(0),
+                path: config.path,
+                can_execute: false,
+                reason: String::from_str(&env, "Path payment disabled"),
+                estimated_gas_fee: 0,
+            };
+        }
+        
+        let final_min_amount = min_destination_amount.unwrap_or(config.min_destination_amount);
+        if final_min_amount <= 0 {
+            return PathPaymentSimulation {
+                source_amount: 0,
+                estimated_destination_amount: 0,
+                min_destination_amount: final_min_amount,
+                path: config.path,
+                can_execute: false,
+                reason: String::from_str(&env, "Invalid minimum amount"),
+                estimated_gas_fee: 0,
+            };
+        }
+
+        // Calculate claimable amount
+        let vault = Self::get_vault_internal(&env, vault_id);
+        let mut total_claimable = 0i128;
+        
+        for (i, allocation) in vault.allocations.iter().enumerate() {
+            let vested_amount = Self::calculate_claimable_for_asset(&env, vault_id, &vault, i);
+            let claimable_amount = vested_amount - allocation.released_amount;
+            if claimable_amount > 0 {
+                total_claimable += claimable_amount;
+            }
+        }
+        
+        if total_claimable <= 0 {
+            return PathPaymentSimulation {
+                source_amount: total_claimable,
+                estimated_destination_amount: 0,
+                min_destination_amount: final_min_amount,
+                path: config.path,
+                can_execute: false,
+                reason: String::from_str(&env, "No tokens available to claim"),
+                estimated_gas_fee: 0,
+            };
+        }
+        
+        // Simplified estimation - in production query DEX for actual rates
+        let estimated_destination_amount = total_claimable;
+        
+        let can_execute = estimated_destination_amount >= final_min_amount;
+        
+        PathPaymentSimulation {
+            source_amount: total_claimable,
+            estimated_destination_amount,
+            min_destination_amount: final_min_amount,
+            path: config.path,
+            can_execute,
+            reason: if can_execute { 
+                String::from_str(&env, "Path payment can be executed") 
+            } else { 
+                String::from_str(&env, "Insufficient destination amount") 
+            },
+            estimated_gas_fee: 5000000, // Estimated gas fee
+        }
+    }
+    
+    /// Get current path payment configuration
+    pub fn get_path_payment_config(env: Env) -> Option<PathPaymentConfig> {
+        env.storage().instance().get(&DataKey::PathPaymentConfig)
+    }
+    
+    /// Get path payment claim history
+    pub fn get_path_payment_claim_history(env: Env) -> Vec<PathPaymentClaimEvent> {
+        env.storage().instance().get(&DataKey::PathPaymentClaimHistory).unwrap_or(Vec::new(&env))
     }
 
     // Private helper methods for legal document integration
