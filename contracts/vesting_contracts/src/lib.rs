@@ -333,6 +333,14 @@ pub struct Vault {
     pub is_frozen: bool,
     pub requires_legal_signatures: bool,     // Whether legal signatures are required
     pub legal_documents_signed: bool,         // Whether all legal documents are signed
+    pub yield_destination: YieldDestination,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum YieldDestination {
+    DAO,
+    Beneficiary,
 }
 
 #[contracttype]
@@ -1249,6 +1257,9 @@ impl VestingContract {
             is_irrevocable: !is_revocable,
             is_transferable,
             is_frozen: false,
+            requires_legal_signatures: false,
+            legal_documents_signed: true,
+            yield_destination: YieldDestination::Beneficiary,
         };
 
         env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
@@ -1308,6 +1319,9 @@ impl VestingContract {
             is_irrevocable: !is_revocable,
             is_transferable,
             is_frozen: false,
+            requires_legal_signatures: false,
+            legal_documents_signed: true,
+            yield_destination: YieldDestination::Beneficiary,
         };
 
         env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
@@ -1466,6 +1480,8 @@ impl VestingContract {
         }
 
         let mut claimed_assets = Vec::new(&env);
+        let mut total_claimable_sum = 0i128;
+        let mut total_unreleased_sum = 0i128;
 
         // Calculate and claim each asset in the basket
         for (i, allocation) in vault.allocations.iter().enumerate() {
@@ -1486,6 +1502,9 @@ impl VestingContract {
             }
 
             if claimable_amount > 0 {
+                total_claimable_sum += claimable_amount;
+                total_unreleased_sum += allocation.total_amount - allocation.released_amount;
+
                 // Update the allocation's released amount
                 let mut updated_allocation = allocation.clone();
                 updated_allocation.released_amount += claimable_amount;
@@ -1498,6 +1517,26 @@ impl VestingContract {
                 claimed_assets.push_back((allocation.asset_id.clone(), claimable_amount));
             }
         }
+
+        // --- Pro-Rata Yield Distribution ---
+        if total_claimable_sum > 0 && vault.yield_destination == YieldDestination::Beneficiary {
+            let mut stake_info = get_stake_info(&env, vault_id);
+            if let StakeState::Staked(_, staking_contract) = &stake_info.stake_state {
+                let new_yield = call_claim_yield_for(&env, &staking_contract, &vault.owner, vault_id);
+                stake_info.accumulated_yield += new_yield;
+                
+                if stake_info.accumulated_yield > 0 && total_unreleased_sum > 0 {
+                    let yield_payout = (total_claimable_sum * stake_info.accumulated_yield) / total_unreleased_sum;
+                    if yield_payout > 0 {
+                        let token: Address = env.storage().instance().get(&DataKey::Token).expect("Token not set");
+                        token::Client::new(&env, &token).transfer(&staking_contract, &vault.owner, &yield_payout);
+                        stake_info.accumulated_yield -= yield_payout;
+                    }
+                }
+                set_stake_info(&env, vault_id, &stake_info);
+            }
+        }
+        // -----------------------------------
 
         // Save updated vault
         env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
@@ -1690,6 +1729,29 @@ impl VestingContract {
         if claim_amount > vested - allocation.released_amount {
             panic!("Insufficient vested tokens");
         }
+
+        // --- Pro-Rata Yield Distribution ---
+        if vault.yield_destination == YieldDestination::Beneficiary {
+            let mut stake_info = get_stake_info(&env, vault_id);
+            if let StakeState::Staked(_, staking_contract) = &stake_info.stake_state {
+                let new_yield = call_claim_yield_for(&env, &staking_contract, &vault.owner, vault_id);
+                stake_info.accumulated_yield += new_yield;
+                
+                if stake_info.accumulated_yield > 0 {
+                    let remaining_base = allocation.total_amount - allocation.released_amount;
+                    if remaining_base > 0 {
+                        let yield_payout = (claim_amount * stake_info.accumulated_yield) / remaining_base;
+                        if yield_payout > 0 {
+                            let token: Address = env.storage().instance().get(&DataKey::Token).expect("Token not set");
+                            token::Client::new(&env, &token).transfer(&staking_contract, &vault.owner, &yield_payout);
+                            stake_info.accumulated_yield -= yield_payout;
+                        }
+                    }
+                }
+                set_stake_info(&env, vault_id, &stake_info);
+            }
+        }
+        // -----------------------------------
 
         let mut updated_allocation = allocation.clone();
         updated_allocation.released_amount += claim_amount;
@@ -2437,7 +2499,12 @@ impl VestingContract {
     pub fn claim_yield(env: Env, vault_id: u64) -> i128 {
         Self::require_not_paused(&env);
         let vault = Self::get_vault_internal(&env, vault_id);
-        vault.owner.require_auth();
+        
+        if vault.yield_destination == YieldDestination::Beneficiary {
+            vault.owner.require_auth();
+            panic!("Yield distributed on token claim");
+        }
+        // If DAO, anyone can trigger the harvest and it goes to the treasury.
 
         // Heartbeat: reset Dead-Man's Switch
         update_activity(&env, vault_id);
@@ -2457,15 +2524,16 @@ impl VestingContract {
         let yield_amount = call_claim_yield_for(&env, &staking_contract, &vault.owner, vault_id);
 
         if yield_amount > 0 {
-            // Transfer yield from staking contract to beneficiary
+            // Transfer yield from staking contract to DAO treasury
             let token: Address = env.storage().instance().get(&DataKey::Token).expect("Token not set");
-            token::Client::new(&env, &token).transfer(&staking_contract, &vault.owner, &yield_amount);
+            let treasury = Self::get_admin(env.clone());
+            token::Client::new(&env, &token).transfer(&staking_contract, &treasury, &yield_amount);
         }
 
         stake_info.accumulated_yield = 0;
         set_stake_info(&env, vault_id, &stake_info);
 
-        stake::emit_yield_claimed(&env, vault_id, &vault.owner, yield_amount);
+        stake::emit_yield_claimed(&env, vault_id, &Self::get_admin(env.clone()), yield_amount);
         yield_amount
     }
 
@@ -3023,6 +3091,7 @@ impl VestingContract {
             is_frozen: false,
             requires_legal_signatures: false,
             legal_documents_signed: true, // Default to true for backward compatibility
+            yield_destination: YieldDestination::Beneficiary,
         };
         env.storage().instance().set(&DataKey::VaultData(id), &vault);
         if is_initialized {
