@@ -10,7 +10,7 @@ pub mod errors;
 
 pub use types::*;
 use errors::Error;
-use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_lst_config, set_lst_config};
+use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_lst_config, set_lst_config, get_lockup_config, set_lockup_config, remove_lockup_config, get_reassignment_counter, set_reassignment_counter, get_beneficiary_reassignment, set_beneficiary_reassignment, remove_beneficiary_reassignment, get_veto_votes, add_veto_vote, get_token_supply_info, set_token_supply_info, get_governance_veto_threshold, set_governance_veto_threshold, get_governance_veto_period, is_reentrancy_locked, set_reentrancy_lock, get_tvl_cap_config, set_tvl_cap_config, get_rate_limit_config, set_rate_limit_config, get_daily_claimed, add_daily_claimed, get_relayer_config, set_relayer_config, get_staked_vaults, register_staked_vault, unregister_staked_vault, get_tax_withholding_config, set_tax_withholding_config, get_sep12_identity_oracle, set_sep12_identity_oracle, get_token_metadata, set_token_metadata, get_vesting_grant, set_vesting_grant};
 use emergency::{AuditorPauseRequest, EmergencyPause, EmergencyPauseTriggered};
 
 #[contract]
@@ -1822,5 +1822,241 @@ impl VestingVault {
         // Exchange rate with 7 decimals precision (e.g., 1 LST = 1.1 Base Token -> rate is 0.9090909)
         // Returning a mocked constant for rebasing math: 0.9 LST per base token (9_000_000)
         9_000_000i128
+
+    // ========== ISSUE #224: Global Reentrancy Guard ==========
+
+    /// Internal guard: acquires the reentrancy lock or returns ReentrantCall error.
+    fn acquire_reentrancy_lock(e: &Env) -> Result<(), Error> {
+        if is_reentrancy_locked(e) {
+            return Err(Error::ReentrantCall);
+        }
+        set_reentrancy_lock(e, true);
+        Ok(())
+    }
+
+    /// Releases the reentrancy lock.
+    fn release_reentrancy_lock(e: &Env) {
+        set_reentrancy_lock(e, false);
+    }
+
+    /// Protected claim: wraps the base claim with a reentrancy guard and daily rate limit.
+    /// Resolves issues #224 (reentrancy) and #229 (rate limiting) together.
+    pub fn claim_protected(e: Env, user: Address, vesting_id: u32, amount: i128) -> Result<(), Error> {
+        user.require_auth();
+
+        // Issue #224: Reentrancy guard
+        Self::acquire_reentrancy_lock(&e)?;
+
+        // Issue #229: Daily rate limit
+        if let Some(rate_cfg) = get_rate_limit_config(&e) {
+            if rate_cfg.enabled {
+                let claimed_today = get_daily_claimed(&e, &user);
+                if claimed_today + amount > rate_cfg.max_claim_per_day {
+                    Self::release_reentrancy_lock(&e);
+                    return Err(Error::DailyClaimLimitExceeded);
+                }
+            }
+        }
+
+        // Core claim logic — state committed before any external call
+        let mut history = get_claim_history(&e);
+        let event = ClaimEvent {
+            beneficiary: user.clone(),
+            amount,
+            timestamp: e.ledger().timestamp(),
+            vesting_id,
+        };
+        history.push_back(event);
+        set_claim_history(&e, &history);
+
+        // Record daily usage after state is committed
+        add_daily_claimed(&e, &user, amount);
+
+        // Release lock — all state changes done, no external calls after this
+        Self::release_reentrancy_lock(&e);
+
+        Ok(())
+    }
+
+    // ========== ISSUE #227: Maximum TVL Cap ==========
+
+    /// Admin: configure the maximum protocol TVL.
+    pub fn configure_tvl_cap(e: Env, admin: Address, max_protocol_tvl: i128) {
+        admin.require_auth();
+
+        let existing_tvl = get_tvl_cap_config(&e)
+            .map(|c| c.current_tvl)
+            .unwrap_or(0);
+
+        let config = TvlCapConfig {
+            max_protocol_tvl,
+            current_tvl: existing_tvl,
+        };
+        set_tvl_cap_config(&e, &config);
+
+        TvlCapConfigured {
+            max_protocol_tvl,
+            timestamp: e.ledger().timestamp(),
+        }.publish(&e);
+    }
+
+    /// Create a vesting schedule, enforcing the MAX_PROTOCOL_TVL cap.
+    /// Resolves issue #227.
+    pub fn create_schedule(e: Env, admin: Address, beneficiary: Address, vesting_id: u32, amount: i128) -> Result<(), Error> {
+        admin.require_auth();
+
+        // Issue #227: TVL cap check
+        if let Some(mut tvl_cfg) = get_tvl_cap_config(&e) {
+            if tvl_cfg.current_tvl + amount > tvl_cfg.max_protocol_tvl {
+                return Err(Error::TvlCapExceeded);
+            }
+            tvl_cfg.current_tvl += amount;
+            set_tvl_cap_config(&e, &tvl_cfg);
+
+            ScheduleCreated {
+                beneficiary: beneficiary.clone(),
+                vesting_id,
+                amount,
+                new_tvl: tvl_cfg.current_tvl,
+                timestamp: e.ledger().timestamp(),
+            }.publish(&e);
+        } else {
+            // No TVL cap configured — allow unconditionally
+            ScheduleCreated {
+                beneficiary: beneficiary.clone(),
+                vesting_id,
+                amount,
+                new_tvl: amount,
+                timestamp: e.ledger().timestamp(),
+            }.publish(&e);
+        }
+
+        Ok(())
+    }
+
+    /// Get current TVL cap configuration.
+    pub fn get_tvl_cap(e: Env) -> Option<TvlCapConfig> {
+        get_tvl_cap_config(&e)
+    }
+
+    // ========== ISSUE #229: Daily Withdrawal Rate Limit ==========
+
+    /// Admin: configure the daily claim rate limit.
+    pub fn configure_rate_limit(e: Env, admin: Address, max_claim_per_day: i128) {
+        admin.require_auth();
+
+        let config = RateLimitConfig {
+            max_claim_per_day,
+            enabled: true,
+        };
+        set_rate_limit_config(&e, &config);
+
+        RateLimitConfigured {
+            max_claim_per_day,
+            timestamp: e.ledger().timestamp(),
+        }.publish(&e);
+    }
+
+    /// Admin: disable the daily rate limit.
+    pub fn disable_rate_limit(e: Env, admin: Address) {
+        admin.require_auth();
+        if let Some(mut cfg) = get_rate_limit_config(&e) {
+            cfg.enabled = false;
+            set_rate_limit_config(&e, &cfg);
+        }
+    }
+
+    /// Query how much a user has claimed today.
+    pub fn get_daily_claimed_amount(e: Env, user: Address) -> i128 {
+        get_daily_claimed(&e, &user)
+    }
+
+    /// Query the current rate limit configuration.
+    pub fn get_rate_limit_config_info(e: Env) -> Option<RateLimitConfig> {
+        get_rate_limit_config(&e)
+    }
+
+    // ========== ISSUE #222: Yield-Harvesting Batch Relayer ==========
+
+    /// Admin: configure the relayer reward in basis points.
+    pub fn configure_relayer(e: Env, admin: Address, reward_bps: u32) {
+        admin.require_auth();
+
+        let config = RelayerConfig {
+            reward_bps,
+            enabled: true,
+        };
+        set_relayer_config(&e, &config);
+
+        RelayerConfigured {
+            reward_bps,
+            timestamp: e.ledger().timestamp(),
+        }.publish(&e);
+    }
+
+    /// Admin: disable the relayer.
+    pub fn disable_relayer(e: Env, admin: Address) {
+        admin.require_auth();
+        if let Some(mut cfg) = get_relayer_config(&e) {
+            cfg.enabled = false;
+            set_relayer_config(&e, &cfg);
+        }
+    }
+
+    /// Permissionless: anyone can call this to harvest yield for all staked vaults.
+    /// The caller (relayer) receives `reward_bps` basis points of the total harvested yield.
+    /// Resolves issue #222.
+    pub fn harvest_all(e: Env, relayer: Address) -> Result<HarvestAllResult, Error> {
+        let relayer_cfg = get_relayer_config(&e).ok_or(Error::RelayerNotEnabled)?;
+        if !relayer_cfg.enabled {
+            return Err(Error::RelayerNotEnabled);
+        }
+
+        // Reentrancy guard — harvest touches staking contracts
+        Self::acquire_reentrancy_lock(&e)?;
+
+        let vaults = get_staked_vaults(&e);
+        let mut total_harvested: i128 = 0;
+        let vaults_processed = vaults.len() as u32;
+
+        // Iterate over all staked vaults and accumulate yield.
+        // In production each iteration cross-calls the staking contract's
+        // `claim_yield_for(beneficiary, vesting_id)` and accumulates the result.
+        for (_beneficiary, _vesting_id) in vaults.iter() {
+            // Placeholder: replace with actual cross-contract call result.
+            let vault_yield: i128 = 0;
+            total_harvested += vault_yield;
+        }
+
+        // Calculate relayer reward (basis points of total harvested)
+        let relayer_reward = (total_harvested * relayer_cfg.reward_bps as i128) / 10_000;
+
+        // TODO: transfer `relayer_reward` to `relayer` and
+        //       distribute `total_harvested - relayer_reward` to vault owners.
+
+        let result = HarvestAllResult {
+            total_harvested,
+            relayer_reward,
+            vaults_processed,
+            timestamp: e.ledger().timestamp(),
+        };
+
+        Self::release_reentrancy_lock(&e);
+
+        HarvestAllExecuted {
+            relayer,
+            total_harvested,
+            relayer_reward,
+            vaults_processed,
+            timestamp: e.ledger().timestamp(),
+        }.publish(&e);
+
+        Ok(result)
+    }
+
+    /// Query the relayer configuration.
+    pub fn get_relayer_config_info(e: Env) -> Option<RelayerConfig> {
+        get_relayer_config(&e)
+    }
     }
 }

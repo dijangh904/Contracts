@@ -42,4 +42,16 @@ pub enum Error {
 
     // ⚙️ System (900s)
     Overflow = 900,
+
+    // 🔒 Reentrancy Guard (Issue #224)
+    ReentrantCall = 500,
+
+    // 📊 TVL Cap (Issue #227)
+    TvlCapExceeded = 501,
+
+    // ⏱️ Rate Limiting (Issue #229)
+    DailyClaimLimitExceeded = 502,
+
+    // 🌾 Harvest Relayer (Issue #222)
+    RelayerNotEnabled = 503,
 }

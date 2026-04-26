@@ -1,5 +1,5 @@
 use soroban_sdk::{Env, Vec, Address, Map, BytesN};
-use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, LockupConfig, BeneficiaryReassignment, VetoVote, TokenSupplyInfo, LSTConfig};
+use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, LockupConfig, BeneficiaryReassignment, VetoVote, TokenSupplyInfo, LSTConfig, TvlCapConfig, RateLimitConfig, RelayerConfig};
 
 pub const CLAIM_HISTORY: &str = "CLAIM_HISTORY";
 pub const AUTHORIZED_PAYOUT_ADDRESS: &str = "AUTHORIZED_PAYOUT_ADDRESS";
@@ -341,4 +341,150 @@ pub fn get_lst_config(e: &Env, vesting_id: u32) -> Option<LSTConfig> {
 
 pub fn set_lst_config(e: &Env, vesting_id: u32, config: &LSTConfig) {
     e.storage().instance().set(&(LST_CONFIGS, vesting_id), config);
+}
+
+// ========== ISSUE #224: Global Reentrancy Guard ==========
+pub const REENTRANCY_LOCK: &str = "REENTRANCY_LOCK";
+
+pub fn is_reentrancy_locked(e: &Env) -> bool {
+    e.storage().instance().get(&REENTRANCY_LOCK).unwrap_or(false)
+}
+
+pub fn set_reentrancy_lock(e: &Env, locked: bool) {
+    if locked {
+        e.storage().instance().set(&REENTRANCY_LOCK, &true);
+    } else {
+        e.storage().instance().remove(&REENTRANCY_LOCK);
+    }
+}
+
+// ========== ISSUE #227: Maximum TVL Cap ==========
+pub const TVL_CAP_CONFIG: &str = "TVL_CAP_CONFIG";
+
+pub fn get_tvl_cap_config(e: &Env) -> Option<crate::types::TvlCapConfig> {
+    e.storage().instance().get(&TVL_CAP_CONFIG)
+}
+
+pub fn set_tvl_cap_config(e: &Env, config: &crate::types::TvlCapConfig) {
+    e.storage().instance().set(&TVL_CAP_CONFIG, config);
+}
+
+// ========== ISSUE #229: Daily Withdrawal Rate Limit ==========
+pub const RATE_LIMIT_CONFIG: &str = "RATE_LIMIT_CONFIG";
+pub const DAILY_CLAIM_RECORD: &str = "DAILY_CLAIM_RECORD";
+
+const SECONDS_PER_DAY: u64 = 86_400;
+
+pub fn get_rate_limit_config(e: &Env) -> Option<crate::types::RateLimitConfig> {
+    e.storage().instance().get(&RATE_LIMIT_CONFIG)
+}
+
+pub fn set_rate_limit_config(e: &Env, config: &crate::types::RateLimitConfig) {
+    e.storage().instance().set(&RATE_LIMIT_CONFIG, config);
+}
+
+pub fn get_daily_claimed(e: &Env, beneficiary: &Address) -> i128 {
+    let current_day = e.ledger().timestamp() / SECONDS_PER_DAY;
+    e.storage()
+        .instance()
+        .get(&(DAILY_CLAIM_RECORD, beneficiary, current_day))
+        .unwrap_or(0i128)
+}
+
+pub fn add_daily_claimed(e: &Env, beneficiary: &Address, amount: i128) {
+    let current_day = e.ledger().timestamp() / SECONDS_PER_DAY;
+    let existing: i128 = e.storage()
+        .instance()
+        .get(&(DAILY_CLAIM_RECORD, beneficiary, current_day))
+        .unwrap_or(0i128);
+    e.storage().instance().set(&(DAILY_CLAIM_RECORD, beneficiary, current_day), &(existing + amount));
+}
+
+// ========== ISSUE #222: Yield-Harvesting Batch Relayer ==========
+pub const RELAYER_CONFIG: &str = "RELAYER_CONFIG";
+pub const STAKED_VAULTS: &str = "STAKED_VAULTS";
+
+pub fn get_relayer_config(e: &Env) -> Option<crate::types::RelayerConfig> {
+    e.storage().instance().get(&RELAYER_CONFIG)
+}
+
+pub fn set_relayer_config(e: &Env, config: &crate::types::RelayerConfig) {
+    e.storage().instance().set(&RELAYER_CONFIG, config);
+}
+
+/// Returns the list of (beneficiary, vesting_id) pairs that are currently staked.
+/// In a full implementation this would be a proper index; here we store a Vec of tuples.
+pub fn get_staked_vaults(e: &Env) -> soroban_sdk::Vec<(Address, u32)> {
+    e.storage()
+        .instance()
+        .get(&STAKED_VAULTS)
+        .unwrap_or(soroban_sdk::Vec::new(e))
+}
+
+pub fn set_staked_vaults(e: &Env, vaults: &soroban_sdk::Vec<(Address, u32)>) {
+    e.storage().instance().set(&STAKED_VAULTS, vaults);
+}
+
+pub fn register_staked_vault(e: &Env, beneficiary: &Address, vesting_id: u32) {
+    let mut vaults = get_staked_vaults(e);
+    let entry = (beneficiary.clone(), vesting_id);
+    if !vaults.contains(entry.clone()) {
+        vaults.push_back(entry);
+        set_staked_vaults(e, &vaults);
+    }
+}
+
+pub fn unregister_staked_vault(e: &Env, beneficiary: &Address, vesting_id: u32) {
+    let vaults = get_staked_vaults(e);
+    let mut new_vaults = soroban_sdk::Vec::new(e);
+    for v in vaults.iter() {
+        if v != (beneficiary.clone(), vesting_id) {
+            new_vaults.push_back(v);
+        }
+    }
+    set_staked_vaults(e, &new_vaults);
+}
+
+// ========== Tax Withholding Storage ==========
+pub const TAX_WITHHOLDING_CONFIG: &str = "TAX_WITHHOLDING_CONFIG";
+
+pub fn get_tax_withholding_config(e: &Env) -> Option<crate::types::TaxWithholdingConfig> {
+    e.storage().instance().get(&TAX_WITHHOLDING_CONFIG)
+}
+
+pub fn set_tax_withholding_config(e: &Env, config: &crate::types::TaxWithholdingConfig) {
+    e.storage().instance().set(&TAX_WITHHOLDING_CONFIG, config);
+}
+
+// ========== SEP-12 Identity Oracle Storage ==========
+pub const SEP12_IDENTITY_ORACLE: &str = "SEP12_IDENTITY_ORACLE";
+
+pub fn get_sep12_identity_oracle(e: &Env) -> Option<crate::types::SEP12IdentityOracle> {
+    e.storage().instance().get(&SEP12_IDENTITY_ORACLE)
+}
+
+pub fn set_sep12_identity_oracle(e: &Env, oracle: &crate::types::SEP12IdentityOracle) {
+    e.storage().instance().set(&SEP12_IDENTITY_ORACLE, oracle);
+}
+
+// ========== Token Metadata Storage ==========
+pub const TOKEN_METADATA: &str = "TOKEN_METADATA";
+
+pub fn get_token_metadata(e: &Env, asset_address: &Address) -> Option<crate::types::TokenMetadata> {
+    e.storage().instance().get(&(TOKEN_METADATA, asset_address))
+}
+
+pub fn set_token_metadata(e: &Env, asset_address: &Address, metadata: &crate::types::TokenMetadata) {
+    e.storage().instance().set(&(TOKEN_METADATA, asset_address), metadata);
+}
+
+// ========== Vesting Grant Storage ==========
+pub const VESTING_GRANTS: &str = "VESTING_GRANTS";
+
+pub fn get_vesting_grant(e: &Env, vesting_id: u32) -> Option<crate::types::VestingGrant> {
+    e.storage().instance().get(&(VESTING_GRANTS, vesting_id))
+}
+
+pub fn set_vesting_grant(e: &Env, vesting_id: u32, grant: &crate::types::VestingGrant) {
+    e.storage().instance().set(&(VESTING_GRANTS, vesting_id), grant);
 }
