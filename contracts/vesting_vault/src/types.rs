@@ -409,190 +409,105 @@ pub struct LSTClaimExecuted {
     pub timestamp: u64,
 }
 
-// ========== ISSUE #224: Global Reentrancy Guard ==========
-// (no contracttype needed — stored as bool)
-
-// ========== ISSUE #227: Maximum TVL Cap ==========
-#[contracttype]
-#[derive(Clone)]
-pub struct TvlCapConfig {
-    pub max_protocol_tvl: i128,
-    pub current_tvl: i128,
-}
+// ========== ISSUE #223: Cross-Contract balanceOf Adapter for DAO Voting ==========
 
 #[contractevent]
 #[derive(Clone)]
-pub struct TvlCapConfigured {
-    pub max_protocol_tvl: i128,
-    pub timestamp: u64,
-}
-
-#[contractevent]
-#[derive(Clone)]
-pub struct ScheduleCreated {
+pub struct VotingPowerQueried {
     #[topic]
-    pub beneficiary: Address,
+    pub voter: Address,
+    pub voting_power: i128,
+    pub timestamp: u64,
+}
+
+// ========== ISSUE #226: Admin Dead-Man's Switch ==========
+
+/// 365 days in seconds
+pub const ADMIN_INACTIVITY_TIMEOUT: u64 = 31_536_000;
+
+#[contracttype]
+#[derive(Clone)]
+pub struct AdminDeadManSwitch {
+    /// The recovery address that can claim admin rights after inactivity
+    pub recovery_address: Address,
+    /// Timestamp of the last admin activity
+    pub last_admin_activity: u64,
+    /// Whether the switch has been triggered (recovery claimed)
+    pub is_triggered: bool,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct AdminRecoveryAddressSet {
     #[topic]
-    pub vesting_id: u32,
-    pub amount: i128,
-    pub new_tvl: i128,
-    pub timestamp: u64,
-}
-
-// ========== ISSUE #229: Daily Withdrawal Rate Limit ==========
-#[contracttype]
-#[derive(Clone)]
-pub struct DailyClaimRecord {
-    pub beneficiary: Address,
-    pub day_timestamp: u64, // truncated to day boundary
-    pub claimed_today: i128,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct RateLimitConfig {
-    pub max_claim_per_day: i128,
-    pub enabled: bool,
+    pub recovery_address: Address,
+    pub set_at: u64,
 }
 
 #[contractevent]
 #[derive(Clone)]
-pub struct RateLimitConfigured {
-    pub max_claim_per_day: i128,
-    pub timestamp: u64,
-}
-
-// ========== ISSUE #222: Yield-Harvesting Batch Relayer ==========
-#[contracttype]
-#[derive(Clone)]
-pub struct HarvestAllResult {
-    pub total_harvested: i128,
-    pub relayer_reward: i128,
-    pub vaults_processed: u32,
-    pub timestamp: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct RelayerConfig {
-    pub reward_bps: u32, // basis points (e.g. 50 = 0.5%)
-    pub enabled: bool,
-}
-
-#[contractevent]
-#[derive(Clone)]
-pub struct HarvestAllExecuted {
+pub struct AdminActivityRecorded {
     #[topic]
-    pub relayer: Address,
-    pub total_harvested: i128,
-    pub relayer_reward: i128,
-    pub vaults_processed: u32,
+    pub admin: Address,
     pub timestamp: u64,
 }
 
 #[contractevent]
 #[derive(Clone)]
-pub struct RelayerConfigured {
-    pub reward_bps: u32,
-    pub timestamp: u64,
-}
-
-// ========== ISSUE #205: Tax Withholding ==========
-#[contracttype]
-#[derive(Clone)]
-pub struct TaxWithholdingConfig {
-    pub tax_treasury_address: Address,
-    pub tax_withholding_bps: u32,
-    pub enabled: bool,
-}
-
-#[contractevent]
-#[derive(Clone)]
-pub struct TaxWithholdingConfigured {
-    pub tax_treasury_address: Address,
-    pub tax_withholding_bps: u32,
-    pub timestamp: u64,
-}
-
-#[contractevent]
-#[derive(Clone)]
-pub struct TaxWithholdingDisabled {
-    pub timestamp: u64,
-}
-
-// ========== ISSUE #204: SEP-12 KYC ==========
-#[contracttype]
-#[derive(Clone)]
-pub struct SEP12IdentityOracle {
-    pub contract_address: Address,
-    pub enabled: bool,
-}
-
-#[contractevent]
-#[derive(Clone)]
-pub struct SEP12OracleConfigured {
-    pub oracle_address: Address,
-    pub timestamp: u64,
-}
-
-#[contractevent]
-#[derive(Clone)]
-pub struct SEP12KYCDisabled {
-    pub timestamp: u64,
-}
-
-#[contractevent]
-#[derive(Clone)]
-pub struct KYCCheckFailed {
+pub struct AdminRecoveryClaimed {
     #[topic]
-    pub beneficiary: Address,
-    pub reason: String,
+    pub recovery_address: Address,
+    pub claimed_at: u64,
+}
+
+// ========== ISSUE #228: Oracle Price Deviation Circuit Breaker ==========
+
+/// 30% deviation threshold (in basis points: 3000 = 30%)
+pub const ORACLE_DEVIATION_THRESHOLD_BPS: u32 = 3000;
+
+#[contracttype]
+#[derive(Clone)]
+pub struct OraclePriceRecord {
+    /// Price at the last ledger (scaled by 10^7)
+    pub last_price: i128,
+    /// Ledger sequence number of the last price update
+    pub last_ledger: u32,
+    /// Whether the circuit breaker is currently tripped
+    pub is_frozen: bool,
+    /// Timestamp when the freeze was triggered (0 if not frozen)
+    pub frozen_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct OraclePriceUpdated {
+    pub old_price: i128,
+    pub new_price: i128,
+    pub ledger: u32,
     pub timestamp: u64,
 }
 
-// ========== ISSUE #203: Token Metadata ==========
-#[contracttype]
+#[contractevent]
 #[derive(Clone)]
-pub struct TokenMetadata {
-    pub decimals: u32,
-    pub asset_address: Address,
+pub struct OracleCircuitBreakerTripped {
+    pub old_price: i128,
+    pub new_price: i128,
+    pub deviation_bps: u32,
+    pub tripped_at: u64,
 }
 
 #[contractevent]
 #[derive(Clone)]
-pub struct TokenMetadataRegistered {
-    pub asset_address: Address,
-    pub decimals: u32,
-    pub timestamp: u64,
+pub struct OracleCircuitBreakerReset {
+    pub reset_by: Address,
+    pub reset_at: u64,
 }
 
-// ========== ISSUE #202: Vesting Grant ==========
-#[contracttype]
-#[derive(Clone)]
-pub struct VestingGrant {
-    pub vesting_id: u32,
-    pub beneficiary: Address,
-    pub created_at: u64,
-    pub is_revocable: bool,
-    pub revocability_expires_at: u64,
-}
+// ========== ISSUE #231: Self-Destruct Prevention ==========
 
 #[contractevent]
 #[derive(Clone)]
-pub struct VestingGrantCreated {
-    #[topic]
-    pub vesting_id: u32,
-    pub beneficiary: Address,
-    pub is_revocable: bool,
-    pub revocability_expires_at: u64,
-    pub created_at: u64,
-}
-
-#[contractevent]
-#[derive(Clone)]
-pub struct RevocabilityExpired {
-    #[topic]
-    pub vesting_id: u32,
-    pub beneficiary: Address,
-    pub expired_at: u64,
+pub struct UpgradeBlocked {
+    pub total_unvested_balance: i128,
+    pub blocked_at: u64,
 }
