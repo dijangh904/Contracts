@@ -342,3 +342,69 @@ pub fn get_lst_config(e: &Env, vesting_id: u32) -> Option<LSTConfig> {
 pub fn set_lst_config(e: &Env, vesting_id: u32, config: &LSTConfig) {
     e.storage().instance().set(&(LST_CONFIGS, vesting_id), config);
 }
+
+// ========== ISSUE #225: Security Council pause storage ==========
+pub const SECURITY_COUNCIL: &str = "SECURITY_COUNCIL";
+pub const SECURITY_COUNCIL_PAUSE: &str = "SC_PAUSE";
+
+// ========== ISSUE #232: Upgrade proposal storage ==========
+pub const UPGRADE_PROPOSAL: &str = "UPGRADE_PROPOSAL";
+pub const UPGRADE_VOTERS: &str = "UPGRADE_VOTERS";
+
+// ========== ISSUE #230: Vault state (amount_claimed) storage ==========
+pub const VAULT_STATE: &str = "VAULT_STATE";
+
+// 14 days in seconds
+pub const UPGRADE_TIMELOCK: u64 = 1_209_600;
+// 75% DAO vote threshold (basis points: 7500 / 10000)
+pub const UPGRADE_VOTE_THRESHOLD_BPS: u32 = 7_500;
+// Storage rent extension: ~1 year in ledgers (assuming 5s/ledger)
+pub const RENT_EXTENSION_LEDGERS: u32 = 6_307_200;
+
+pub fn get_security_council(e: &Env) -> Vec<Address> {
+    e.storage().instance().get(&SECURITY_COUNCIL).unwrap_or(Vec::new(e))
+}
+
+pub fn set_security_council(e: &Env, members: &Vec<Address>) {
+    e.storage().instance().set(&SECURITY_COUNCIL, members);
+}
+
+pub fn get_security_council_pause(e: &Env) -> Option<crate::types::SecurityCouncilPause> {
+    e.storage().instance().get(&SECURITY_COUNCIL_PAUSE)
+}
+
+pub fn set_security_council_pause(e: &Env, pause: &crate::types::SecurityCouncilPause) {
+    e.storage().instance().set(&SECURITY_COUNCIL_PAUSE, pause);
+}
+
+pub fn remove_security_council_pause(e: &Env) {
+    e.storage().instance().remove(&SECURITY_COUNCIL_PAUSE);
+}
+
+pub fn get_upgrade_proposal(e: &Env) -> Option<crate::types::UpgradeProposal> {
+    e.storage().instance().get(&UPGRADE_PROPOSAL)
+}
+
+pub fn set_upgrade_proposal(e: &Env, proposal: &crate::types::UpgradeProposal) {
+    e.storage().instance().set(&UPGRADE_PROPOSAL, proposal);
+}
+
+pub fn remove_upgrade_proposal(e: &Env) {
+    e.storage().instance().remove(&UPGRADE_PROPOSAL);
+}
+
+pub fn get_upgrade_voters(e: &Env) -> Vec<Address> {
+    e.storage().instance().get(&UPGRADE_VOTERS).unwrap_or(Vec::new(e))
+}
+
+pub fn set_upgrade_voters(e: &Env, voters: &Vec<Address>) {
+    e.storage().instance().set(&UPGRADE_VOTERS, voters);
+}
+
+pub fn get_vault_state(e: &Env, vesting_id: u32) -> Option<crate::types::VaultState> {
+    e.storage().persistent().get(&(VAULT_STATE, vesting_id))
+}
+
+pub fn set_vault_state(e: &Env, vesting_id: u32, state: &crate::types::VaultState) {
+    e.storage().persistent().set(&(VAULT_STATE, vesting_id), state);
+}
