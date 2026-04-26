@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, Env, Address, Vec, Map, String, BytesN};
+use soroban_sdk::{contract, contractimpl, Env, Address, Vec, Map, String, BytesN, IntoVal};
 
 mod storage;
 pub mod types;
@@ -2059,4 +2059,4 @@ impl VestingVault {
         get_relayer_config(&e)
     }
     }
-}
+}
