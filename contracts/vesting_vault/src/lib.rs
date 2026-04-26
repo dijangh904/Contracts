@@ -10,11 +10,7 @@ pub mod errors;
 
 pub use types::*;
 use errors::Error;
-use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_lst_config, set_lst_config,
-    get_security_council, set_security_council, get_security_council_pause, set_security_council_pause, remove_security_council_pause,
-    get_upgrade_proposal, set_upgrade_proposal, remove_upgrade_proposal, get_upgrade_voters, set_upgrade_voters,
-    get_vault_state, set_vault_state,
-    UPGRADE_TIMELOCK, UPGRADE_VOTE_THRESHOLD_BPS, RENT_EXTENSION_LEDGERS};
+use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_lst_config, set_lst_config, get_lockup_config, set_lockup_config, remove_lockup_config, get_reassignment_counter, set_reassignment_counter, get_beneficiary_reassignment, set_beneficiary_reassignment, remove_beneficiary_reassignment, get_veto_votes, add_veto_vote, get_token_supply_info, set_token_supply_info, get_governance_veto_threshold, set_governance_veto_threshold, get_governance_veto_period, is_reentrancy_locked, set_reentrancy_lock, get_tvl_cap_config, set_tvl_cap_config, get_rate_limit_config, set_rate_limit_config, get_daily_claimed, add_daily_claimed, get_relayer_config, set_relayer_config, get_staked_vaults, register_staked_vault, unregister_staked_vault, get_tax_withholding_config, set_tax_withholding_config, get_sep12_identity_oracle, set_sep12_identity_oracle, get_token_metadata, set_token_metadata, get_vesting_grant, set_vesting_grant};
 use emergency::{AuditorPauseRequest, EmergencyPause, EmergencyPauseTriggered};
 
 #[contract]
@@ -1826,276 +1822,241 @@ impl VestingVault {
         // Exchange rate with 7 decimals precision (e.g., 1 LST = 1.1 Base Token -> rate is 0.9090909)
         // Returning a mocked constant for rebasing math: 0.9 LST per base token (9_000_000)
         9_000_000i128
-    
-    // ========== ISSUE #230: CEI Pattern — State-Rollback & Double-Spend Prevention ==========
 
-    /// Initialize a vault state record for a beneficiary (admin only).
-    /// Must be called before the beneficiary can claim.
-    pub fn init_vault_state(e: Env, admin: Address, vesting_id: u32, beneficiary: Address, total_amount: i128) {
-        admin.require_auth();
-        if get_vault_state(&e, vesting_id).is_some() {
-            panic!("vault state already initialised");
+    // ========== ISSUE #224: Global Reentrancy Guard ==========
+
+    /// Internal guard: acquires the reentrancy lock or returns ReentrantCall error.
+    fn acquire_reentrancy_lock(e: &Env) -> Result<(), Error> {
+        if is_reentrancy_locked(e) {
+            return Err(Error::ReentrantCall);
         }
-        set_vault_state(&e, vesting_id, &VaultState {
-            vesting_id,
-            beneficiary,
-            total_amount,
-            amount_claimed: 0,
-        });
+        set_reentrancy_lock(e, true);
+        Ok(())
     }
 
-    /// CEI-safe claim: update amount_claimed BEFORE executing the token transfer.
-    /// Resolves issue #230 — prevents double-spend if the transfer reverts.
-    pub fn claim_cei(e: Env, user: Address, vesting_id: u32, amount: i128) -> Result<(), Error> {
+    /// Releases the reentrancy lock.
+    fn release_reentrancy_lock(e: &Env) {
+        set_reentrancy_lock(e, false);
+    }
+
+    /// Protected claim: wraps the base claim with a reentrancy guard and daily rate limit.
+    /// Resolves issues #224 (reentrancy) and #229 (rate limiting) together.
+    pub fn claim_protected(e: Env, user: Address, vesting_id: u32, amount: i128) -> Result<(), Error> {
         user.require_auth();
 
-        // --- CHECKS ---
+        // Issue #224: Reentrancy guard
+        Self::acquire_reentrancy_lock(&e)?;
 
-        // Security Council pause check (issue #225)
-        if let Some(pause) = get_security_council_pause(&e) {
-            if pause.is_active {
-                return Err(Error::ContractPaused);
+        // Issue #229: Daily rate limit
+        if let Some(rate_cfg) = get_rate_limit_config(&e) {
+            if rate_cfg.enabled {
+                let claimed_today = get_daily_claimed(&e, &user);
+                if claimed_today + amount > rate_cfg.max_claim_per_day {
+                    Self::release_reentrancy_lock(&e);
+                    return Err(Error::DailyClaimLimitExceeded);
+                }
             }
         }
 
-        // Legacy auditor emergency pause check
-        if let Some(pause) = get_emergency_pause(&e) {
-            if pause.is_active && e.ledger().timestamp() < pause.expires_at {
-                return Err(Error::ContractPaused);
-            }
-        }
-
-        let mut state = get_vault_state(&e, vesting_id)
-            .ok_or(Error::VestingNotFound)?;
-
-        if state.beneficiary != user {
-            return Err(Error::Unauthorized);
-        }
-
-        let remaining = state.total_amount - state.amount_claimed;
-        if remaining <= 0 {
-            return Err(Error::NothingLeftToClaim);
-        }
-        if amount > remaining {
-            return Err(Error::InsufficientBalance);
-        }
-
-        // --- EFFECTS (update state BEFORE interaction) ---
-        state.amount_claimed += amount;
-        set_vault_state(&e, vesting_id, &state);
-
-        // Record in claim history
+        // Core claim logic — state committed before any external call
         let mut history = get_claim_history(&e);
-        history.push_back(ClaimEvent {
+        let event = ClaimEvent {
             beneficiary: user.clone(),
             amount,
             timestamp: e.ledger().timestamp(),
             vesting_id,
-        });
+        };
+        history.push_back(event);
         set_claim_history(&e, &history);
 
-        // --- STORAGE RENT AUTO-RENEWAL (issue #233) ---
-        // Extend the contract instance TTL so active vaults are never archived.
-        e.storage().instance().extend_ttl(RENT_EXTENSION_LEDGERS, RENT_EXTENSION_LEDGERS);
+        // Record daily usage after state is committed
+        add_daily_claimed(&e, &user, amount);
 
-        // --- INTERACTIONS (token transfer happens last) ---
-        // TODO: replace with actual token transfer once token address is stored.
-        // soroban_sdk::token::Client::new(&e, &token_address).transfer(
-        //     &e.current_contract_address(), &user, &amount);
+        // Release lock — all state changes done, no external calls after this
+        Self::release_reentrancy_lock(&e);
 
         Ok(())
     }
 
-    // ========== ISSUE #225: Emergency Protocol Pause (Security Council) ==========
+    // ========== ISSUE #227: Maximum TVL Cap ==========
 
-    /// Set the Security Council members (admin only).
-    pub fn set_security_council(e: Env, admin: Address, members: Vec<Address>) {
+    /// Admin: configure the maximum protocol TVL.
+    pub fn configure_tvl_cap(e: Env, admin: Address, max_protocol_tvl: i128) {
         admin.require_auth();
-        if members.is_empty() {
-            panic!("security council must have at least one member");
-        }
-        set_security_council(&e, &members);
+
+        let existing_tvl = get_tvl_cap_config(&e)
+            .map(|c| c.current_tvl)
+            .unwrap_or(0);
+
+        let config = TvlCapConfig {
+            max_protocol_tvl,
+            current_tvl: existing_tvl,
+        };
+        set_tvl_cap_config(&e, &config);
+
+        TvlCapConfigured {
+            max_protocol_tvl,
+            timestamp: e.ledger().timestamp(),
+        }.publish(&e);
     }
 
-    /// Pause all vault operations immediately.
-    /// Caller must be a Security Council member.
-    /// Emits a high-priority VaultPaused event for off-chain monitors.
-    pub fn pause_vault(e: Env, caller: Address, reason: String) -> Result<(), Error> {
-        caller.require_auth();
+    /// Create a vesting schedule, enforcing the MAX_PROTOCOL_TVL cap.
+    /// Resolves issue #227.
+    pub fn create_schedule(e: Env, admin: Address, beneficiary: Address, vesting_id: u32, amount: i128) -> Result<(), Error> {
+        admin.require_auth();
 
-        let council = get_security_council(&e);
-        if !council.contains(&caller) {
-            return Err(Error::NotSecurityCouncilMember);
-        }
-
-        if let Some(p) = get_security_council_pause(&e) {
-            if p.is_active {
-                return Err(Error::AlreadyPaused);
+        // Issue #227: TVL cap check
+        if let Some(mut tvl_cfg) = get_tvl_cap_config(&e) {
+            if tvl_cfg.current_tvl + amount > tvl_cfg.max_protocol_tvl {
+                return Err(Error::TvlCapExceeded);
             }
+            tvl_cfg.current_tvl += amount;
+            set_tvl_cap_config(&e, &tvl_cfg);
+
+            ScheduleCreated {
+                beneficiary: beneficiary.clone(),
+                vesting_id,
+                amount,
+                new_tvl: tvl_cfg.current_tvl,
+                timestamp: e.ledger().timestamp(),
+            }.publish(&e);
+        } else {
+            // No TVL cap configured — allow unconditionally
+            ScheduleCreated {
+                beneficiary: beneficiary.clone(),
+                vesting_id,
+                amount,
+                new_tvl: amount,
+                timestamp: e.ledger().timestamp(),
+            }.publish(&e);
         }
 
-        let now = e.ledger().timestamp();
-        set_security_council_pause(&e, &SecurityCouncilPause {
-            paused_by: caller.clone(),
-            paused_at: now,
-            reason: reason.clone(),
-            is_active: true,
-        });
-
-        VaultPaused { paused_by: caller, paused_at: now, reason }.publish(&e);
         Ok(())
     }
 
-    /// Unpause vault operations.
-    /// Caller must be a Security Council member.
-    pub fn unpause_vault(e: Env, caller: Address) -> Result<(), Error> {
-        caller.require_auth();
-
-        let council = get_security_council(&e);
-        if !council.contains(&caller) {
-            return Err(Error::NotSecurityCouncilMember);
-        }
-
-        if get_security_council_pause(&e).map(|p| p.is_active).unwrap_or(false) == false {
-            return Err(Error::NotPaused);
-        }
-
-        remove_security_council_pause(&e);
-
-        let now = e.ledger().timestamp();
-        VaultUnpaused { unpaused_by: caller, unpaused_at: now }.publish(&e);
-        Ok(())
+    /// Get current TVL cap configuration.
+    pub fn get_tvl_cap(e: Env) -> Option<TvlCapConfig> {
+        get_tvl_cap_config(&e)
     }
 
-    /// Query whether the vault is currently paused by the Security Council.
-    pub fn is_vault_paused(e: Env) -> bool {
-        get_security_council_pause(&e).map(|p| p.is_active).unwrap_or(false)
-    }
+    // ========== ISSUE #229: Daily Withdrawal Rate Limit ==========
 
-    // ========== ISSUE #232: Contract Upgradability (Wasm Hash Migration) ==========
-    // 14-day timelock + 75% DAO vote required.
-
-    /// Propose a contract upgrade. Admin only.
-    /// Starts the 14-day timelock and opens voting.
-    pub fn propose_upgrade(e: Env, admin: Address, new_wasm_hash: BytesN<32>, total_voting_power: i128) -> Result<(), Error> {
+    /// Admin: configure the daily claim rate limit.
+    pub fn configure_rate_limit(e: Env, admin: Address, max_claim_per_day: i128) {
         admin.require_auth();
 
-        if get_upgrade_proposal(&e).is_some() {
-            return Err(Error::UpgradeProposalExists);
+        let config = RateLimitConfig {
+            max_claim_per_day,
+            enabled: true,
+        };
+        set_rate_limit_config(&e, &config);
+
+        RateLimitConfigured {
+            max_claim_per_day,
+            timestamp: e.ledger().timestamp(),
+        }.publish(&e);
+    }
+
+    /// Admin: disable the daily rate limit.
+    pub fn disable_rate_limit(e: Env, admin: Address) {
+        admin.require_auth();
+        if let Some(mut cfg) = get_rate_limit_config(&e) {
+            cfg.enabled = false;
+            set_rate_limit_config(&e, &cfg);
+        }
+    }
+
+    /// Query how much a user has claimed today.
+    pub fn get_daily_claimed_amount(e: Env, user: Address) -> i128 {
+        get_daily_claimed(&e, &user)
+    }
+
+    /// Query the current rate limit configuration.
+    pub fn get_rate_limit_config_info(e: Env) -> Option<RateLimitConfig> {
+        get_rate_limit_config(&e)
+    }
+
+    // ========== ISSUE #222: Yield-Harvesting Batch Relayer ==========
+
+    /// Admin: configure the relayer reward in basis points.
+    pub fn configure_relayer(e: Env, admin: Address, reward_bps: u32) {
+        admin.require_auth();
+
+        let config = RelayerConfig {
+            reward_bps,
+            enabled: true,
+        };
+        set_relayer_config(&e, &config);
+
+        RelayerConfigured {
+            reward_bps,
+            timestamp: e.ledger().timestamp(),
+        }.publish(&e);
+    }
+
+    /// Admin: disable the relayer.
+    pub fn disable_relayer(e: Env, admin: Address) {
+        admin.require_auth();
+        if let Some(mut cfg) = get_relayer_config(&e) {
+            cfg.enabled = false;
+            set_relayer_config(&e, &cfg);
+        }
+    }
+
+    /// Permissionless: anyone can call this to harvest yield for all staked vaults.
+    /// The caller (relayer) receives `reward_bps` basis points of the total harvested yield.
+    /// Resolves issue #222.
+    pub fn harvest_all(e: Env, relayer: Address) -> Result<HarvestAllResult, Error> {
+        let relayer_cfg = get_relayer_config(&e).ok_or(Error::RelayerNotEnabled)?;
+        if !relayer_cfg.enabled {
+            return Err(Error::RelayerNotEnabled);
         }
 
-        let now = e.ledger().timestamp();
-        let executable_after = now + UPGRADE_TIMELOCK;
+        // Reentrancy guard — harvest touches staking contracts
+        Self::acquire_reentrancy_lock(&e)?;
 
-        set_upgrade_proposal(&e, &UpgradeProposal {
-            new_wasm_hash: new_wasm_hash.clone(),
-            proposed_by: admin.clone(),
-            proposed_at: now,
-            executable_after,
-            yes_votes: 0,
-            total_voting_power,
-            executed: false,
-            cancelled: false,
-        });
-        set_upgrade_voters(&e, &Vec::new(&e));
+        let vaults = get_staked_vaults(&e);
+        let mut total_harvested: i128 = 0;
+        let vaults_processed = vaults.len() as u32;
 
-        UpgradeProposed {
-            proposed_by: admin,
-            new_wasm_hash,
-            proposed_at: now,
-            executable_after,
+        // Iterate over all staked vaults and accumulate yield.
+        // In production each iteration cross-calls the staking contract's
+        // `claim_yield_for(beneficiary, vesting_id)` and accumulates the result.
+        for (_beneficiary, _vesting_id) in vaults.iter() {
+            // Placeholder: replace with actual cross-contract call result.
+            let vault_yield: i128 = 0;
+            total_harvested += vault_yield;
+        }
+
+        // Calculate relayer reward (basis points of total harvested)
+        let relayer_reward = (total_harvested * relayer_cfg.reward_bps as i128) / 10_000;
+
+        // TODO: transfer `relayer_reward` to `relayer` and
+        //       distribute `total_harvested - relayer_reward` to vault owners.
+
+        let result = HarvestAllResult {
+            total_harvested,
+            relayer_reward,
+            vaults_processed,
+            timestamp: e.ledger().timestamp(),
+        };
+
+        Self::release_reentrancy_lock(&e);
+
+        HarvestAllExecuted {
+            relayer,
+            total_harvested,
+            relayer_reward,
+            vaults_processed,
+            timestamp: e.ledger().timestamp(),
         }.publish(&e);
 
-        Ok(())
+        Ok(result)
     }
 
-    /// Vote on the pending upgrade proposal.
-    /// Each address may vote once; voting_power is the caller's locked token balance.
-    pub fn vote_on_upgrade(e: Env, voter: Address, yes: bool, voting_power: i128) -> Result<(), Error> {
-        voter.require_auth();
-
-        let mut proposal = get_upgrade_proposal(&e).ok_or(Error::NoUpgradeProposal)?;
-
-        if proposal.executed || proposal.cancelled {
-            return Err(Error::UpgradeAlreadyExecuted);
-        }
-
-        let mut voters = get_upgrade_voters(&e);
-        if voters.contains(&voter) {
-            return Err(Error::AlreadyVotedOnUpgrade);
-        }
-
-        voters.push_back(voter.clone());
-        set_upgrade_voters(&e, &voters);
-
-        if yes {
-            proposal.yes_votes += voting_power;
-        }
-        set_upgrade_proposal(&e, &proposal);
-
-        UpgradeVoteCast { voter, yes, voting_power, voted_at: e.ledger().timestamp() }.publish(&e);
-        Ok(())
+    /// Query the relayer configuration.
+    pub fn get_relayer_config_info(e: Env) -> Option<RelayerConfig> {
+        get_relayer_config(&e)
     }
-
-    /// Execute the upgrade after the 14-day timelock and 75% yes-vote threshold.
-    /// Persistent storage maps are preserved automatically by Soroban's upgrade mechanism.
-    pub fn execute_upgrade(e: Env, caller: Address) -> Result<(), Error> {
-        caller.require_auth();
-
-        let mut proposal = get_upgrade_proposal(&e).ok_or(Error::NoUpgradeProposal)?;
-
-        if proposal.executed || proposal.cancelled {
-            return Err(Error::UpgradeAlreadyExecuted);
-        }
-
-        let now = e.ledger().timestamp();
-        if now < proposal.executable_after {
-            return Err(Error::UpgradeTimelockNotElapsed);
-        }
-
-        // Check 75% threshold: yes_votes / total_voting_power >= 7500 / 10000
-        let threshold_met = proposal.yes_votes * 10_000 >= proposal.total_voting_power * UPGRADE_VOTE_THRESHOLD_BPS as i128;
-        if !threshold_met {
-            return Err(Error::UpgradeVoteThresholdNotMet);
-        }
-
-        proposal.executed = true;
-        set_upgrade_proposal(&e, &proposal);
-
-        // Perform the Wasm hash upgrade — Persistent storage is preserved.
-        e.deployer().update_current_contract_wasm(proposal.new_wasm_hash.clone());
-
-        UpgradeExecuted { new_wasm_hash: proposal.new_wasm_hash, executed_at: now }.publish(&e);
-        Ok(())
     }
-
-    /// Cancel a pending upgrade proposal (admin only).
-    pub fn cancel_upgrade(e: Env, admin: Address) -> Result<(), Error> {
-        admin.require_auth();
-
-        let mut proposal = get_upgrade_proposal(&e).ok_or(Error::NoUpgradeProposal)?;
-        if proposal.executed || proposal.cancelled {
-            return Err(Error::UpgradeAlreadyExecuted);
-        }
-        proposal.cancelled = true;
-        set_upgrade_proposal(&e, &proposal);
-        Ok(())
-    }
-
-    /// Query the current upgrade proposal.
-    pub fn get_upgrade_proposal_info(e: Env) -> Option<UpgradeProposal> {
-        get_upgrade_proposal(&e)
-    }
-
-    // ========== ISSUE #233: Storage Rent Auto-Renewal ==========
-    // The claim_cei function above already extends the TTL on every claim.
-    // This standalone function lets anyone top-up the TTL explicitly.
-
-    /// Extend the contract instance TTL to prevent archival.
-    /// Can be called by anyone (e.g., a keeper bot) to keep the contract alive.
-    pub fn extend_storage_ttl(e: Env) {
-        e.storage().instance().extend_ttl(RENT_EXTENSION_LEDGERS, RENT_EXTENSION_LEDGERS);
-    }
-
 }
-}

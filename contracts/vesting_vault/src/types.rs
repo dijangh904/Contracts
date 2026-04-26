@@ -409,83 +409,190 @@ pub struct LSTClaimExecuted {
     pub timestamp: u64,
 }
 
-// ========== ISSUE #225: Security Council Emergency Pause ==========
+// ========== ISSUE #224: Global Reentrancy Guard ==========
+// (no contracttype needed — stored as bool)
+
+// ========== ISSUE #227: Maximum TVL Cap ==========
+#[contracttype]
+#[derive(Clone)]
+pub struct TvlCapConfig {
+    pub max_protocol_tvl: i128,
+    pub current_tvl: i128,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct TvlCapConfigured {
+    pub max_protocol_tvl: i128,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct ScheduleCreated {
+    #[topic]
+    pub beneficiary: Address,
+    #[topic]
+    pub vesting_id: u32,
+    pub amount: i128,
+    pub new_tvl: i128,
+    pub timestamp: u64,
+}
+
+// ========== ISSUE #229: Daily Withdrawal Rate Limit ==========
+#[contracttype]
+#[derive(Clone)]
+pub struct DailyClaimRecord {
+    pub beneficiary: Address,
+    pub day_timestamp: u64, // truncated to day boundary
+    pub claimed_today: i128,
+}
 
 #[contracttype]
 #[derive(Clone)]
-pub struct SecurityCouncilPause {
-    pub paused_by: Address,
-    pub paused_at: u64,
+pub struct RateLimitConfig {
+    pub max_claim_per_day: i128,
+    pub enabled: bool,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct RateLimitConfigured {
+    pub max_claim_per_day: i128,
+    pub timestamp: u64,
+}
+
+// ========== ISSUE #222: Yield-Harvesting Batch Relayer ==========
+#[contracttype]
+#[derive(Clone)]
+pub struct HarvestAllResult {
+    pub total_harvested: i128,
+    pub relayer_reward: i128,
+    pub vaults_processed: u32,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct RelayerConfig {
+    pub reward_bps: u32, // basis points (e.g. 50 = 0.5%)
+    pub enabled: bool,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct HarvestAllExecuted {
+    #[topic]
+    pub relayer: Address,
+    pub total_harvested: i128,
+    pub relayer_reward: i128,
+    pub vaults_processed: u32,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct RelayerConfigured {
+    pub reward_bps: u32,
+    pub timestamp: u64,
+}
+
+// ========== ISSUE #205: Tax Withholding ==========
+#[contracttype]
+#[derive(Clone)]
+pub struct TaxWithholdingConfig {
+    pub tax_treasury_address: Address,
+    pub tax_withholding_bps: u32,
+    pub enabled: bool,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct TaxWithholdingConfigured {
+    pub tax_treasury_address: Address,
+    pub tax_withholding_bps: u32,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct TaxWithholdingDisabled {
+    pub timestamp: u64,
+}
+
+// ========== ISSUE #204: SEP-12 KYC ==========
+#[contracttype]
+#[derive(Clone)]
+pub struct SEP12IdentityOracle {
+    pub contract_address: Address,
+    pub enabled: bool,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct SEP12OracleConfigured {
+    pub oracle_address: Address,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct SEP12KYCDisabled {
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct KYCCheckFailed {
+    #[topic]
+    pub beneficiary: Address,
     pub reason: String,
-    pub is_active: bool,
+    pub timestamp: u64,
 }
 
-#[contractevent]
-#[derive(Clone)]
-pub struct VaultPaused {
-    #[topic]
-    pub paused_by: Address,
-    pub paused_at: u64,
-    pub reason: String,
-}
-
-#[contractevent]
-#[derive(Clone)]
-pub struct VaultUnpaused {
-    #[topic]
-    pub unpaused_by: Address,
-    pub unpaused_at: u64,
-}
-
-// ========== ISSUE #232: Contract Upgrade with Timelock + DAO Vote ==========
-
+// ========== ISSUE #203: Token Metadata ==========
 #[contracttype]
 #[derive(Clone)]
-pub struct UpgradeProposal {
-    pub new_wasm_hash: BytesN<32>,
-    pub proposed_by: Address,
-    pub proposed_at: u64,
-    pub executable_after: u64, // proposed_at + 14 days
-    pub yes_votes: i128,
-    pub total_voting_power: i128,
-    pub executed: bool,
-    pub cancelled: bool,
+pub struct TokenMetadata {
+    pub decimals: u32,
+    pub asset_address: Address,
 }
 
 #[contractevent]
 #[derive(Clone)]
-pub struct UpgradeProposed {
-    #[topic]
-    pub proposed_by: Address,
-    pub new_wasm_hash: BytesN<32>,
-    pub proposed_at: u64,
-    pub executable_after: u64,
+pub struct TokenMetadataRegistered {
+    pub asset_address: Address,
+    pub decimals: u32,
+    pub timestamp: u64,
 }
 
-#[contractevent]
-#[derive(Clone)]
-pub struct UpgradeVoteCast {
-    #[topic]
-    pub voter: Address,
-    pub yes: bool,
-    pub voting_power: i128,
-    pub voted_at: u64,
-}
-
-#[contractevent]
-#[derive(Clone)]
-pub struct UpgradeExecuted {
-    pub new_wasm_hash: BytesN<32>,
-    pub executed_at: u64,
-}
-
-// ========== ISSUE #230: CEI pattern — amount_claimed tracker ==========
-
+// ========== ISSUE #202: Vesting Grant ==========
 #[contracttype]
 #[derive(Clone)]
-pub struct VaultState {
+pub struct VestingGrant {
     pub vesting_id: u32,
     pub beneficiary: Address,
-    pub total_amount: i128,
-    pub amount_claimed: i128,
+    pub created_at: u64,
+    pub is_revocable: bool,
+    pub revocability_expires_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct VestingGrantCreated {
+    #[topic]
+    pub vesting_id: u32,
+    pub beneficiary: Address,
+    pub is_revocable: bool,
+    pub revocability_expires_at: u64,
+    pub created_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct RevocabilityExpired {
+    #[topic]
+    pub vesting_id: u32,
+    pub beneficiary: Address,
+    pub expired_at: u64,
 }
