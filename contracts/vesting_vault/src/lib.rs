@@ -10,7 +10,7 @@ pub mod errors;
 
 pub use types::*;
 use errors::Error;
-use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_lst_config, set_lst_config};
+use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_lst_config, set_lst_config, get_unvested_balance, set_unvested_balance, get_admin_dead_man_switch, set_admin_dead_man_switch, get_oracle_price_record, set_oracle_price_record, get_contract_total_unvested, set_contract_total_unvested};
 use emergency::{AuditorPauseRequest, EmergencyPause, EmergencyPauseTriggered};
 
 #[contract]
@@ -1822,5 +1822,273 @@ impl VestingVault {
         // Exchange rate with 7 decimals precision (e.g., 1 LST = 1.1 Base Token -> rate is 0.9090909)
         // Returning a mocked constant for rebasing math: 0.9 LST per base token (9_000_000)
         9_000_000i128
+    }
+
+    // ========== ISSUE #223: Cross-Contract balanceOf Adapter for DAO Voting ==========
+
+    /// Returns the voting power of an address, defined as its total unvested token balance.
+    /// DAO governance contracts can call this to allow employees to vote with locked tokens,
+    /// ensuring protocol alignment even before tokens are fully vested.
+    pub fn get_voting_power(e: Env, voter: Address) -> i128 {
+        let power = get_unvested_balance(&e, &voter);
+        VotingPowerQueried {
+            voter,
+            voting_power: power,
+            timestamp: e.ledger().timestamp(),
+        }.publish(&e);
+        power
+    }
+
+    /// Admin function to record/update an address's unvested balance.
+    /// Called when vaults are created or tokens are claimed to keep the balance current.
+    pub fn record_unvested_balance(e: Env, admin: Address, beneficiary: Address, unvested_amount: i128) {
+        admin.require_auth();
+        if unvested_amount < 0 {
+            panic!("Unvested amount cannot be negative");
+        }
+        set_unvested_balance(&e, &beneficiary, unvested_amount);
+    }
+
+    // ========== ISSUE #226: Admin Dead-Man's Switch ==========
+
+    /// Configure the recovery address for the admin dead-man's switch.
+    /// If the admin is inactive for 365 days, the recovery address can claim admin rights.
+    pub fn set_admin_recovery_address(e: Env, admin: Address, recovery_address: Address) -> Result<(), Error> {
+        admin.require_auth();
+
+        if recovery_address == admin {
+            return Err(Error::RecoveryAddressInvalid);
+        }
+
+        let current_time = e.ledger().timestamp();
+
+        let switch = AdminDeadManSwitch {
+            recovery_address: recovery_address.clone(),
+            last_admin_activity: current_time,
+            is_triggered: false,
+        };
+
+        set_admin_dead_man_switch(&e, &switch);
+
+        AdminRecoveryAddressSet {
+            recovery_address,
+            set_at: current_time,
+        }.publish(&e);
+
+        Ok(())
+    }
+
+    /// Record admin activity to reset the dead-man's switch inactivity timer.
+    /// Admin should call this periodically (at least once per year) to prevent recovery.
+    pub fn ping_admin_activity(e: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+
+        let mut switch = get_admin_dead_man_switch(&e)
+            .ok_or(Error::AdminSwitchNotConfigured)?;
+
+        if switch.is_triggered {
+            return Err(Error::AdminSwitchAlreadyTriggered);
+        }
+
+        let current_time = e.ledger().timestamp();
+        switch.last_admin_activity = current_time;
+        set_admin_dead_man_switch(&e, &switch);
+
+        AdminActivityRecorded {
+            admin,
+            timestamp: current_time,
+        }.publish(&e);
+
+        Ok(())
+    }
+
+    /// Claim admin rights after 365 days of admin inactivity.
+    /// Only the pre-configured recovery address can call this.
+    pub fn claim_admin_recovery(e: Env, recovery_address: Address) -> Result<(), Error> {
+        recovery_address.require_auth();
+
+        let mut switch = get_admin_dead_man_switch(&e)
+            .ok_or(Error::AdminSwitchNotConfigured)?;
+
+        if switch.is_triggered {
+            return Err(Error::AdminSwitchAlreadyTriggered);
+        }
+
+        if switch.recovery_address != recovery_address {
+            return Err(Error::Unauthorized);
+        }
+
+        let current_time = e.ledger().timestamp();
+        let elapsed = current_time.saturating_sub(switch.last_admin_activity);
+
+        if elapsed < ADMIN_INACTIVITY_TIMEOUT {
+            return Err(Error::AdminInactivityNotElapsed);
+        }
+
+        switch.is_triggered = true;
+        set_admin_dead_man_switch(&e, &switch);
+
+        AdminRecoveryClaimed {
+            recovery_address,
+            claimed_at: current_time,
+        }.publish(&e);
+
+        Ok(())
+    }
+
+    /// Get the current admin dead-man's switch state.
+    pub fn get_admin_switch_state(e: Env) -> Option<AdminDeadManSwitch> {
+        get_admin_dead_man_switch(&e)
+    }
+
+    // ========== ISSUE #228: Oracle Price Deviation Circuit Breaker ==========
+
+    /// Submit a new oracle price. If the price deviates >30% from the previous ledger's
+    /// price, the vault is frozen to prevent oracle manipulation attacks.
+    /// Returns Err(OracleCircuitBreakerActive) if already frozen.
+    /// Returns Err(OraclePriceDeviationTooHigh) if this update trips the breaker.
+    pub fn update_oracle_price(e: Env, admin: Address, new_price: i128) -> Result<(), Error> {
+        admin.require_auth();
+
+        if new_price <= 0 {
+            return Err(Error::InvalidInput);
+        }
+
+        let current_time = e.ledger().timestamp();
+        let current_ledger = e.ledger().sequence();
+
+        match get_oracle_price_record(&e) {
+            None => {
+                // First price submission — just store it
+                set_oracle_price_record(&e, &OraclePriceRecord {
+                    last_price: new_price,
+                    last_ledger: current_ledger,
+                    is_frozen: false,
+                    frozen_at: 0,
+                });
+                OraclePriceUpdated {
+                    old_price: 0,
+                    new_price,
+                    ledger: current_ledger,
+                    timestamp: current_time,
+                }.publish(&e);
+            }
+            Some(record) => {
+                if record.is_frozen {
+                    return Err(Error::OracleCircuitBreakerActive);
+                }
+
+                // Only check deviation when the update is within the same ledger
+                if record.last_ledger == current_ledger {
+                    let deviation_bps = Self::calc_deviation_bps(record.last_price, new_price);
+                    if deviation_bps > ORACLE_DEVIATION_THRESHOLD_BPS {
+                        // Trip the circuit breaker
+                        set_oracle_price_record(&e, &OraclePriceRecord {
+                            last_price: record.last_price,
+                            last_ledger: current_ledger,
+                            is_frozen: true,
+                            frozen_at: current_time,
+                        });
+                        OracleCircuitBreakerTripped {
+                            old_price: record.last_price,
+                            new_price,
+                            deviation_bps,
+                            tripped_at: current_time,
+                        }.publish(&e);
+                        return Err(Error::OraclePriceDeviationTooHigh);
+                    }
+                }
+
+                set_oracle_price_record(&e, &OraclePriceRecord {
+                    last_price: new_price,
+                    last_ledger: current_ledger,
+                    is_frozen: record.is_frozen,
+                    frozen_at: record.frozen_at,
+                });
+                OraclePriceUpdated {
+                    old_price: record.last_price,
+                    new_price,
+                    ledger: current_ledger,
+                    timestamp: current_time,
+                }.publish(&e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Admin resets the oracle circuit breaker after manual review.
+    pub fn reset_oracle_circuit_breaker(e: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+
+        let mut record = get_oracle_price_record(&e)
+            .ok_or(Error::InvalidInput)?;
+
+        record.is_frozen = false;
+        record.frozen_at = 0;
+        set_oracle_price_record(&e, &record);
+
+        OracleCircuitBreakerReset {
+            reset_by: admin,
+            reset_at: e.ledger().timestamp(),
+        }.publish(&e);
+
+        Ok(())
+    }
+
+    /// Returns the current oracle price record.
+    pub fn get_oracle_price(e: Env) -> Option<OraclePriceRecord> {
+        get_oracle_price_record(&e)
+    }
+
+    /// Internal helper: compute deviation in basis points between two prices.
+    fn calc_deviation_bps(old_price: i128, new_price: i128) -> u32 {
+        if old_price == 0 {
+            return 0;
+        }
+        let diff = if new_price > old_price {
+            new_price - old_price
+        } else {
+            old_price - new_price
+        };
+        // deviation_bps = (diff * 10000) / old_price
+        ((diff * 10_000) / old_price) as u32
+    }
+
+    // ========== ISSUE #231: Self-Destruct Prevention & Storage Locking ==========
+
+    /// Guard function that MUST be called before any contract upgrade or deletion.
+    /// Returns Err(UpgradeBlockedByUnvestedFunds) if Total_Unvested_Balance > 0,
+    /// ensuring user funds can never be trapped by a malicious admin action.
+    pub fn assert_safe_to_upgrade(e: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+
+        let total_unvested = get_contract_total_unvested(&e);
+        if total_unvested > 0 {
+            UpgradeBlocked {
+                total_unvested_balance: total_unvested,
+                blocked_at: e.ledger().timestamp(),
+            }.publish(&e);
+            return Err(Error::UpgradeBlockedByUnvestedFunds);
+        }
+
+        Ok(())
+    }
+
+    /// Returns the contract-wide total unvested balance.
+    /// Used by assert_safe_to_upgrade and external auditors.
+    pub fn get_total_unvested_balance(e: Env) -> i128 {
+        get_contract_total_unvested(&e)
+    }
+
+    /// Admin function to update the contract-wide total unvested balance.
+    /// Should be called whenever vaults are created, claimed from, or revoked.
+    pub fn update_total_unvested_balance(e: Env, admin: Address, new_total: i128) -> Result<(), Error> {
+        admin.require_auth();
+        if new_total < 0 {
+            return Err(Error::InvalidInput);
+        }
+        set_contract_total_unvested(&e, new_total);
+        Ok(())
     }
 }

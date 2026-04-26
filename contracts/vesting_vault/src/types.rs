@@ -408,3 +408,106 @@ pub struct LSTClaimExecuted {
     pub lst_token_address: Address,
     pub timestamp: u64,
 }
+
+// ========== ISSUE #223: Cross-Contract balanceOf Adapter for DAO Voting ==========
+
+#[contractevent]
+#[derive(Clone)]
+pub struct VotingPowerQueried {
+    #[topic]
+    pub voter: Address,
+    pub voting_power: i128,
+    pub timestamp: u64,
+}
+
+// ========== ISSUE #226: Admin Dead-Man's Switch ==========
+
+/// 365 days in seconds
+pub const ADMIN_INACTIVITY_TIMEOUT: u64 = 31_536_000;
+
+#[contracttype]
+#[derive(Clone)]
+pub struct AdminDeadManSwitch {
+    /// The recovery address that can claim admin rights after inactivity
+    pub recovery_address: Address,
+    /// Timestamp of the last admin activity
+    pub last_admin_activity: u64,
+    /// Whether the switch has been triggered (recovery claimed)
+    pub is_triggered: bool,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct AdminRecoveryAddressSet {
+    #[topic]
+    pub recovery_address: Address,
+    pub set_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct AdminActivityRecorded {
+    #[topic]
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct AdminRecoveryClaimed {
+    #[topic]
+    pub recovery_address: Address,
+    pub claimed_at: u64,
+}
+
+// ========== ISSUE #228: Oracle Price Deviation Circuit Breaker ==========
+
+/// 30% deviation threshold (in basis points: 3000 = 30%)
+pub const ORACLE_DEVIATION_THRESHOLD_BPS: u32 = 3000;
+
+#[contracttype]
+#[derive(Clone)]
+pub struct OraclePriceRecord {
+    /// Price at the last ledger (scaled by 10^7)
+    pub last_price: i128,
+    /// Ledger sequence number of the last price update
+    pub last_ledger: u32,
+    /// Whether the circuit breaker is currently tripped
+    pub is_frozen: bool,
+    /// Timestamp when the freeze was triggered (0 if not frozen)
+    pub frozen_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct OraclePriceUpdated {
+    pub old_price: i128,
+    pub new_price: i128,
+    pub ledger: u32,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct OracleCircuitBreakerTripped {
+    pub old_price: i128,
+    pub new_price: i128,
+    pub deviation_bps: u32,
+    pub tripped_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct OracleCircuitBreakerReset {
+    pub reset_by: Address,
+    pub reset_at: u64,
+}
+
+// ========== ISSUE #231: Self-Destruct Prevention ==========
+
+#[contractevent]
+#[derive(Clone)]
+pub struct UpgradeBlocked {
+    pub total_unvested_balance: i128,
+    pub blocked_at: u64,
+}

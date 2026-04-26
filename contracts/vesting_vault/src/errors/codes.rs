@@ -42,4 +42,28 @@ pub enum Error {
 
     // ⚙️ System (900s)
     Overflow = 900,
+
+    // 🗳️ Governance / DAO (500s)
+    /// #223: No unvested balance found for the queried address
+    NoUnvestedBalance = 500,
+
+    // 🔑 Admin Recovery (600s)
+    /// #226: Admin dead-man's switch not configured
+    AdminSwitchNotConfigured = 600,
+    /// #226: Admin inactivity timeout has not elapsed yet
+    AdminInactivityNotElapsed = 601,
+    /// #226: Admin switch already triggered
+    AdminSwitchAlreadyTriggered = 602,
+    /// #226: Recovery address cannot be the same as admin
+    RecoveryAddressInvalid = 603,
+
+    // 🔮 Oracle (700s)
+    /// #228: Oracle circuit breaker is currently tripped — vault is frozen
+    OracleCircuitBreakerActive = 700,
+    /// #228: Price deviation exceeds the 30% threshold
+    OraclePriceDeviationTooHigh = 701,
+
+    // 🛡️ Self-Destruct Prevention (800s)
+    /// #231: Cannot upgrade/delete contract while unvested balance > 0
+    UpgradeBlockedByUnvestedFunds = 800,
 }

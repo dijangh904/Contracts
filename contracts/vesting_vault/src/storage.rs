@@ -342,3 +342,53 @@ pub fn get_lst_config(e: &Env, vesting_id: u32) -> Option<LSTConfig> {
 pub fn set_lst_config(e: &Env, vesting_id: u32, config: &LSTConfig) {
     e.storage().instance().set(&(LST_CONFIGS, vesting_id), config);
 }
+
+// ========== ISSUE #223: Voting Power (Total Unvested Balance per address) ==========
+pub const TOTAL_UNVESTED_BALANCE: &str = "TOTAL_UNVESTED_BALANCE";
+
+pub fn get_unvested_balance(e: &Env, address: &Address) -> i128 {
+    e.storage()
+        .instance()
+        .get(&(TOTAL_UNVESTED_BALANCE, address))
+        .unwrap_or(0i128)
+}
+
+pub fn set_unvested_balance(e: &Env, address: &Address, balance: i128) {
+    e.storage().instance().set(&(TOTAL_UNVESTED_BALANCE, address), &balance);
+}
+
+// ========== ISSUE #226: Admin Dead-Man's Switch ==========
+pub const ADMIN_DEAD_MAN_SWITCH: &str = "ADMIN_DEAD_MAN_SWITCH";
+
+pub fn get_admin_dead_man_switch(e: &Env) -> Option<crate::types::AdminDeadManSwitch> {
+    e.storage().instance().get(&ADMIN_DEAD_MAN_SWITCH)
+}
+
+pub fn set_admin_dead_man_switch(e: &Env, switch: &crate::types::AdminDeadManSwitch) {
+    e.storage().instance().set(&ADMIN_DEAD_MAN_SWITCH, switch);
+}
+
+// ========== ISSUE #228: Oracle Price Deviation Circuit Breaker ==========
+pub const ORACLE_PRICE_RECORD: &str = "ORACLE_PRICE_RECORD";
+
+pub fn get_oracle_price_record(e: &Env) -> Option<crate::types::OraclePriceRecord> {
+    e.storage().instance().get(&ORACLE_PRICE_RECORD)
+}
+
+pub fn set_oracle_price_record(e: &Env, record: &crate::types::OraclePriceRecord) {
+    e.storage().instance().set(&ORACLE_PRICE_RECORD, record);
+}
+
+// ========== ISSUE #231: Total Unvested Balance (contract-wide) ==========
+pub const CONTRACT_TOTAL_UNVESTED: &str = "CONTRACT_TOTAL_UNVESTED";
+
+pub fn get_contract_total_unvested(e: &Env) -> i128 {
+    e.storage()
+        .instance()
+        .get(&CONTRACT_TOTAL_UNVESTED)
+        .unwrap_or(0i128)
+}
+
+pub fn set_contract_total_unvested(e: &Env, total: i128) {
+    e.storage().instance().set(&CONTRACT_TOTAL_UNVESTED, &total);
+}
