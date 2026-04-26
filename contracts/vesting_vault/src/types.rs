@@ -408,3 +408,84 @@ pub struct LSTClaimExecuted {
     pub lst_token_address: Address,
     pub timestamp: u64,
 }
+
+// ========== ISSUE #225: Security Council Emergency Pause ==========
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SecurityCouncilPause {
+    pub paused_by: Address,
+    pub paused_at: u64,
+    pub reason: String,
+    pub is_active: bool,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct VaultPaused {
+    #[topic]
+    pub paused_by: Address,
+    pub paused_at: u64,
+    pub reason: String,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct VaultUnpaused {
+    #[topic]
+    pub unpaused_by: Address,
+    pub unpaused_at: u64,
+}
+
+// ========== ISSUE #232: Contract Upgrade with Timelock + DAO Vote ==========
+
+#[contracttype]
+#[derive(Clone)]
+pub struct UpgradeProposal {
+    pub new_wasm_hash: BytesN<32>,
+    pub proposed_by: Address,
+    pub proposed_at: u64,
+    pub executable_after: u64, // proposed_at + 14 days
+    pub yes_votes: i128,
+    pub total_voting_power: i128,
+    pub executed: bool,
+    pub cancelled: bool,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct UpgradeProposed {
+    #[topic]
+    pub proposed_by: Address,
+    pub new_wasm_hash: BytesN<32>,
+    pub proposed_at: u64,
+    pub executable_after: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct UpgradeVoteCast {
+    #[topic]
+    pub voter: Address,
+    pub yes: bool,
+    pub voting_power: i128,
+    pub voted_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct UpgradeExecuted {
+    pub new_wasm_hash: BytesN<32>,
+    pub executed_at: u64,
+}
+
+// ========== ISSUE #230: CEI pattern — amount_claimed tracker ==========
+
+#[contracttype]
+#[derive(Clone)]
+pub struct VaultState {
+    pub vesting_id: u32,
+    pub beneficiary: Address,
+    pub total_amount: i128,
+    pub amount_claimed: i128,
+}

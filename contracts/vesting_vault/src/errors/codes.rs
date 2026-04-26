@@ -42,4 +42,21 @@ pub enum Error {
 
     // ⚙️ System (900s)
     Overflow = 900,
+
+    // 🛡️ Security Council / Pause (500s)
+    ContractPaused = 500,
+    NotSecurityCouncilMember = 501,
+    AlreadyPaused = 502,
+    NotPaused = 503,
+
+    // 🔄 Upgrade (600s)
+    UpgradeProposalExists = 600,
+    NoUpgradeProposal = 601,
+    UpgradeTimelockNotElapsed = 602,
+    UpgradeVoteThresholdNotMet = 603,
+    AlreadyVotedOnUpgrade = 604,
+    UpgradeAlreadyExecuted = 605,
+
+    // 💸 Double-spend (700s)
+    NothingLeftToClaim = 700,
 }
