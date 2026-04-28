@@ -3485,6 +3485,12 @@ impl VestingContract {
         total_claimable
     }
 
+    #[cfg(test)]
+    pub fn calculate_claimable_for_asset_wrapper(env: Env, id: u64, asset_index: usize) -> i128 {
+        let vault = Self::get_vault_internal(&env, id);
+        Self::calculate_claimable_for_asset(&env, id, &vault, asset_index)
+    }
+
     /// Applies anti-dilution adjustments to vested amount based on network growth
     fn apply_anti_dilution_adjustment(env: &Env, vault_id: u64, base_vested: i128, total_amount: i128) -> i128 {
         // Check if anti-dilution is configured for this vault
