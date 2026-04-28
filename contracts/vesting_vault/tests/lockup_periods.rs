@@ -1,13 +1,13 @@
 #![cfg(test)]
 
-use soroban_sdk::{Address, Env};
+use soroban_sdk::{Address, Env, Bytes};
 use vesting_vault::VestingVault;
 
 #[test]
 fn test_configure_lockup() {
     let env = Env::default();
-    let admin = Address::random(&env);
-    let lockup_token_address = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
+    let lockup_token_address = Address::from_string_bytes(&Bytes::new(&env));
     
     let vesting_id = 1u32;
     let lockup_duration = 86400u64; // 1 day
@@ -30,8 +30,8 @@ fn test_configure_lockup() {
 #[test]
 fn test_disable_lockup() {
     let env = Env::default();
-    let admin = Address::random(&env);
-    let lockup_token_address = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
+    let lockup_token_address = Address::from_string_bytes(&Bytes::new(&env));
     
     let vesting_id = 1u32;
     let lockup_duration = 86400u64;
@@ -60,9 +60,9 @@ fn test_disable_lockup() {
 #[test]
 fn test_claim_with_lockup_issued() {
     let env = Env::default();
-    let admin = Address::random(&env);
-    let user = Address::random(&env);
-    let lockup_token_address = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
+    let user = Address::from_string_bytes(&Bytes::new(&env));
+    let lockup_token_address = Address::from_string_bytes(&Bytes::new(&env));
     
     let vesting_id = 1u32;
     let lockup_duration = 86400u64;
@@ -93,7 +93,7 @@ fn test_claim_with_lockup_issued() {
 #[test]
 fn test_claim_without_lockup_normal_flow() {
     let env = Env::default();
-    let user = Address::random(&env);
+    let user = Address::from_string_bytes(&Bytes::new(&env));
     
     let vesting_id = 1u32;
     let amount = 1000i128;
@@ -114,7 +114,7 @@ fn test_claim_without_lockup_normal_flow() {
 #[test]
 fn test_is_user_unlocked_no_lockup() {
     let env = Env::default();
-    let user = Address::random(&env);
+    let user = Address::from_string_bytes(&Bytes::new(&env));
     let vesting_id = 1u32;
     
     // Without lockup configuration, should return true
@@ -125,9 +125,9 @@ fn test_is_user_unlocked_no_lockup() {
 #[test]
 fn test_is_user_unlocked_with_lockup() {
     let env = Env::default();
-    let admin = Address::random(&env);
-    let user = Address::random(&env);
-    let lockup_token_address = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
+    let user = Address::from_string_bytes(&Bytes::new(&env));
+    let lockup_token_address = Address::from_string_bytes(&Bytes::new(&env));
     
     let vesting_id = 1u32;
     let lockup_duration = 86400u64;
@@ -149,7 +149,7 @@ fn test_is_user_unlocked_with_lockup() {
 #[test]
 fn test_get_user_unlock_time_no_lockup() {
     let env = Env::default();
-    let user = Address::random(&env);
+    let user = Address::from_string_bytes(&Bytes::new(&env));
     let vesting_id = 1u32;
     
     // Without lockup configuration, should return None
@@ -187,8 +187,8 @@ fn test_get_user_unlock_time_with_lockup() {
 #[test]
 fn test_multiple_vesting_ids_lockup_configuration() {
     let env = Env::default();
-    let admin = Address::random(&env);
-    let lockup_token_address = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
+    let lockup_token_address = Address::from_string_bytes(&Bytes::new(&env));
     
     let vesting_id_1 = 1u32;
     let vesting_id_2 = 2u32;
@@ -223,9 +223,9 @@ fn test_multiple_vesting_ids_lockup_configuration() {
 #[test]
 fn test_claim_with_lockup_respects_existing_features() {
     let env = Env::default();
-    let admin = Address::random(&env);
-    let user = Address::random(&env);
-    let lockup_token_address = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
+    let user = Address::from_string_bytes(&Bytes::new(&env));
+    let lockup_token_address = Address::from_string_bytes(&Bytes::new(&env));
     
     let vesting_id = 1u32;
     let lockup_duration = 86400u64;

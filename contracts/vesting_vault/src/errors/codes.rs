@@ -52,6 +52,8 @@ pub enum Error {
     DocumentVerificationFailed = 409,
     AccreditationStatusInvalid = 410,
     TaxComplianceFailed = 411,
+    /// Tax liquidation (swap/transfer) failed during claim processing
+    TaxLiquidationFailed = 421,
     RegulatoryBlockActive = 412,
     WhitelistNotApproved = 413,
     BlacklistViolation = 414,
