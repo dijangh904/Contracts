@@ -28,6 +28,7 @@ pub enum Error {
     MilestoneAlreadyTriggered = 212,
     MilestoneNotSequential = 213,
     VestingExpired = 214,
+    CliffJumpTooLarge = 215,
 
     // Financial (300s)
     InsufficientBalance = 300,

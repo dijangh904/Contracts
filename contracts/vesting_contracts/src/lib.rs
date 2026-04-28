@@ -3048,6 +3048,34 @@ impl VestingContract {
         }
     }
 
+    /// Maximum cliff-to-total-duration ratio in basis points (50%).
+    /// A linear ramp whose cliff exceeds this fraction of the total vesting
+    /// period would produce an unacceptably large "cliff-jump" on first claim.
+    const MAX_CLIFF_RATIO_BPS: u64 = 5000;
+
+    /// Validates that a linear ramp schedule does not produce a cliff-jump
+    /// larger than [`MAX_CLIFF_RATIO_BPS`] of the total vesting period.
+    ///
+    /// Only enforced when `step_duration == 0` (pure linear) and a cliff is
+    /// present (`start_time > grant_time`).
+    ///
+    /// # Errors
+    /// Panics with [`Error::CliffJumpTooLarge`] when the cliff ratio exceeds
+    /// the maximum.
+    fn check_cliff_jump_smoothness(grant_time: u64, start_time: u64, end_time: u64, step_duration: u64) {
+        // Only applies to linear ramps with an explicit cliff.
+        if step_duration != 0 || start_time <= grant_time {
+            return;
+        }
+        let total_duration = end_time - grant_time;
+        let cliff_duration = start_time - grant_time;
+        // cliff_ratio_bps = cliff_duration * 10_000 / total_duration
+        let cliff_ratio_bps = cliff_duration * 10_000 / total_duration;
+        if cliff_ratio_bps > Self::MAX_CLIFF_RATIO_BPS {
+            panic!("CliffJumpTooLarge");
+        }
+    }
+
     fn create_vault_full_internal(
         env: &Env,
         owner: Address,
@@ -3138,6 +3166,8 @@ impl VestingContract {
         is_initialized: bool,
     ) -> u64 {
         Self::require_valid_duration(start_time, end_time);
+        let grant_time = env.ledger().timestamp();
+        Self::check_cliff_jump_smoothness(grant_time, start_time, end_time, step_duration);
         let id = Self::increment_vault_count(env);
         let title = String::from_str(env, "");
         let vault = Vault {
