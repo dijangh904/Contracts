@@ -587,3 +587,138 @@ pub struct UpgradeBlocked {
     pub total_unvested_balance: i128,
     pub blocked_at: u64,
 }
+
+// ========== ISSUE #268: Cross-Chain Vesting Synchronization via Wormhole ==========
+
+/// Wormhole chain IDs for supported networks
+/// Reference: https://docs.wormhole.com/wormhole/reference/chain-ids
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChainId {
+    Stellar = 1,
+    Ethereum = 2,
+    Solana = 3,
+    Bsc = 4,
+    Polygon = 5,
+    Avalanche = 6,
+    Optimism = 10,
+    Arbitrum = 11,
+    Base = 23,
+}
+
+/// Verified Action Approval (VAA) from Wormhole Guardians
+/// This is the signed message that proves cross-chain intent
+#[contracttype]
+#[derive(Clone)]
+pub struct VAA {
+    /// Version of the VAA format
+    pub version: u8,
+    /// Guardian set index that signed this VAA
+    pub guardian_set_index: u32,
+    /// Chain ID where the VAA was emitted
+    pub emitter_chain: ChainId,
+    /// Address of the emitter contract
+    pub emitter_address: BytesN<32>,
+    /// Sequence number for replay protection
+    pub sequence: u64,
+    /// Consistency level of the VAA
+    pub consistency_level: u8,
+    /// Timestamp when the VAA was created
+    pub timestamp: u64,
+    /// Signatures from the guardians
+    pub signatures: Vec<BytesN<65>>,
+    /// Payload data (contains the cross-chain message)
+    pub payload: Bytes,
+}
+
+/// Cross-chain claim payload embedded in VAA
+#[contracttype]
+#[derive(Clone)]
+pub struct CrossChainClaimPayload {
+    /// Original vesting ID on Soroban
+    pub vesting_id: u32,
+    /// Beneficiary address on Soroban
+    pub soroban_beneficiary: Address,
+    /// Amount to claim
+    pub amount: i128,
+    /// Destination chain ID
+    pub destination_chain: ChainId,
+    /// Recipient address on destination chain (encoded as bytes)
+    pub destination_address: Bytes,
+    /// Nonce for replay protection
+    pub nonce: u64,
+}
+
+/// Bridge configuration for Wormhole integration
+#[contracttype]
+#[derive(Clone)]
+pub struct BridgeConfig {
+    /// Whether the bridge is currently paused
+    pub is_paused: bool,
+    /// Wormhole core contract address on Stellar
+    pub wormhole_core_address: Address,
+    /// Supported destination chains
+    pub supported_chains: Vec<ChainId>,
+    /// Maximum amount that can be bridged per transaction
+    pub max_bridge_amount: i128,
+    /// Minimum delay between bridge operations (in seconds)
+    pub bridge_cooldown: u64,
+}
+
+/// Queued claim for when bridge is paused
+#[contracttype]
+#[derive(Clone)]
+pub struct QueuedClaim {
+    /// Original vesting ID
+    pub vesting_id: u32,
+    /// Beneficiary address
+    pub beneficiary: Address,
+    /// Amount to claim
+    pub amount: i128,
+    /// Destination chain
+    pub destination_chain: ChainId,
+    /// Destination address
+    pub destination_address: Bytes,
+    /// Nonce for replay protection
+    pub nonce: u64,
+    /// Timestamp when the claim was queued
+    pub queued_at: u64,
+    /// VAA associated with this claim
+    pub vaa: VAA,
+}
+
+/// Cross-chain claim event emitted when a claim is initiated
+#[contractevent]
+#[derive(Clone)]
+pub struct CrossChainClaimInitiated {
+    #[topic]
+    pub soroban_beneficiary: Address,
+    #[topic]
+    pub vesting_id: u32,
+    pub amount: i128,
+    pub destination_chain: ChainId,
+    pub destination_address: Bytes,
+    pub nonce: u64,
+    pub timestamp: u64,
+}
+
+/// Event emitted when a queued claim is processed after bridge unpause
+#[contractevent]
+#[derive(Clone)]
+pub struct QueuedClaimProcessed {
+    #[topic]
+    pub beneficiary: Address,
+    #[topic]
+    pub vesting_id: u32,
+    pub amount: i128,
+    pub processed_at: u64,
+}
+
+/// Event emitted when bridge is paused/unpaused
+#[contractevent]
+#[derive(Clone)]
+pub struct BridgePauseToggled {
+    pub is_paused: bool,
+    pub paused_by: Address,
+    pub timestamp: u64,
+}
