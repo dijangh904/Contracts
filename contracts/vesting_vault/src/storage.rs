@@ -261,6 +261,30 @@ pub fn remove_lockup_config(e: &Env, vesting_id: u32) {
     e.storage().instance().remove(&(LOCKUP_CONFIGS, vesting_id));
 }
 
+// ========== TAX CONFIGURATION STORAGE ==========
+pub const TAX_CONFIGS: &str = "TAX_CONFIGS"; // keyed by vesting_id
+pub const CUMULATIVE_TAXES: &str = "CUMULATIVE_TAXES"; // keyed by (vesting_id, authority)
+
+pub fn get_tax_config(e: &Env, vesting_id: u32) -> Option<crate::types::TaxConfig> {
+    e.storage().instance().get(&(TAX_CONFIGS, vesting_id))
+}
+
+pub fn set_tax_config(e: &Env, vesting_id: u32, cfg: &crate::types::TaxConfig) {
+    e.storage().instance().set(&(TAX_CONFIGS, vesting_id), cfg);
+}
+
+pub fn get_cumulative_taxes(e: &Env, vesting_id: u32, authority: &Address) -> i128 {
+    e.storage()
+        .instance()
+        .get(&(CUMULATIVE_TAXES, vesting_id, authority.clone()))
+        .unwrap_or(0i128)
+}
+
+pub fn add_cumulative_taxes(e: &Env, vesting_id: u32, authority: &Address, amount: i128) {
+    let prev = get_cumulative_taxes(e, vesting_id, authority);
+    e.storage().instance().set(&(CUMULATIVE_TAXES, vesting_id, authority.clone()), &(prev + amount));
+}
+
 // Beneficiary reassignment and governance veto storage functions
 pub fn get_reassignment_counter(e: &Env) -> u32 {
     e.storage()

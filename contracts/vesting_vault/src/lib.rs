@@ -10,7 +10,7 @@ pub mod errors;
 
 pub use types::*;
 use errors::Error;
-use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_lst_config, set_lst_config, get_unvested_balance, set_unvested_balance, get_admin_dead_man_switch, set_admin_dead_man_switch, get_oracle_price_record, set_oracle_price_record, get_contract_total_unvested, set_contract_total_unvested};
+use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_lst_config, set_lst_config, get_unvested_balance, set_unvested_balance, get_admin_dead_man_switch, set_admin_dead_man_switch, get_oracle_price_record, set_oracle_price_record, get_contract_total_unvested, set_contract_total_unvested, get_tax_config, set_tax_config, get_cumulative_taxes, add_cumulative_taxes };
 use emergency::{AuditorPauseRequest, EmergencyPause, EmergencyPauseTriggered};
 
 #[contract]
@@ -184,11 +184,70 @@ impl VestingVault {
 
         // TODO: your base token vesting logic here
 
+        // Determine gross amount to release (caller-specified for now)
+        let gross = amount;
+
+        // Compute tax withholding if a tax config exists
+        if let Some(cfg) = get_tax_config(&e, vesting_id) {
+            if cfg.tax_bps > 0 {
+                // Ceil division to avoid underpaying the authority due to truncation
+                let numerator: i128 = gross.checked_mul(cfg.tax_bps as i128).ok_or(Error::Overflow)?;
+                let tax = (numerator + 9_999i128) / 10_000i128; // ceil(div by 10000)
+                if tax > 0 {
+                    // Attempt liquidation (swap if required). In this implementation we
+                    // simulate swap success only if tax_asset is None or path payment is enabled.
+                    let swap_ok = match cfg.tax_asset.clone() {
+                        None => true,
+                        Some(_asset) => {
+                            if let Some(path_cfg) = get_path_payment_config(&e) {
+                                path_cfg.enabled
+                            } else { false }
+                        }
+                    };
+
+                    if !swap_ok {
+                        return Err(Error::TaxLiquidationFailed);
+                    }
+
+                    // Record cumulative taxes and emit event. Actual token transfers/swaps
+                    // should be implemented via a DEX adapter; we only update accounting here.
+                    add_cumulative_taxes(&e, vesting_id, &cfg.authority, tax);
+
+                    let net = gross - tax;
+
+                    let mut history = get_claim_history(&e);
+
+                    let event = ClaimEvent {
+                        beneficiary: user.clone(),
+                        amount: net,
+                        timestamp: e.ledger().timestamp(),
+                        vesting_id,
+                    };
+
+                    history.push_back(event);
+                    set_claim_history(&e, &history);
+
+                    TaxWithheld {
+                        vesting_id,
+                        beneficiary: user.clone(),
+                        gross_amount: gross,
+                        tax_amount: tax,
+                        net_amount: net,
+                        tax_asset: cfg.tax_asset.clone(),
+                        timestamp: e.ledger().timestamp(),
+                    }.publish(&e);
+
+                    return Ok(());
+                }
+            }
+        }
+
+        // No tax configured or tax is zero: record full amount
         let mut history = get_claim_history(&e);
 
         let event = ClaimEvent {
             beneficiary: user.clone(),
-            amount,
+            amount: gross,
             timestamp: e.ledger().timestamp(),
             vesting_id,
         };

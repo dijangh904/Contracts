@@ -85,6 +85,28 @@ pub struct ClaimSimulation {
     pub reason: String,
 }
 
+// Tax configuration for a vesting schedule
+#[contracttype]
+#[derive(Clone)]
+pub struct TaxConfig {
+    pub tax_bps: u32, // basis points (10000 = 100%)
+    pub authority: Address, // tax authority receiving payments
+    pub tax_asset: Option<Address>, // if Some, tax must be paid in this asset (may require swap)
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct TaxWithheld {
+    #[topic]
+    pub vesting_id: u32,
+    pub beneficiary: Address,
+    pub gross_amount: i128,
+    pub tax_amount: i128,
+    pub net_amount: i128,
+    pub tax_asset: Option<Address>,
+    pub timestamp: u64,
+}
+
 // Reputation bridge types
 #[contracttype]
 #[derive(Clone)]
