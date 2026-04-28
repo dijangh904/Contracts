@@ -1,17 +1,16 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, Env, Address, Vec, Map, String, BytesN, Bytes, IntoVal};
+use soroban_sdk::{contract, contractimpl, Env, Address, Vec, Map, String, BytesN, IntoVal};
 
 mod storage;
 pub mod types;
 mod audit_exporter;
 mod emergency;
 pub mod errors;
-mod zk_verifier;
 
 pub use types::*;
 use errors::Error;
-use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_lst_config, set_lst_config, get_unvested_balance, set_unvested_balance, get_admin_dead_man_switch, set_admin_dead_man_switch, get_oracle_price_record, set_oracle_price_record, get_contract_total_unvested, set_contract_total_unvested, get_confidential_grant, set_confidential_grant, remove_confidential_grant, get_master_viewing_key, set_master_viewing_key, remove_master_viewing_key, is_nullifier_in_set, add_nullifier_to_set, get_stream_pause, set_stream_pause, remove_stream_pause, is_stream_paused, get_stream_pause_history, add_stream_pause_to_history};
+use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_lst_config, set_lst_config, get_unvested_balance, set_unvested_balance, get_admin_dead_man_switch, set_admin_dead_man_switch, get_oracle_price_record, set_oracle_price_record, get_contract_total_unvested, set_contract_total_unvested};
 use emergency::{AuditorPauseRequest, EmergencyPause, EmergencyPauseTriggered};
 
 #[contract]
@@ -20,15 +19,22 @@ pub struct VestingVault;
 #[contractimpl]
 impl VestingVault {
 
+    /// Claim vested tokens for a beneficiary.
+    ///
+    /// Runs the full compliance gate (KYC, sanctions, AML, etc.) before recording
+    /// the claim event.  The actual token transfer is left to the caller's vesting
+    /// logic; this function only validates and records.
+    ///
+    /// # Parameters
+    /// - `user`       – The beneficiary address; must sign the transaction.
+    /// - `vesting_id` – Identifier of the vesting schedule being claimed against.
+    /// - `amount`     – Number of tokens (in base units) to claim.
+    ///
+    /// # Errors
+    /// Returns a typed [`Error`] variant for every compliance failure (e.g.
+    /// `KycNotCompleted`, `AddressSanctioned`, `AmlThresholdExceeded`, …).
     pub fn claim(e: Env, user: Address, vesting_id: u32, amount: i128) -> Result<(), Error> {
         user.require_auth();
-
-        // ========== STREAM PAUSE CHECK ==========
-        
-        // Check if this specific stream is paused for suspicious activity
-        if is_stream_paused(&e, vesting_id, &user) {
-            return Err(Error::StreamPaused);
-        }
 
         // ========== COMPLIANCE CHECKS ==========
 
@@ -169,103 +175,34 @@ impl VestingVault {
             // Additional milestone logic would go here
         }
 
-        // Check LST configuration and auto-compound rewards before claim
+        // Check LST configuration
         if let Some(lst_config) = get_lst_config(&e, vesting_id) {
             if lst_config.enabled {
-                // Auto-compound rewards before calculating claim amount
-                let _ = Self::compound_lst_rewards(e.clone(), vesting_id);
-
-                // Calculate claim amount based on shares instead of static amount
-                let shares_based_amount = Self::calculate_shares_based_claim(&e, &user, vesting_id)?;
-
-                if shares_based_amount > 0 {
-                    // Use shares-based calculation for LST-enabled vesting
-                    let exchange_rate = Self::get_lst_exchange_rate(&e, &lst_config.lst_token_address);
-                    // Rebasing math: exchange rate has 7 decimal precision (e.g. 1 LST = 1 Base -> 10,000,000)
-                    // LST amount = (Base amount * exchange rate) / 10_000_000
-                    let lst_amount = (shares_based_amount * exchange_rate) / 10_000_000i128;
-
-                    LSTClaimExecuted {
-                        user: user.clone(),
-                        vesting_id,
-                        base_amount: shares_based_amount,
-                        lst_amount,
-                        lst_token_address: lst_config.lst_token_address.clone(),
-                        timestamp: e.ledger().timestamp(),
-                    }.publish(&e);
-
-                    // Update the amount to use the shares-based calculation
-                    // Note: In a real implementation, this would replace the amount parameter
-                    // For now, we emit the event but keep the original amount for compatibility
-                }
+                let exchange_rate = Self::get_lst_exchange_rate(&e, &lst_config.lst_token_address);
+                // Rebasing math: exchange rate has 7 decimal precision (e.g. 1 LST = 1 Base -> 10,000,000)
+                // LST amount = (Base amount * exchange rate) / 10_000_000
+                let lst_amount = (amount * exchange_rate) / 10_000_000i128;
+                
+                LSTClaimExecuted {
+                    user: user.clone(),
+                    vesting_id,
+                    base_amount: amount,
+                    lst_amount,
+                    lst_token_address: lst_config.lst_token_address.clone(),
+                    timestamp: e.ledger().timestamp(),
+                }.publish(&e);
+                
+                // TODO: Execute actual LST token transfer here using lst_amount
             }
         }
 
         // TODO: your base token vesting logic here
 
-        // Determine gross amount to release (caller-specified for now)
-        let gross = amount;
-
-        // Compute tax withholding if a tax config exists
-        if let Some(cfg) = get_tax_config(&e, vesting_id) {
-            if cfg.tax_bps > 0 {
-                // Ceil division to avoid underpaying the authority due to truncation
-                let numerator: i128 = gross.checked_mul(cfg.tax_bps as i128).ok_or(Error::Overflow)?;
-                let tax = (numerator + 9_999i128) / 10_000i128; // ceil(div by 10000)
-                if tax > 0 {
-                    // Attempt liquidation (swap if required). In this implementation we
-                    // simulate swap success only if tax_asset is None or path payment is enabled.
-                    let swap_ok = match cfg.tax_asset.clone() {
-                        None => true,
-                        Some(_asset) => {
-                            if let Some(path_cfg) = get_path_payment_config(&e) {
-                                path_cfg.enabled
-                            } else { false }
-                        }
-                    };
-
-                    if !swap_ok {
-                        return Err(Error::TaxLiquidationFailed);
-                    }
-
-                    // Record cumulative taxes and emit event. Actual token transfers/swaps
-                    // should be implemented via a DEX adapter; we only update accounting here.
-                    add_cumulative_taxes(&e, vesting_id, &cfg.authority, tax);
-
-                    let net = gross - tax;
-
-                    let mut history = get_claim_history(&e);
-
-                    let event = ClaimEvent {
-                        beneficiary: user.clone(),
-                        amount: net,
-                        timestamp: e.ledger().timestamp(),
-                        vesting_id,
-                    };
-
-                    history.push_back(event);
-                    set_claim_history(&e, &history);
-
-                    TaxWithheld {
-                        vesting_id,
-                        beneficiary: user.clone(),
-                        gross_amount: gross,
-                        tax_amount: tax,
-                        net_amount: net,
-                        timestamp: e.ledger().timestamp(),
-                    }.publish(&e);
-
-                    return Ok(());
-                }
-            }
-        }
-
-        // No tax configured or tax is zero: record full amount
         let mut history = get_claim_history(&e);
 
         let event = ClaimEvent {
             beneficiary: user.clone(),
-            amount: gross,
+            amount,
             timestamp: e.ledger().timestamp(),
             vesting_id,
         };
@@ -281,16 +218,6 @@ impl VestingVault {
     /// This provides multi-layer defense against phishing hacks
     pub fn set_authorized_payout_address(e: Env, beneficiary: Address, authorized_address: Address) {
         beneficiary.require_auth();
-        
-        // Additional security: Verify authorized address is valid
-        if authorized_address == beneficiary {
-            panic!("Authorized address cannot be the same as beneficiary");
-        }
-        
-        // Additional security: Check if there's already a pending request
-        if let Some(_pending) = storage_get_pending_address_request(&e, &beneficiary) {
-            panic!("Address change request already pending");
-        }
         
         let current_time = e.ledger().timestamp();
         let effective_at = current_time + get_timelock_duration();
@@ -312,23 +239,18 @@ impl VestingVault {
 
     /// Confirms and activates a pending authorized payout address request
     /// Can only be called after the 48-hour timelock period has passed
-    pub fn confirm_auth_payout_addr(e: Env, beneficiary: Address) {
+    pub fn confirm_auth_payout_addr(e: Env, beneficiary: Address) -> Result<(), Error> {
         beneficiary.require_auth();
         
-        // Additional security: Verify caller is the beneficiary
-        let pending_request = storage_get_pending_address_request(&e, &beneficiary)
-            .expect("No pending address request found");
-        
-        // Verify the pending request belongs to the caller
-        if pending_request.beneficiary != beneficiary {
-            panic!("Unauthorized: Request does not belong to caller");
-        }
-        
         let current_time = e.ledger().timestamp();
+        
+        // Get the pending request
+        let pending_request = storage_get_pending_address_request(&e, &beneficiary)
+            .ok_or(Error::InvalidInput)?;
 
         // Check if timelock has passed
         if current_time < pending_request.effective_at {
-            panic!("Timelock period has not yet passed");
+            return Err(Error::TimelockNotElapsed);
         }
 
         // Create the authorized address record
@@ -372,11 +294,15 @@ impl VestingVault {
         storage_remove_pending_address_request(&e, &beneficiary);
     }
 
-    // 🔍 helper getter (needed for exporter)
+    /// Return the full on-chain claim history (needed by the audit exporter).
     pub fn get_all_claims(e: Env) -> Vec<ClaimEvent> {
         get_claim_history(&e)
     }
 
+    /// Return all claim events for a specific beneficiary.
+    ///
+    /// # Parameters
+    /// - `user` – The beneficiary whose claim history is requested.
     pub fn get_claims_by_user(e: Env, user: Address) -> Vec<ClaimEvent> {
         audit_exporter::export_claims_by_user(&e, user)
     }
@@ -384,25 +310,43 @@ impl VestingVault {
     // ========== ISSUE #140: Emergency Protocol Pause for Auditors ==========
     
     /// Initialize the auditor security team
-    pub fn initialize_auditors(e: Env, admin: Address, auditors: Vec<Address>) {
+    /// Initialise the 2-of-3 auditor multisig security team.
+    ///
+    /// # Parameters
+    /// - `admin`    – Must sign; only the admin may set auditors.
+    /// - `auditors` – Exactly 3 auditor addresses required.
+    ///
+    /// # Errors
+    /// - `InvalidInput` if `auditors.len() != 3`.
+    pub fn initialize_auditors(e: Env, admin: Address, auditors: Vec<Address>) -> Result<(), Error> {
         admin.require_auth();
         
         // Require exactly 3 auditors for 2-out-of-3 multisig
         if auditors.len() != 3 {
-            panic!("Must have exactly 3 auditors");
+            return Err(Error::InvalidInput);
         }
         
         set_auditors(&e, &auditors);
+
+        Ok(())
     }
 
     /// Request emergency pause by an auditor
-    pub fn request_emergency_pause(e: Env, auditor: Address, reason: String) {
+    /// Submit an emergency-pause request from an authorised auditor.
+    ///
+    /// When 2 of the 3 registered auditors have requested a pause the contract
+    /// is automatically frozen for the configured pause duration.
+    ///
+    /// # Errors
+    /// - `Unauthorized`  – caller is not a registered auditor.
+    /// - `AlreadyVoted`  – this auditor already submitted a request.
+    pub fn request_emergency_pause(e: Env, auditor: Address, reason: String) -> Result<(), Error> {
         auditor.require_auth();
         
         // Verify caller is an authorized auditor
         let authorized_auditors = get_auditors(&e);
         if !authorized_auditors.contains(&auditor) {
-            panic!("Not an authorized auditor");
+            return Err(Error::Unauthorized);
         }
         
         let current_time = e.ledger().timestamp();
@@ -410,7 +354,7 @@ impl VestingVault {
         
         // Check if auditor already requested
         if requests.contains_key(auditor.clone()) {
-            panic!("Auditor already requested pause");
+            return Err(Error::AlreadyVoted);
         }
         
         let request = AuditorPauseRequest {
@@ -426,6 +370,8 @@ impl VestingVault {
         if requests.len() >= 2 {
             Self::trigger_emergency_pause(&e);
         }
+
+        Ok(())
     }
 
     /// Internal function to trigger emergency pause
@@ -461,6 +407,7 @@ impl VestingVault {
     }
 
     /// Check if contract is currently paused
+    /// Returns `true` if the contract is currently under an active emergency pause.
     pub fn is_emergency_paused(e: Env) -> bool {
         if let Some(pause) = get_emergency_pause(&e) {
             if pause.is_active {
@@ -472,89 +419,9 @@ impl VestingVault {
     }
 
     /// Get current emergency pause status
+    /// Returns the current emergency-pause record, or `None` if no pause is active.
     pub fn get_emergency_pause_status(e: Env) -> Option<EmergencyPause> {
         get_emergency_pause(&e)
-    }
-
-    // ========== STREAM PAUSE FOR SUSPICIOUS ACTIVITY ==========
-    
-    /// Pause a specific vesting stream for suspicious activity
-    pub fn pause_stream(
-        e: Env,
-        admin: Address,
-        vesting_id: u32,
-        beneficiary: Address,
-        reason: types::StreamPauseReason,
-        notes: String,
-    ) {
-        admin.require_auth();
-        
-        let current_time = e.ledger().timestamp();
-        
-        let pause = types::StreamPause {
-            vesting_id,
-            beneficiary: beneficiary.clone(),
-            paused_at: current_time,
-            paused_by: admin.clone(),
-            reason: reason.clone(),
-            is_active: true,
-            notes: notes.clone(),
-        };
-        
-        set_stream_pause(&e, vesting_id, &beneficiary, &pause);
-        add_stream_pause_to_history(&e, &pause);
-        
-        // Emit event
-        types::StreamPaused {
-            vesting_id,
-            beneficiary: beneficiary.clone(),
-            paused_at: current_time,
-            paused_by: admin,
-            reason,
-        }.publish(&e);
-    }
-    
-    /// Unpause a specific vesting stream after review
-    pub fn unpause_stream(
-        e: Env,
-        admin: Address,
-        vesting_id: u32,
-        beneficiary: Address,
-    ) {
-        admin.require_auth();
-        
-        // Check if stream is actually paused
-        if !is_stream_paused(&e, vesting_id, &beneficiary) {
-            panic!("Stream is not paused");
-        }
-        
-        let current_time = e.ledger().timestamp();
-        
-        // Remove the pause
-        remove_stream_pause(&e, vesting_id, &beneficiary);
-        
-        // Emit event
-        types::StreamUnpaused {
-            vesting_id,
-            beneficiary: beneficiary.clone(),
-            unpaused_at: current_time,
-            unpaused_by: admin,
-        }.publish(&e);
-    }
-    
-    /// Check if a specific stream is paused
-    pub fn is_stream_paused_check(e: Env, vesting_id: u32, beneficiary: Address) -> bool {
-        is_stream_paused(&e, vesting_id, &beneficiary)
-    }
-    
-    /// Get stream pause details
-    pub fn get_stream_pause_info(e: Env, vesting_id: u32, beneficiary: Address) -> Option<types::StreamPause> {
-        get_stream_pause(&e, vesting_id, &beneficiary)
-    }
-    
-    /// Get all stream pause history
-    pub fn get_all_stream_pauses(e: Env) -> Vec<types::StreamPause> {
-        get_stream_pause_history(&e)
     }
 
     // ========== ISSUE #137: Vesting Simulate Claim Dry-Run Helper ==========
@@ -562,18 +429,6 @@ impl VestingVault {
     /// Simulate a claim to show exact amounts without consuming gas
     pub fn simulate_claim(e: Env, user: Address, _vesting_id: u32) -> ClaimSimulation {
         let current_time = e.ledger().timestamp();
-        
-        // Check if stream is paused for suspicious activity
-        if is_stream_paused(&e, _vesting_id, &user) {
-            return ClaimSimulation {
-                tokens_to_release: 0,
-                estimated_gas_fee: 0,
-                tax_withholding_amount: 0,
-                net_amount: 0,
-                can_claim: false,
-                reason: String::from_str(&e, "Stream paused due to suspicious activity"),
-            };
-        }
         
         // Check if contract is under emergency pause
         if let Some(pause) = get_emergency_pause(&e) {
@@ -627,18 +482,24 @@ impl VestingVault {
     // ========== ISSUE #139: Cross-Project Reputation Bonus Hook ==========
     
     /// Set the reputation bridge contract address
+    /// Set the cross-project reputation bridge contract address (admin only).
     pub fn set_reputation_bridge(e: Env, admin: Address, bridge_contract: Address) {
         admin.require_auth();
         set_reputation_bridge_contract(&e, &bridge_contract);
     }
 
     /// Apply reputation bonus based on cross-project success
-    pub fn apply_reputation_bonus(e: Env, beneficiary: Address) {
+    /// Apply a cliff-reduction reputation bonus for a beneficiary who has
+    /// achieved 100 % completion on a linked project.
+    ///
+    /// # Errors
+    /// - `AlreadyInitialized` – bonus has already been applied for this address.
+    pub fn apply_reputation_bonus(e: Env, beneficiary: Address) -> Result<(), Error> {
         beneficiary.require_auth();
         
         // Check if bonus already applied
         if has_reputation_bonus_applied(&e, &beneficiary) {
-            panic!("Reputation bonus already applied");
+            return Err(Error::AlreadyInitialized);
         }
         
         // Get reputation bridge contract
@@ -659,9 +520,12 @@ impl VestingVault {
             // Emit event
             ReputationBonusApplied { beneficiary: beneficiary.clone(), cliff_reduction_months: cliff_reduction, applied_at: current_time }.publish(&e);
         }
+
+        Ok(())
     }
 
     /// Check if user has reputation bonus applied
+    /// Returns `true` if the reputation bonus has already been applied for `beneficiary`.
     pub fn has_reputation_bonus(e: Env, beneficiary: Address) -> bool {
         has_reputation_bonus_applied(&e, &beneficiary)
     }
@@ -669,7 +533,14 @@ impl VestingVault {
     // ========== ISSUE #138: Milestone-Gated Step Vesting ==========
     
     /// Configure milestone vesting for a vesting schedule
-    pub fn configure_milestone_vesting(e: Env, admin: Address, vesting_id: u32, milestone_percentages: Vec<u32>) {
+    /// Configure milestone-gated step vesting for a schedule.
+    ///
+    /// Each entry in `milestone_percentages` is the percentage of total tokens
+    /// unlocked when that milestone is completed.  The values must sum to 100.
+    ///
+    /// # Errors
+    /// - `InvalidInput` – percentages do not sum to 100.
+    pub fn configure_milestone_vesting(e: Env, admin: Address, vesting_id: u32, milestone_percentages: Vec<u32>) -> Result<(), Error> {
         admin.require_auth();
         
         // Validate percentages sum to 100
@@ -679,7 +550,7 @@ impl VestingVault {
         }
         
         if total != 100 {
-            panic!("Milestone percentages must sum to 100");
+            return Err(Error::InvalidInput);
         }
         
         let _config = MilestoneConfig {
@@ -689,23 +560,32 @@ impl VestingVault {
         };
         
         set_milestone_configs(&e, vesting_id, &milestone_percentages);
+
+        Ok(())
     }
 
     /// Complete a milestone (admin only)
-    pub fn complete_milestone(e: Env, admin: Address, vesting_id: u32, milestone_number: u32) {
+    /// Mark a milestone as completed, unlocking the associated token tranche.
+    ///
+    /// Milestones must be completed sequentially (N-1 before N).
+    ///
+    /// # Errors
+    /// - `AlreadyInitialized`   – milestone already completed.
+    /// - `MilestoneNotCompleted` – previous milestone not yet completed.
+    pub fn complete_milestone(e: Env, admin: Address, vesting_id: u32, milestone_number: u32) -> Result<(), Error> {
         admin.require_auth();
         
         let mut status = get_milestone_status(&e, vesting_id);
         
         // Check if milestone already completed
         if status.contains_key(milestone_number) {
-            panic!("Milestone already completed");
+            return Err(Error::AlreadyInitialized);
         }
         
         // Check sequential completion (milestone N-1 must be completed)
         if milestone_number > 1 {
             if !status.contains_key(milestone_number - 1) {
-                panic!("Previous milestone must be completed first");
+                return Err(Error::MilestoneNotCompleted);
             }
         }
         
@@ -715,14 +595,18 @@ impl VestingVault {
         
         // Emit event
         MilestoneCompleted { vesting_id, milestone_number, completed_at: e.ledger().timestamp() }.publish(&e);
+
+        Ok(())
     }
 
     /// Get milestone status for a vesting schedule
+    /// Return the completion status map (`milestone_number -> completed`) for a schedule.
     pub fn get_milestone_status(e: Env, vesting_id: u32) -> Map<u32, bool> {
         get_milestone_status(&e, vesting_id)
     }
 
     /// Get milestone configuration for a vesting schedule
+    /// Return the milestone percentage configuration for a schedule, if set.
     pub fn get_milestone_config(e: Env, vesting_id: u32) -> Option<Vec<u32>> {
         get_milestone_configs(&e, vesting_id)
     }
@@ -731,12 +615,12 @@ impl VestingVault {
     
     /// Create a commitment for future private claims
     /// This function allows users to create a commitment that can be used for private claims later
-    pub fn create_commitment(e: Env, user: Address, vesting_id: u32, amount: i128, commitment_hash: BytesN<32>) {
+    pub fn create_commitment(e: Env, user: Address, vesting_id: u32, amount: i128, commitment_hash: BytesN<32>) -> Result<(), Error> {
         user.require_auth();
         
         // Check if commitment already exists
         if get_commitment(&e, &commitment_hash).is_some() {
-            panic!("Commitment already exists");
+            return Err(Error::AlreadyInitialized);
         }
         
         let current_time = e.ledger().timestamp();
@@ -755,11 +639,13 @@ impl VestingVault {
         
         // Emit event
         CommitmentCreated { commitment_hash, vesting_id, amount, created_at: current_time }.publish(&e);
+
+        Ok(())
     }
     
     /// Execute a private claim using ZK proof
     /// This function allows users to claim tokens without revealing their identity
-    pub fn private_claim(e: Env, zk_proof: ZKClaimProof, nullifier: Nullifier, amount: i128) {
+    pub fn private_claim(e: Env, zk_proof: ZKClaimProof, nullifier: Nullifier, amount: i128) -> Result<(), Error> {
         // No require_auth() - this is a privacy feature
         
         // Check if contract is under emergency pause
@@ -767,7 +653,7 @@ impl VestingVault {
             if pause.is_active {
                 let current_time = e.ledger().timestamp();
                 if current_time < pause.expires_at {
-                    panic!("Contract is under emergency pause until {}", pause.expires_at);
+                    return Err(Error::ContractPaused);
                 } else {
                     // Pause expired, remove it
                     remove_emergency_pause(&e);
@@ -777,25 +663,25 @@ impl VestingVault {
         
         // Check if nullifier has already been used (prevent double-spending)
         if is_nullifier_used(&e, &nullifier) {
-            panic!("Nullifier has already been used");
+            return Err(Error::AlreadyInitialized);
         }
         
         // Verify the commitment exists and is not used
         let commitment = get_commitment(&e, &zk_proof.commitment_hash)
-            .expect("Commitment not found");
+            .ok_or(Error::VaultNotFound)?;
         
         if commitment.is_used {
-            panic!("Commitment has already been used");
+            return Err(Error::AlreadyFullyClaimed);
         }
         
         // Verify the commitment amount matches the claim amount
         if commitment.amount != amount {
-            panic!("Claim amount does not match commitment amount");
+            return Err(Error::InvalidAmount);
         }
         
         // Verify the Merkle root is valid (for ZK proof verification)
         if !is_valid_merkle_root(&e, &zk_proof.merkle_root) {
-            panic!("Invalid Merkle root");
+            return Err(Error::InvalidInput);
         }
         
         // TODO: Verify actual ZK-SNARK proof
@@ -827,38 +713,46 @@ impl VestingVault {
         
         // TODO: Execute actual token transfer
         // This would integrate with the existing vesting logic
+
+        Ok(())
     }
     
     /// Add a Merkle root for ZK proof verification
     /// This function is called by the admin to add new Merkle roots
-    pub fn add_merkle_root_admin(e: Env, admin: Address, merkle_root: BytesN<32>) {
+    pub fn add_merkle_root_admin(e: Env, admin: Address, merkle_root: BytesN<32>) -> Result<(), Error> {
         admin.require_auth();
         
         // Check if Merkle root already exists
         if is_valid_merkle_root(&e, &merkle_root) {
-            panic!("Merkle root already exists");
+            return Err(Error::AlreadyInitialized);
         }
         
         // Add the Merkle root
         add_merkle_root(&e, &merkle_root);
+
+        Ok(())
     }
     
     /// Get all valid Merkle roots
+    /// Return all valid Merkle roots registered for ZK proof verification.
     pub fn get_merkle_roots(e: Env) -> Vec<BytesN<32>> {
         get_merkle_roots(&e)
     }
     
     /// Check if a nullifier has been used
+    /// Returns `true` if the given nullifier has already been consumed (double-spend guard).
     pub fn is_nullifier_used_public(e: Env, nullifier: Nullifier) -> bool {
         is_nullifier_used(&e, &nullifier)
     }
     
     /// Get commitment information
+    /// Return the commitment record for a given hash, or `None` if not found.
     pub fn get_commitment_info(e: Env, commitment_hash: BytesN<32>) -> Option<Commitment> {
         get_commitment(&e, &commitment_hash)
     }
     
     /// Get privacy claim history
+    /// Return the full history of private (ZK) claim events.
     pub fn get_privacy_claim_history(e: Env) -> Vec<PrivacyClaimEvent> {
         storage::get_privacy_claim_history(&e)
     }
@@ -926,20 +820,15 @@ impl VestingVault {
     
     /// Claim tokens with automatic path payment to USDC (Auto-Exit feature)
     /// This allows users to instantly swap their claimed tokens for USDC in one transaction
-    pub fn claim_with_path_payment(e: Env, user: Address, vesting_id: u32, amount: i128, min_destination_amount: Option<i128>) {
+    pub fn claim_with_path_payment(e: Env, user: Address, vesting_id: u32, amount: i128, min_destination_amount: Option<i128>) -> Result<(), Error> {
         user.require_auth();
-
-        // Check if stream is paused for suspicious activity
-        if is_stream_paused(&e, vesting_id, &user) {
-            panic!("Stream paused due to suspicious activity");
-        }
 
         // Check if contract is under emergency pause
         if let Some(pause) = get_emergency_pause(&e) {
             if pause.is_active {
                 let current_time = e.ledger().timestamp();
                 if current_time < pause.expires_at {
-                    panic!("Contract is under emergency pause until {}", pause.expires_at);
+                    return Err(Error::ContractPaused);
                 } else {
                     // Pause expired, remove it
                     remove_emergency_pause(&e);
@@ -949,10 +838,10 @@ impl VestingVault {
 
         // Get path payment configuration
         let config = get_path_payment_config(&e)
-            .expect("Path payment not configured");
+            .ok_or(Error::PathPaymentNotConfigured)?;
 
         if !config.enabled {
-            panic!("Path payment feature is disabled");
+            return Err(Error::PathPaymentDisabled);
         }
 
         // Use provided min_destination_amount or fallback to config
@@ -960,7 +849,7 @@ impl VestingVault {
         
         // Validate the amount
         if final_min_amount <= 0 {
-            panic!("Minimum destination amount must be positive");
+            return Err(Error::InvalidInput);
         }
 
         // TODO: Calculate actual vesting amounts and validate claim
@@ -968,12 +857,12 @@ impl VestingVault {
         let actual_claimable_amount = amount; // Placeholder - should calculate based on vesting schedule
         
         if actual_claimable_amount <= 0 {
-            panic!("No tokens available to claim");
+            return Err(Error::NothingToClaim);
         }
 
         // Execute the path payment using Stellar's built-in path_payment_strict_receive
         // This is the core of the Auto-Exit feature
-        let destination_amount = Self::execute_path_payment(&e, &user, actual_claimable_amount, &config.destination_asset, final_min_amount, &config.path);
+        let destination_amount = Self::execute_path_payment(&e, &user, actual_claimable_amount, &config.destination_asset, final_min_amount, &config.path)?;
         
         // Record the path payment claim event
         let current_time = e.ledger().timestamp();
@@ -1001,6 +890,8 @@ impl VestingVault {
         
         // Emit the path payment claim event
         PathPaymentClaimExecuted { user: user.clone(), source_amount: actual_claimable_amount, destination_amount, destination_asset: config.destination_asset.clone(), timestamp: current_time, vesting_id }.publish(&e);
+
+        Ok(())
     }
     
     /// Simulate a path payment claim to show expected amounts without consuming gas
@@ -1090,18 +981,20 @@ impl VestingVault {
     }
     
     /// Get current path payment configuration
+    /// Return the current path-payment (auto-exit) configuration, or `None` if not set.
     pub fn get_path_payment_config(e: Env) -> Option<PathPaymentConfig> {
         get_path_payment_config(&e)
     }
     
     /// Get path payment claim history
+    /// Return the history of all path-payment claim events.
     pub fn get_path_payment_claim_history(e: Env) -> Vec<PathPaymentClaimEvent> {
         get_path_payment_claim_history(&e)
     }
     
     /// Internal function to execute the path payment using Stellar's path_payment_strict_receive
     /// This is the core logic that enables the Auto-Exit feature
-    fn execute_path_payment(e: &Env, _beneficiary: &Address, source_amount: i128, destination_asset: &Address, min_destination_amount: i128, path: &Vec<Address>) -> i128 {
+    fn execute_path_payment(e: &Env, _beneficiary: &Address, source_amount: i128, destination_asset: &Address, min_destination_amount: i128, path: &Vec<Address>) -> Result<i128, Error> {
         // In a real Stellar Soroban implementation, this would use the built-in
         // path_payment_strict_receive function from the Stellar SDK
         
@@ -1117,19 +1010,15 @@ impl VestingVault {
         let simulated_destination_amount = Self::simulate_path_payment_result(e, source_amount, destination_asset, path);
         
         if simulated_destination_amount < min_destination_amount {
-            panic!("Path payment failed: insufficient liquidity for minimum destination amount");
+            return Err(Error::InsufficientLiquidity);
         }
         
-        simulated_destination_amount
-    }
-
-    /// Helper to simulate path payment result. Returns a conservative estimate.
-    fn simulate_path_payment_result(_e: &Env, source_amount: i128, _destination_asset: &Address, _path: &Vec<Address>) -> i128 {
-        // For now, assume 1:1 with no fees. Replace with DEX or oracle integration.
-        source_amount
+        Ok(simulated_destination_amount)
     }
     
     /// Check if a user's tokens are unlocked for a specific vesting schedule
+    /// Returns `true` if the lock-up period for `user` on `vesting_id` has elapsed
+    /// (or no lock-up is configured).
     pub fn is_user_unlocked(e: Env, user: Address, vesting_id: u32) -> bool {
         if let Some(lockup_config) = get_lockup_config(&e, vesting_id) {
             if lockup_config.enabled {
@@ -1145,6 +1034,8 @@ impl VestingVault {
     }
     
     /// Get the unlock time for a user's tokens
+    /// Return the Unix timestamp at which `user`'s tokens unlock for `vesting_id`,
+    /// or `None` if no lock-up is configured.
     pub fn get_user_unlock_time(e: Env, user: Address, vesting_id: u32) -> Option<u64> {
         if let Some(lockup_config) = get_lockup_config(&e, vesting_id) {
             if lockup_config.enabled {
@@ -1200,20 +1091,15 @@ impl VestingVault {
     
     /// Claim tokens with lock-up period handling
     /// This is the enhanced claim function that handles lock-up periods
-    pub fn claim_with_lockup(e: Env, user: Address, vesting_id: u32, amount: i128) {
+    pub fn claim_with_lockup(e: Env, user: Address, vesting_id: u32, amount: i128) -> Result<(), Error> {
         user.require_auth();
-
-        // Check if stream is paused for suspicious activity
-        if is_stream_paused(&e, vesting_id, &user) {
-            panic!("Stream paused due to suspicious activity");
-        }
 
         // Check if contract is under emergency pause
         if let Some(pause) = get_emergency_pause(&e) {
             if pause.is_active {
                 let current_time = e.ledger().timestamp();
                 if current_time < pause.expires_at {
-                    panic!("Contract is under emergency pause until {}", pause.expires_at);
+                    return Err(Error::ContractPaused);
                 } else {
                     // Pause expired, remove it
                     remove_emergency_pause(&e);
@@ -1228,7 +1114,7 @@ impl VestingVault {
                 
                 // Check if timelock has passed
                 if current_time < auth_address.effective_at {
-                    panic!("Authorized payout address is still in timelock period");
+                    return Err(Error::TimelockNotElapsed);
                 }
             }
         }
@@ -1261,6 +1147,8 @@ impl VestingVault {
         history.push_back(event);
 
         set_claim_history(&e, &history);
+
+        Ok(())
     }
     
     /// Internal function to issue wrapped tokens during lock-up period
@@ -1306,6 +1194,7 @@ impl VestingVault {
     // ========== ISSUE #114 & #212: Beneficiary Reassignment with Governance Veto ==========
 
     /// Initialize total token supply for governance calculations
+    /// Initialise the total token supply used for governance veto-power calculations.
     pub fn initialize_token_supply(e: Env, admin: Address, total_supply: i128) {
         admin.require_auth();
         
@@ -1318,6 +1207,7 @@ impl VestingVault {
     }
     
     /// Update total token supply (for dynamic supply tracking)
+    /// Update the total token supply (for dynamic supply tracking).
     pub fn update_token_supply(e: Env, admin: Address, new_total_supply: i128) {
         admin.require_auth();
         
@@ -1330,14 +1220,16 @@ impl VestingVault {
     }
     
     /// Set governance veto threshold percentage
-    pub fn set_governance_veto_threshold(e: Env, admin: Address, threshold_percentage: u32) {
+    pub fn set_governance_veto_threshold(e: Env, admin: Address, threshold_percentage: u32) -> Result<(), Error> {
         admin.require_auth();
         
         if threshold_percentage > 100 {
-            panic!("Threshold cannot exceed 100%");
+            return Err(Error::InvalidInput);
         }
         
         set_governance_veto_threshold(&e, threshold_percentage);
+
+        Ok(())
     }
     
     /// Request beneficiary reassignment with governance veto protection
@@ -1377,7 +1269,7 @@ impl VestingVault {
         set_beneficiary_reassignment(&e, reassignment_id, &reassignment);
         
         // Emit reassignment request event
-        e.events().publish(("beneficiary_reassignment_requested", reassignment_id), BeneficiaryReassignmentRequested {
+        BeneficiaryReassignmentRequested {
             reassignment_id,
             vesting_id,
             current_beneficiary: current_beneficiary.clone(),
@@ -1385,38 +1277,38 @@ impl VestingVault {
             total_amount,
             effective_at,
             requires_governance_veto,
-        });
+        }.publish(&e);
         
         // If governance veto is required, start veto period
         if requires_governance_veto {
-            e.events().publish(("veto_period_started", reassignment_id), VetoPeriodStarted {
+            VetoPeriodStarted {
                 reassignment_id,
                 vesting_id,
                 veto_deadline: effective_at,
                 threshold_percentage: threshold,
-            });
+            }.publish(&e);
         }
     }
     
     /// Execute beneficiary reassignment after timelock period
-    pub fn execute_beneficiary_reassignment(e: Env, reassignment_id: u32) {
+    pub fn execute_beneficiary_reassignment(e: Env, reassignment_id: u32) -> Result<(), Error> {
         let mut reassignment = get_beneficiary_reassignment(&e, reassignment_id)
-            .expect("Reassignment not found");
+            .ok_or(Error::VaultNotFound)?;
         
         if reassignment.is_executed {
-            panic!("Reassignment already executed");
+            return Err(Error::AlreadyInitialized);
         }
         
         let current_time = e.ledger().timestamp();
         
         if current_time < reassignment.effective_at {
-            panic!("Timelock period has not expired");
+            return Err(Error::TimelockNotElapsed);
         }
         
         // Check if governance veto was triggered
         if reassignment.requires_governance_veto {
             let veto_votes = get_veto_votes(&e, reassignment_id);
-            let total_veto_power: i128 = veto_votes.iter()
+            let total_veto_power = veto_votes.iter()
                 .filter(|vote| vote.vote_for_veto)
                 .map(|vote| vote.voting_power)
                 .sum();
@@ -1426,7 +1318,7 @@ impl VestingVault {
             let veto_threshold = (supply_info.total_supply * threshold as i128) / 100;
             
             if total_veto_power >= veto_threshold {
-                panic!("Reassignment vetoed by governance");
+                return Err(Error::QuorumNotMet);
             }
         }
         
@@ -1438,40 +1330,42 @@ impl VestingVault {
         // For now, we'll just emit the event
         
         // Emit execution event
-        e.events().publish(("beneficiary_reassignment_executed", reassignment_id), BeneficiaryReassignmentExecuted {
+        BeneficiaryReassignmentExecuted {
             reassignment_id,
             vesting_id: reassignment.vesting_id,
             old_beneficiary: reassignment.current_beneficiary,
             new_beneficiary: reassignment.new_beneficiary,
             executed_at: current_time,
-        });
+        }.publish(&e);
+
+        Ok(())
     }
     
     /// Cast a vote for or against a beneficiary reassignment
-    pub fn cast_veto_vote(e: Env, voter: Address, reassignment_id: u32, vote_for_veto: bool, voting_power: i128) {
+    pub fn cast_veto_vote(e: Env, voter: Address, reassignment_id: u32, vote_for_veto: bool, voting_power: i128) -> Result<(), Error> {
         voter.require_auth();
         
         let reassignment = get_beneficiary_reassignment(&e, reassignment_id)
-            .expect("Reassignment not found");
+            .ok_or(Error::VaultNotFound)?;
         
         if !reassignment.requires_governance_veto {
-            panic!("This reassignment does not require governance veto");
+            return Err(Error::InvalidInput);
         }
         
         if reassignment.is_executed {
-            panic!("Reassignment already executed");
+            return Err(Error::AlreadyInitialized);
         }
         
         let current_time = e.ledger().timestamp();
         
         if current_time >= reassignment.effective_at {
-            panic!("Veto period has expired");
+            return Err(Error::VotingPeriodEnded);
         }
         
         // Check if voter has already voted
         let existing_votes = get_veto_votes(&e, reassignment_id);
         if existing_votes.iter().any(|vote| vote.voter == voter) {
-            panic!("Voter has already cast a vote");
+            return Err(Error::AlreadyVoted);
         }
         
         let vote = VetoVote {
@@ -1485,17 +1379,17 @@ impl VestingVault {
         add_veto_vote(&e, reassignment_id, &vote);
         
         // Emit vote event
-        e.events().publish(("veto_vote_cast", reassignment_id), VetoVoteCast {
+        VetoVoteCast {
             voter: voter.clone(),
             reassignment_id,
             vote_for_veto,
             voting_power,
             voted_at: current_time,
-        });
+        }.publish(&e);
         
         // Check if veto threshold is reached
         let all_votes = get_veto_votes(&e, reassignment_id);
-        let total_veto_power: i128 = all_votes.iter()
+        let total_veto_power = all_votes.iter()
             .filter(|vote| vote.vote_for_veto)
             .map(|vote| vote.voting_power)
             .sum();
@@ -1509,36 +1403,43 @@ impl VestingVault {
             remove_beneficiary_reassignment(&e, reassignment_id);
             
             // Emit veto event
-            e.events().publish(("reassignment_vetoed", reassignment_id), ReassignmentVetoed {
+            ReassignmentVetoed {
                 reassignment_id,
                 veto_triggered_by: voter,
                 veto_power: total_veto_power,
                 vetoed_at: current_time,
-            });
+            }.publish(&e);
         }
+
+        Ok(())
     }
     
     /// Get beneficiary reassignment details
+    /// Return the reassignment record for `reassignment_id`, or `None` if not found.
     pub fn get_beneficiary_reassignment(e: Env, reassignment_id: u32) -> Option<BeneficiaryReassignment> {
         get_beneficiary_reassignment(&e, reassignment_id)
     }
     
     /// Get veto votes for a reassignment
+    /// Return all veto votes cast for a given reassignment.
     pub fn get_veto_votes(e: Env, reassignment_id: u32) -> Vec<VetoVote> {
         get_veto_votes(&e, reassignment_id)
     }
     
     /// Get current token supply info
+    /// Return the current token supply info used for governance calculations.
     pub fn get_token_supply_info(e: Env) -> TokenSupplyInfo {
         get_token_supply_info(&e)
     }
     
     /// Get current governance veto threshold
+    /// Return the current governance veto threshold percentage (0–100).
     pub fn get_governance_veto_threshold(e: Env) -> u32 {
         get_governance_veto_threshold(&e)
     }
     
     /// Check if a reassignment requires governance veto
+    /// Returns `true` if a reassignment of `amount` tokens requires a governance veto period.
     pub fn requires_governance_veto(e: Env, amount: i128) -> bool {
         let supply_info = get_token_supply_info(&e);
         let threshold = get_governance_veto_threshold(&e);
@@ -1548,9 +1449,10 @@ impl VestingVault {
     }
     
     /// Get veto status for a reassignment
+    /// Return `(is_vetoed, total_veto_power, veto_threshold)` for a reassignment.
     pub fn get_veto_status(e: Env, reassignment_id: u32) -> (bool, i128, i128) {
         let votes = get_veto_votes(&e, reassignment_id);
-        let total_veto_power: i128 = votes.iter()
+        let total_veto_power = votes.iter()
             .filter(|vote| vote.vote_for_veto)
             .map(|vote| vote.voting_power)
             .sum();
@@ -1567,12 +1469,12 @@ impl VestingVault {
     // ========== ISSUE #205: Automated Tax Withholding Logic ==========
     
     /// Configure tax withholding settings
-    pub fn configure_tax_withholding(e: Env, admin: Address, tax_treasury_address: Address, tax_withholding_bps: u32) {
+    pub fn configure_tax_withholding(e: Env, admin: Address, tax_treasury_address: Address, tax_withholding_bps: u32) -> Result<(), Error> {
         admin.require_auth();
         
         // Validate tax rate (basis points, 10000 = 100%)
         if tax_withholding_bps > 10000 {
-            panic!("Tax withholding rate cannot exceed 100%");
+            return Err(Error::InvalidInput);
         }
         
         let config = TaxWithholdingConfig {
@@ -1585,9 +1487,12 @@ impl VestingVault {
         
         // Emit configuration event
         TaxWithholdingConfigured { tax_treasury_address, tax_withholding_bps, timestamp: e.ledger().timestamp() }.publish(&e);
+
+        Ok(())
     }
     
     /// Disable tax withholding feature
+    /// Disable the tax withholding feature (admin only).
     pub fn disable_tax_withholding(e: Env, admin: Address) {
         admin.require_auth();
         
@@ -1601,6 +1506,7 @@ impl VestingVault {
     }
     
     /// Get current tax withholding configuration
+    /// Return the current tax withholding configuration, or `None` if not set.
     pub fn get_tax_withholding_config(e: Env) -> Option<TaxWithholdingConfig> {
         get_tax_withholding_config(&e)
     }
@@ -1639,6 +1545,7 @@ impl VestingVault {
     }
     
     /// Disable SEP-12 KYC checking
+    /// Disable SEP-12 KYC checking (admin only).
     pub fn disable_sep12_kyc(e: Env, admin: Address) {
         admin.require_auth();
         
@@ -1652,6 +1559,7 @@ impl VestingVault {
     }
     
     /// Get current SEP-12 Identity Oracle configuration
+    /// Return the current SEP-12 Identity Oracle configuration, or `None` if not set.
     pub fn get_sep12_oracle_config(e: Env) -> Option<SEP12IdentityOracle> {
         get_sep12_identity_oracle(&e)
     }
@@ -1691,12 +1599,12 @@ impl VestingVault {
     // ========== ISSUE #203: Handle Zero-Decimal Token Precision Safely ==========
     
     /// Register token metadata for precision handling
-    pub fn register_token_metadata(e: Env, admin: Address, asset_address: Address, decimals: u32) {
+    pub fn register_token_metadata(e: Env, admin: Address, asset_address: Address, decimals: u32) -> Result<(), Error> {
         admin.require_auth();
         
         // Validate decimals (0-18 typical range for Stellar assets)
         if decimals > 18 {
-            panic!("Token decimals cannot exceed 18");
+            return Err(Error::InvalidInput);
         }
         
         let metadata = TokenMetadata {
@@ -1708,9 +1616,12 @@ impl VestingVault {
         
         // Emit registration event
         TokenMetadataRegistered { asset_address, decimals, timestamp: e.ledger().timestamp() }.publish(&e);
+
+        Ok(())
     }
     
     /// Get token metadata
+    /// Return the registered token metadata for `asset_address`, or `None` if not registered.
     pub fn get_token_metadata_info(e: Env, asset_address: Address) -> Option<TokenMetadata> {
         get_token_metadata(&e, &asset_address)
     }
@@ -1757,12 +1668,12 @@ impl VestingVault {
     // ========== ISSUE #202: Implement Revocability Expiration (Cliff-Drop) ==========
     
     /// Create a new vesting grant with revocability expiration
-    pub fn create_vesting_grant(e: Env, admin: Address, vesting_id: u32, beneficiary: Address, is_revocable: bool) {
+    pub fn create_vesting_grant(e: Env, admin: Address, vesting_id: u32, beneficiary: Address, is_revocable: bool) -> Result<(), Error> {
         admin.require_auth();
         
         // Check if grant already exists
         if get_vesting_grant(&e, vesting_id).is_some() {
-            panic!("Vesting grant already exists");
+            return Err(Error::AlreadyInitialized);
         }
         
         let current_time = e.ledger().timestamp();
@@ -1786,6 +1697,8 @@ impl VestingVault {
             revocability_expires_at: grant.revocability_expires_at,
             created_at: current_time,
         }.publish(&e);
+
+        Ok(())
     }
     
     /// Check if a grant is still revocable
@@ -1819,6 +1732,7 @@ impl VestingVault {
     }
     
     /// Get vesting grant information
+    /// Return the vesting grant record for `vesting_id`, or `None` if not found.
     pub fn get_vesting_grant_info(e: Env, vesting_id: u32) -> Option<VestingGrant> {
         get_vesting_grant(&e, vesting_id)
     }
@@ -2025,326 +1939,6 @@ impl VestingVault {
         9_000_000i128
     }
 
-    // ========== ISSUE #154: Native LST Auto-Compounding ==========
-
-    /// Configure LST auto-compounding for a vesting schedule
-    /// This enables automatic reinvestment of staking rewards
-    pub fn configure_lst_compounding(e: Env, admin: Address, vesting_id: u32, lst_token_address: Address, base_token_address: Address, staking_contract_address: Address, unbonding_period_seconds: u64) {
-        admin.require_auth();
-
-        let config = LSTConfig {
-            vesting_id,
-            enabled: true,
-            lst_token_address: lst_token_address.clone(),
-            base_token_address: base_token_address.clone(),
-            staking_contract_address: staking_contract_address.clone(),
-            unbonding_period_seconds,
-        };
-
-        set_lst_config(&e, vesting_id, &config);
-
-        // Initialize pool shares if not exists
-        if get_lst_pool_shares(&e, vesting_id).is_none() {
-            let pool_shares = LSTPoolShares {
-                total_shares: 0,
-                total_underlying: 0,
-                last_compounded_at: e.ledger().timestamp(),
-                exchange_rate_snapshot: 10_000_000i128, // Initial rate: 1.0 (7 decimals)
-                snapshot_timestamp: e.ledger().timestamp(),
-            };
-            set_lst_pool_shares(&e, vesting_id, &pool_shares);
-        }
-
-        LSTConfigured {
-            vesting_id,
-            lst_token_address,
-            base_token_address,
-            timestamp: e.ledger().timestamp(),
-        }.publish(&e);
-    }
-
-    /// Deposit tokens into the LST pool and receive shares
-    /// This is called when tokens are vested into the vault
-    pub fn deposit_to_lst_pool(e: Env, user: Address, vesting_id: u32, amount: i128) -> Result<(), Error> {
-        user.require_auth();
-
-        let lst_config = get_lst_config(&e, vesting_id)
-            .ok_or(Error::LSTNotConfigured)?;
-
-        if !lst_config.enabled {
-            return Err(Error::LSTNotEnabled);
-        }
-
-        let mut pool_shares = get_lst_pool_shares(&e, vesting_id)
-            .ok_or(Error::LSTPoolNotInitialized)?;
-
-        // Calculate shares to mint based on current exchange rate
-        // If pool is empty, 1 share = 1 underlying token
-        let shares_to_mint = if pool_shares.total_shares == 0 {
-            amount
-        } else {
-            // shares = (amount * total_shares) / total_underlying
-            (amount * pool_shares.total_shares) / pool_shares.total_underlying
-        };
-
-        // Update pool state
-        pool_shares.total_shares += shares_to_mint;
-        pool_shares.total_underlying += amount;
-        pool_shares.last_compounded_at = e.ledger().timestamp();
-        set_lst_pool_shares(&e, vesting_id, &pool_shares);
-
-        // Update user shares
-        let mut user_shares = get_user_lst_shares(&e, &user, vesting_id)
-            .unwrap_or(UserLSTShares {
-                shares: 0,
-                vesting_id,
-                unbonding_pending: false,
-                unbonding_requested_at: 0,
-            });
-        user_shares.shares += shares_to_mint;
-        set_user_lst_shares(&e, &user, vesting_id, &user_shares);
-
-        // Stake tokens in the staking contract
-        Self::stake_tokens_in_contract(&e, &lst_config.staking_contract_address, &user, vesting_id as u64, amount);
-
-        Ok(())
-    }
-
-    /// Compound LST rewards - automatically reinvest staking rewards
-    /// This hook is called periodically or before claims
-    pub fn compound_lst_rewards(e: Env, vesting_id: u32) -> Result<(), Error> {
-        let lst_config = get_lst_config(&e, vesting_id)
-            .ok_or(Error::LSTNotConfigured)?;
-
-        if !lst_config.enabled {
-            return Err(Error::LSTNotEnabled);
-        }
-
-        let mut pool_shares = get_lst_pool_shares(&e, vesting_id)
-            .ok_or(Error::LSTPoolNotInitialized)?;
-
-        let current_time = e.ledger().timestamp();
-
-        // Security: Check if exchange rate is being manipulated
-        // If the snapshot is too recent, reject the compounding
-        if current_time.saturating_sub(pool_shares.snapshot_timestamp) < 3600 {
-            // Less than 1 hour since last snapshot - potential manipulation
-            return Err(Error::ExchangeRateManipulationSuspected);
-        }
-
-        // Query staking contract for total rewards
-        let total_rewards = Self::query_staking_rewards(&e, &lst_config.staking_contract_address, vesting_id as u64);
-
-        if total_rewards <= 0 {
-            return Ok(()); // No rewards to compound
-        }
-
-        // Calculate new exchange rate
-        // exchange_rate = (total_underlying + rewards) / total_shares * 10_000_000
-        let new_total_underlying = pool_shares.total_underlying + total_rewards;
-        let new_exchange_rate = if pool_shares.total_shares > 0 {
-            (new_total_underlying * 10_000_000i128) / pool_shares.total_shares
-        } else {
-            10_000_000i128
-        };
-
-        // Update pool state
-        pool_shares.total_underlying = new_total_underlying;
-        pool_shares.last_compounded_at = current_time;
-        pool_shares.exchange_rate_snapshot = new_exchange_rate;
-        pool_shares.snapshot_timestamp = current_time;
-        set_lst_pool_shares(&e, vesting_id, &pool_shares);
-
-        // Emit compounding event
-        LSTRewardsCompounded {
-            vesting_id,
-            total_yield_generated: total_rewards,
-            total_shares: pool_shares.total_shares,
-            exchange_rate: new_exchange_rate,
-            timestamp: current_time,
-        }.publish(&e);
-
-        Ok(())
-    }
-
-    /// Calculate user's claimable amount based on shares and current exchange rate
-    /// This is called during the claim function
-    fn calculate_shares_based_claim(e: &Env, user: &Address, vesting_id: u32) -> Result<i128, Error> {
-        let user_shares = get_user_lst_shares(e, user, vesting_id)
-            .ok_or(Error::NoUserShares)?;
-
-        let pool_shares = get_lst_pool_shares(e, vesting_id)
-            .ok_or(Error::LSTPoolNotInitialized)?;
-
-        if user_shares.shares == 0 || pool_shares.total_shares == 0 {
-            return Ok(0);
-        }
-
-        // Calculate user's share of the pool
-        // user_amount = (user_shares * total_underlying) / total_shares
-        let user_amount = (user_shares.shares * pool_shares.total_underlying) / pool_shares.total_shares;
-
-        Ok(user_amount)
-    }
-
-    /// Request unbonding of staked tokens
-    /// This initiates the unbonding period before tokens can be withdrawn
-    pub fn request_unbonding(e: Env, user: Address, vesting_id: u32) -> Result<(), Error> {
-        user.require_auth();
-
-        let lst_config = get_lst_config(&e, vesting_id)
-            .ok_or(Error::LSTNotConfigured)?;
-
-        if !lst_config.enabled {
-            return Err(Error::LSTNotEnabled);
-        }
-
-        let user_shares = get_user_lst_shares(&e, &user, vesting_id)
-            .ok_or(Error::NoUserShares)?;
-
-        if user_shares.shares == 0 {
-            return Err(Error::NoSharesToUnbond);
-        }
-
-        if user_shares.unbonding_pending {
-            return Err(Error::UnbondingAlreadyPending);
-        }
-
-        // Check unbonding queue for rate limiting
-        let queue = get_unbonding_queue(&e);
-        if queue.len() >= 100 {
-            // Rate limit: max 100 unbonding requests in queue
-            return Err(Error::UnbondingQueueFull);
-        }
-
-        let current_time = e.ledger().timestamp();
-        let unbonding_complete_at = current_time + lst_config.unbonding_period_seconds;
-
-        // Create unbonding request
-        let request = UnbondingRequest {
-            user: user.clone(),
-            vesting_id,
-            shares: user_shares.shares,
-            requested_at: current_time,
-            unbonding_complete_at,
-        };
-
-        set_unbonding_request(&e, &user, vesting_id, &request);
-        add_to_unbonding_queue(&e, &request);
-
-        // Update user shares to mark unbonding as pending
-        let mut updated_user_shares = user_shares;
-        updated_user_shares.unbonding_pending = true;
-        updated_user_shares.unbonding_requested_at = current_time;
-        set_user_lst_shares(&e, &user, vesting_id, &updated_user_shares);
-
-        // Emit event
-        UnbondingRequested {
-            user: user.clone(),
-            vesting_id,
-            shares: user_shares.shares,
-            unbonding_complete_at,
-            timestamp: current_time,
-        }.publish(&e);
-
-        Ok(())
-    }
-
-    /// Complete unbonding and withdraw tokens
-    /// This can only be called after the unbonding period has elapsed
-    pub fn complete_unbonding(e: Env, user: Address, vesting_id: u32) -> Result<i128, Error> {
-        user.require_auth();
-
-        let lst_config = get_lst_config(&e, vesting_id)
-            .ok_or(Error::LSTNotConfigured)?;
-
-        let unbonding_request = get_unbonding_request(&e, &user, vesting_id)
-            .ok_or(Error::NoUnbondingRequest)?;
-
-        let current_time = e.ledger().timestamp();
-
-        if current_time < unbonding_request.unbonding_complete_at {
-            return Err(Error::UnbondingPeriodNotElapsed);
-        }
-
-        // Calculate underlying amount based on shares
-        let pool_shares = get_lst_pool_shares(&e, vesting_id)
-            .ok_or(Error::LSTPoolNotInitialized)?;
-
-        let underlying_amount = if pool_shares.total_shares > 0 {
-            (unbonding_request.shares * pool_shares.total_underlying) / pool_shares.total_shares
-        } else {
-            unbonding_request.shares
-        };
-
-        // Update pool state
-        let mut updated_pool_shares = pool_shares;
-        updated_pool_shares.total_shares -= unbonding_request.shares;
-        updated_pool_shares.total_underlying -= underlying_amount;
-        set_lst_pool_shares(&e, vesting_id, &updated_pool_shares);
-
-        // Update user shares
-        let mut user_shares = get_user_lst_shares(&e, &user, vesting_id)
-            .ok_or(Error::NoUserShares)?;
-        user_shares.shares = 0;
-        user_shares.unbonding_pending = false;
-        user_shares.unbonding_requested_at = 0;
-        set_user_lst_shares(&e, &user, vesting_id, &user_shares);
-
-        // Remove unbonding request
-        remove_unbonding_request(&e, &user, vesting_id);
-        remove_from_unbonding_queue(&e, &user, vesting_id);
-
-        // Unstake from staking contract
-        Self::unstake_tokens_from_contract(&e, &lst_config.staking_contract_address, &user, vesting_id as u64);
-
-        // Emit event
-        UnbondingCompleted {
-            user: user.clone(),
-            vesting_id,
-            shares: unbonding_request.shares,
-            underlying_amount,
-            timestamp: current_time,
-        }.publish(&e);
-
-        Ok(underlying_amount)
-    }
-
-    /// Internal function to stake tokens in the staking contract
-    /// Uses cross-contract authentication
-    fn stake_tokens_in_contract(e: &Env, staking_contract: &Address, beneficiary: &Address, vault_id: u64, amount: i128) {
-        // In production, this would use Soroban's cross-contract call
-        // For now, this is a placeholder
-        // e.invoke_contract::<()>(
-        //     staking_contract,
-        //     &symbol_short!("stake_tokens"),
-        //     (beneficiary, vault_id, amount)
-        // );
-    }
-
-    /// Internal function to unstake tokens from the staking contract
-    fn unstake_tokens_from_contract(e: &Env, staking_contract: &Address, beneficiary: &Address, vault_id: u64) {
-        // In production, this would use Soroban's cross-contract call
-        // For now, this is a placeholder
-        // e.invoke_contract::<()>(
-        //     staking_contract,
-        //     &symbol_short!("unstake_tokens"),
-        //     (beneficiary, vault_id)
-        // );
-    }
-
-    /// Internal function to query staking rewards from the staking contract
-    fn query_staking_rewards(e: &Env, staking_contract: &Address, vault_id: u64) -> i128 {
-        // In production, this would use Soroban's cross-contract call
-        // For now, return a simulated value
-        // e.invoke_contract::<i128>(
-        //     staking_contract,
-        //     &symbol_short!("get_yield"),
-        //     (e.current_contract_address(), vault_id)
-        // );
-        0i128 // Placeholder - no rewards in simulation
-    }
-
     // ========== ISSUE #223: Cross-Contract balanceOf Adapter for DAO Voting ==========
 
     /// Returns the voting power of an address, defined as its total unvested token balance.
@@ -2362,12 +1956,14 @@ impl VestingVault {
 
     /// Admin function to record/update an address's unvested balance.
     /// Called when vaults are created or tokens are claimed to keep the balance current.
-    pub fn record_unvested_balance(e: Env, admin: Address, beneficiary: Address, unvested_amount: i128) {
+    pub fn record_unvested_balance(e: Env, admin: Address, beneficiary: Address, unvested_amount: i128) -> Result<(), Error> {
         admin.require_auth();
         if unvested_amount < 0 {
-            panic!("Unvested amount cannot be negative");
+            return Err(Error::InvalidInput);
         }
         set_unvested_balance(&e, &beneficiary, unvested_amount);
+
+        Ok(())
     }
 
     // ========== ISSUE #226: Admin Dead-Man's Switch ==========
@@ -2612,623 +2208,4 @@ impl VestingVault {
         set_contract_total_unvested(&e, new_total);
         Ok(())
     }
-
-    // ========== ISSUE #269: Zero-Knowledge Confidential Grant Amounts ==========
-
-    /// Create a confidential grant with shielded amount
-    /// 
-    /// This function creates a vesting grant where the total amount is stored as a
-    /// cryptographic commitment (hash) rather than plaintext, hiding executive compensation
-    /// details from public blockchain scanners.
-    /// 
-    /// # Arguments
-    /// * `e` - The environment
-    /// * `admin` - Admin address authorizing the grant
-    /// * `vesting_id` - Unique identifier for the vesting schedule
-    /// * `commitment_hash` - Pedersen commitment hash of the total grant amount
-    /// * `total_shielded_amount` - The actual shielded amount (for internal tracking)
-    /// 
-    /// # Events
-    /// Emits `ConfidentialGrantCreated` event
-    pub fn create_confidential_grant(
-        e: Env,
-        admin: Address,
-        vesting_id: u32,
-        commitment_hash: BytesN<32>,
-        total_shielded_amount: i128,
-    ) -> Result<(), Error> {
-        admin.require_auth();
-
-        // Check if confidential grant already exists
-        if get_confidential_grant(&e, vesting_id).is_some() {
-            return Err(Error::InvalidInput);
-        }
-
-        // Validate shielded amount is positive
-        if total_shielded_amount <= 0 {
-            return Err(Error::InvalidInput);
-        }
-
-        let current_time = e.ledger().timestamp();
-
-        // Create the confidential grant
-        let grant = ConfidentialGrant {
-            commitment_hash: commitment_hash.clone(),
-            vesting_id,
-            created_at: current_time,
-            is_fully_claimed: false,
-            remaining_shielded: total_shielded_amount,
-        };
-
-        // Store the confidential grant
-        set_confidential_grant(&e, vesting_id, &grant);
-
-        // Emit event
-        ConfidentialGrantCreated {
-            vesting_id,
-            commitment_hash,
-            timestamp: current_time,
-        }.publish(&e);
-
-        Ok(())
-    }
-
-    /// Execute a confidential claim using ZK-SNARK proof
-    /// 
-    /// This function allows employees to claim tokens without revealing their identity
-    /// or the exact amount being claimed. The ZK proof verifies that:
-    /// 1. The claim is valid against the hidden total commitment
-    /// 2. The claim amount does not exceed the remaining shielded amount
-    /// 3. The nullifier has not been used before (prevents double-spending)
-    /// 
-    /// # Arguments
-    /// * `e` - The environment
-    /// * `vesting_id` - Vesting schedule identifier
-    /// * `proof` - ZK-SNARK proof with public inputs
-    /// 
-    /// # Events
-    /// Emits `ConfidentialClaimExecuted` event with only the nullifier hash
-    /// 
-    /// # Errors
-    /// * `Error::InvalidZKProof` - If the ZK proof is malformed or verification fails
-    /// * `Error::OverClaimAttempt` - If the claim amount exceeds remaining shielded amount
-    pub fn confidential_claim(
-        e: Env,
-        vesting_id: u32,
-        proof: ConfidentialClaimProof,
-    ) -> Result<(), Error> {
-        // No require_auth() - this is a privacy feature
-
-        // Check if contract is under emergency pause
-        if let Some(pause) = get_emergency_pause(&e) {
-            if pause.is_active {
-                let current_time = e.ledger().timestamp();
-                if current_time < pause.expires_at {
-                    return Err(Error::RegulatoryBlockActive);
-                } else {
-                    remove_emergency_pause(&e);
-                }
-            }
-        }
-
-        // Check if nullifier has already been used (prevent double-spending)
-        if is_nullifier_in_set(&e, &proof.nullifier) {
-            return Err(Error::InvalidZKProof);
-        }
-
-        // Get the confidential grant
-        let mut grant = get_confidential_grant(&e, vesting_id)
-            .ok_or(Error::VestingNotFound)?;
-
-        // Check if grant is already fully claimed
-        if grant.is_fully_claimed {
-            return Err(Error::AlreadyFullyClaimed);
-        }
-
-        // Verify the Merkle root is valid
-        if !is_valid_merkle_root(&e, &proof.merkle_root) {
-            return Err(Error::InvalidZKProof);
-        }
-
-        // Verify the ZK proof using the verifier module
-        zk_verifier::ZKVerifier::verify_confidential_claim(
-            &e,
-            &proof,
-            &grant.commitment_hash,
-            grant.remaining_shielded,
-        )?;
-
-        // Update the grant's remaining shielded amount
-        grant.remaining_shielded = proof.remaining_amount;
-
-        // Check if grant is now fully claimed
-        if grant.remaining_shielded == 0 {
-            grant.is_fully_claimed = true;
-        }
-
-        // Store the updated grant
-        set_confidential_grant(&e, vesting_id, &grant);
-
-        // Add nullifier to persistent storage (permanent tracking)
-        add_nullifier_to_set(&e, &proof.nullifier);
-
-        // Emit event with only the nullifier hash (zero metadata leakage)
-        ConfidentialClaimExecuted {
-            nullifier_hash: proof.nullifier,
-            new_commitment_hash: proof.commitment_hash,
-            timestamp: e.ledger().timestamp(),
-        }.publish(&e);
-
-        // TODO: Execute actual token transfer
-        // This would integrate with the existing vesting logic to transfer tokens
-
-        Ok(())
-    }
-
-    /// Set the master viewing key for DAO clawback operations
-    /// 
-    /// This allows the DAO to recover shielded funds in emergency situations
-    /// using a master viewing key that can decrypt the shielded amounts.
-    /// 
-    /// # Arguments
-    /// * `e` - The environment
-    /// * `admin` - Admin address authorizing the viewing key
-    /// * `viewing_key` - The master viewing key public key
-    /// 
-    /// # Security
-    /// Only authorized admins can set the viewing key. The key can be revoked
-    /// by setting a new one or removing it entirely.
-    pub fn set_master_viewing_key_admin(
-        e: Env,
-        admin: Address,
-        viewing_key: BytesN<32>,
-    ) -> Result<(), Error> {
-        admin.require_auth();
-
-        let current_time = e.ledger().timestamp();
-
-        let key = MasterViewingKey {
-            viewing_key,
-            authorized_by: admin,
-            set_at: current_time,
-            is_active: true,
-        };
-
-        set_master_viewing_key(&e, &key);
-
-        Ok(())
-    }
-
-    /// Execute DAO clawback using master viewing key
-    /// 
-    /// This function allows the DAO to recover shielded funds from a confidential grant
-    /// in emergency situations (e.g., employee termination, legal requirements).
-    /// 
-    /// # Arguments
-    /// * `e` - The environment
-    /// * `admin` - Admin address authorizing the clawback
-    /// * `vesting_id` - Vesting schedule identifier
-    /// * `viewing_key` - Master viewing key for decryption
-    /// * `clawback_amount` - Amount to claw back
-    /// 
-    /// # Events
-    /// Emits `ConfidentialClawbackExecuted` event
-    /// 
-    /// # Errors
-    /// * `Error::ViewingKeyUnauthorized` - If the viewing key is not valid
-    /// * `Error::OverClaimAttempt` - If clawback amount exceeds remaining
-    pub fn confidential_clawback(
-        e: Env,
-        admin: Address,
-        vesting_id: u32,
-        viewing_key: BytesN<32>,
-        clawback_amount: i128,
-    ) -> Result<(), Error> {
-        admin.require_auth();
-
-        // Get the stored master viewing key
-        let stored_key = get_master_viewing_key(&e)
-            .ok_or(Error::ViewingKeyUnauthorized)?;
-
-        // Verify the viewing key is authorized
-        if !zk_verifier::ZKVerifier::verify_viewing_key(&viewing_key, &admin, &stored_key) {
-            return Err(Error::ViewingKeyUnauthorized);
-        }
-
-        // Get the confidential grant
-        let mut grant = get_confidential_grant(&e, vesting_id)
-            .ok_or(Error::VestingNotFound)?;
-
-        // Verify clawback amount doesn't exceed remaining
-        if clawback_amount > grant.remaining_shielded {
-            return Err(Error::OverClaimAttempt);
-        }
-
-        // Update the grant's remaining shielded amount
-        grant.remaining_shielded -= clawback_amount;
-
-        // Check if grant is now fully claimed (clawed back)
-        if grant.remaining_shielded == 0 {
-            grant.is_fully_claimed = true;
-        }
-
-        // Store the updated grant
-        set_confidential_grant(&e, vesting_id, &grant);
-
-        // Emit event
-        ConfidentialClawbackExecuted {
-            vesting_id,
-            clawed_amount: clawback_amount,
-            authorized_by: admin,
-            timestamp: e.ledger().timestamp(),
-        }.publish(&e);
-
-        // TODO: Execute actual token transfer to DAO treasury
-        // This would integrate with the existing vesting logic
-
-        Ok(())
-    }
-
-    /// Get confidential grant information
-    /// 
-    /// Returns the confidential grant details for a given vesting ID.
-    /// Note: The actual grant amount is shielded and only visible with the viewing key.
-    pub fn get_confidential_grant_info(e: Env, vesting_id: u32) -> Option<ConfidentialGrant> {
-        get_confidential_grant(&e, vesting_id)
-    }
-
-    /// Check if a nullifier has been used
-    /// 
-
-    // Update the grant's remaining shielded amount
-    grant.remaining_shielded = proof.remaining_amount;
-
-    // Check if grant is now fully claimed
-    if grant.remaining_shielded == 0 {
-        grant.is_fully_claimed = true;
-    }
-
-    // Store the updated grant
-    set_confidential_grant(&e, vesting_id, &grant);
-
-    // Add nullifier to persistent storage (permanent tracking)
-    add_nullifier_to_set(&e, &proof.nullifier);
-
-    // Emit event with only the nullifier hash (zero metadata leakage)
-    ConfidentialClaimExecuted {
-        nullifier_hash: proof.nullifier,
-        new_commitment_hash: proof.commitment_hash,
-        timestamp: e.ledger().timestamp(),
-    }.publish(&e);
-
-    // TODO: Execute actual token transfer
-    // This would integrate with the existing vesting logic to transfer tokens
-
-    Ok(())
-}
-
-/// Set the master viewing key for DAO clawback operations
-/// 
-/// This allows the DAO to recover shielded funds in emergency situations
-/// using a master viewing key that can decrypt the shielded amounts.
-/// 
-/// # Arguments
-/// * `e` - The environment
-/// * `admin` - Admin address authorizing the viewing key
-/// * `viewing_key` - The master viewing key public key
-/// 
-/// # Security
-/// Only authorized admins can set the viewing key. The key can be revoked
-/// by setting a new one or removing it entirely.
-pub fn set_master_viewing_key_admin(
-    e: Env,
-    admin: Address,
-    viewing_key: BytesN<32>,
-) -> Result<(), Error> {
-    admin.require_auth();
-
-    let current_time = e.ledger().timestamp();
-
-    let key = MasterViewingKey {
-        viewing_key,
-        authorized_by: admin,
-        set_at: current_time,
-        is_active: true,
-    };
-
-    set_master_viewing_key(&e, &key);
-
-    Ok(())
-}
-
-/// Execute DAO clawback using master viewing key
-/// 
-/// This function allows the DAO to recover shielded funds from a confidential grant
-/// in emergency situations (e.g., employee termination, legal requirements).
-/// 
-/// # Arguments
-/// * `e` - The environment
-/// * `admin` - Admin address authorizing the clawback
-/// * `vesting_id` - Vesting schedule identifier
-/// * `viewing_key` - Master viewing key for decryption
-/// * `clawback_amount` - Amount to claw back
-/// 
-/// # Events
-/// Emits `ConfidentialClawbackExecuted` event
-/// 
-/// # Errors
-/// * `Error::ViewingKeyUnauthorized` - If the viewing key is not valid
-/// * `Error::OverClaimAttempt` - If clawback amount exceeds remaining
-pub fn confidential_clawback(
-    e: Env,
-    admin: Address,
-    vesting_id: u32,
-    viewing_key: BytesN<32>,
-    clawback_amount: i128,
-) -> Result<(), Error> {
-    admin.require_auth();
-
-    // Get the stored master viewing key
-    let stored_key = get_master_viewing_key(&e)
-        .ok_or(Error::ViewingKeyUnauthorized)?;
-
-    // Verify the viewing key is authorized
-    if !zk_verifier::ZKVerifier::verify_viewing_key(&viewing_key, &admin, &stored_key) {
-        return Err(Error::ViewingKeyUnauthorized);
-    }
-
-    // Get the confidential grant
-    let mut grant = get_confidential_grant(&e, vesting_id)
-        .ok_or(Error::VestingNotFound)?;
-
-    // Verify clawback amount doesn't exceed remaining
-    if clawback_amount > grant.remaining_shielded {
-        return Err(Error::OverClaimAttempt);
-    }
-
-    // Update the grant's remaining shielded amount
-    grant.remaining_shielded -= clawback_amount;
-
-    // Check if grant is now fully claimed (clawed back)
-    if grant.remaining_shielded == 0 {
-        grant.is_fully_claimed = true;
-    }
-
-    // Store the updated grant
-    set_confidential_grant(&e, vesting_id, &grant);
-
-    // Emit event
-    ConfidentialClawbackExecuted {
-        vesting_id,
-        clawed_amount: clawback_amount,
-        authorized_by: admin,
-        timestamp: e.ledger().timestamp(),
-    }.publish(&e);
-
-    // TODO: Execute actual token transfer to DAO treasury
-    // This would integrate with the existing vesting logic
-
-    Ok(())
-}
-
-/// Get confidential grant information
-/// 
-/// Returns the confidential grant details for a given vesting ID.
-/// Note: The actual grant amount is shielded and only visible with the viewing key.
-pub fn get_confidential_grant_info(e: Env, vesting_id: u32) -> Option<ConfidentialGrant> {
-    get_confidential_grant(&e, vesting_id)
-}
-
-/// Check if a nullifier has been used
-/// 
-/// This is a public function to check if a nullifier is in the permanent set.
-pub fn is_nullifier_used_confidential(e: Env, nullifier_hash: BytesN<32>) -> bool {
-    is_nullifier_in_set(&e, &nullifier_hash)
-}
-
-/// Remove the master viewing key (admin only)
-/// 
-/// This revokes the DAO's ability to perform clawbacks.
-pub fn revoke_master_viewing_key(e: Env, admin: Address) -> Result<(), Error> {
-    admin.require_auth();
-    remove_master_viewing_key(&e);
-    Ok(())
-}
-
-// ========== ISSUE #295: Use Temporary Storage for Claim-History Pagination State ==========
-
-/// Get claim history with pagination using temporary storage
-/// This optimizes gas usage by avoiding full history scans
-pub fn get_claim_history_paginated(e: Env, page_number: u32) -> ClaimHistoryPage {
-    let current_time = e.ledger().timestamp();
-    let all_claims = get_claim_history(&e);
-    
-    // Update pagination state in temporary storage
-    let pagination_state = PaginationState {
-        current_page: page_number,
-        total_items: all_claims.len() as u32,
-        last_updated: current_time,
-    };
-    set_pagination_state(&e, &pagination_state);
-    
-    // Calculate pagination
-    let start_index = page_number * CLAIM_HISTORY_PAGE_SIZE;
-    let end_index = std::cmp::min(start_index + CLAIM_HISTORY_PAGE_SIZE, all_claims.len() as u32);
-    
-    let mut page_claims = Vec::new(&e);
-    for i in start_index..end_index {
-        if let Some(claim) = all_claims.get(i as usize) {
-            page_claims.push_back(claim.clone());
-        }
-    }
-    
-    let total_pages = (all_claims.len() as u32 + CLAIM_HISTORY_PAGE_SIZE - 1) / CLAIM_HISTORY_PAGE_SIZE;
-    let has_next = page_number + 1 < total_pages;
-    
-    ClaimHistoryPage {
-        page_number,
-        claims: page_claims,
-        has_next,
-        total_pages,
-    }
-}
-
-/// Get current pagination state from temporary storage
-pub fn get_pagination_info(e: Env) -> PaginationState {
-    get_pagination_state(&e)
-}
-
-// ========== ISSUE #296: Implement 'Force-Withdrawal' for Expired and Fully Vested Schedules ==========
-
-/// Force withdrawal for expired or fully vested schedules
-/// This allows beneficiaries to withdraw remaining tokens after vesting expiration
-pub fn force_withdrawal(e: Env, beneficiary: Address, vesting_id: u32) -> Result<i128, Error> {
-    beneficiary.require_auth();
-    
-    let current_time = e.ledger().timestamp();
-    
-    // Check if schedule exists and is expired/fully vested
-    let expired_schedule = get_expired_schedule(&e, vesting_id)
-        .ok_or(Error::VestingNotFound)?;
-    
-    if expired_schedule.is_force_withdrawn {
-        return Err(Error::AlreadyFullyClaimed);
-    }
-    
-    // Check if schedule is expired (current time past expiration)
-    if current_time < expired_schedule.expires_at {
-        return Err(Error::CliffNotReached);
-    }
-    
-    // Calculate remaining amount to withdraw
-    let remaining_amount = expired_schedule.total_amount - expired_schedule.claimed_amount;
-    
-    if remaining_amount <= 0 {
-        return Err(Error::NothingToClaim);
-    }
-    
-    // Mark as force withdrawn
-    let mut updated_schedule = expired_schedule;
-    updated_schedule.is_force_withdrawn = true;
-    set_expired_schedule(&e, vesting_id, &updated_schedule);
-    
-    // Emit force withdrawal event
-    ForceWithdrawalExecuted {
-        vesting_id,
-        beneficiary: beneficiary.clone(),
-        withdrawn_amount: remaining_amount,
-        reason: String::from_str(&e, "Force withdrawal of expired/fully vested schedule"),
-        timestamp: current_time,
-    }.publish(&e);
-    
-    Ok(remaining_amount)
-}
-
-/// Register an expired vesting schedule for force withdrawal
-/// This should be called when a vesting schedule is created or expires
-pub fn register_expired_schedule(e: Env, admin: Address, vesting_id: u32, beneficiary: Address, total_amount: i128, expires_at: u64) -> Result<(), Error> {
-    admin.require_auth();
-    
-    // Check if already registered
-    if get_expired_schedule(&e, vesting_id).is_some() {
-        return Err(Error::VestingNotFound);
-    }
-    
-    let schedule = ExpiredSchedule {
-        vesting_id,
-        beneficiary: beneficiary.clone(),
-        total_amount,
-        claimed_amount: 0,
-        expires_at,
-        is_force_withdrawn: false,
-    };
-    
-    set_expired_schedule(&e, vesting_id, &schedule);
-    
-    // In a real implementation, this would integrate with vesting creation
-    Ok(())
-}
-
-/// Get expired schedule information
-pub fn get_expired_schedule_info(e: Env, vesting_id: u32) -> Option<ExpiredSchedule> {
-    get_expired_schedule(&e, vesting_id)
-}
-
-// ========== ISSUE #297: Implement 'Max-Allocation-Sanity-Check' on Global Contract Level ==========
-
-/// Set maximum allocation limit for the entire contract
-/// This prevents over-allocation of tokens beyond safe limits
-pub fn set_max_allocation_limit(e: Env, admin: Address, max_limit: i128) -> Result<(), Error> {
-    admin.require_auth();
-    
-    if max_limit <= 0 {
-        return Err(Error::InvalidInput);
-    }
-    
-    let current_total = get_total_allocated(&e);
-    if current_total > max_limit {
-        return Err(Error::InsufficientBalance);
-    }
-    
-    set_max_allocation_limit(&e, max_limit);
-    
-    MaxAllocationLimitSet {
-        max_limit,
-        set_by: admin,
-        timestamp: e.ledger().timestamp(),
-    }.publish(&e);
-    
-    Ok(())
-}
-
-/// Check and update total allocation with sanity check
-/// This should be called whenever new allocations are made
-pub fn check_allocation_limit(e: Env, new_allocation: i128) -> Result<(), Error> {
-    let max_limit = get_max_allocation_limit(&e);
-    let current_total = get_total_allocated(&e);
-    let projected_total = current_total + new_allocation;
-    
-    if projected_total > max_limit {
-        AllocationLimitExceeded {
-            attempted_allocation: new_allocation,
-            max_limit,
-            rejected_at: e.ledger().timestamp(),
-        }.publish(&e);
-        
-        return Err(Error::InsufficientBalance);
-    }
-    
-    // Update total allocated
-    set_total_allocated(&e, projected_total);
-    Ok(())
-}
-
-/// Get current maximum allocation limit
-pub fn get_max_allocation_limit_info(e: Env) -> i128 {
-    get_max_allocation_limit(&e)
-}
-
-/// Get current total allocated amount
-pub fn get_total_allocated_info(e: Env) -> i128 {
-    get_total_allocated(&e)
-}
-
-/// Initialize allocation tracking (call during contract deployment)
-pub fn initialize_allocation_tracking(e: Env, admin: Address, initial_limit: i128) -> Result<(), Error> {
-    admin.require_auth();
-    
-    if initial_limit <= 0 {
-        return Err(Error::InvalidInput);
-    }
-    
-    set_max_allocation_limit(&e, initial_limit);
-    set_total_allocated(&e, 0i128);
-    
-    MaxAllocationLimitSet {
-        max_limit: initial_limit,
-        set_by: admin,
-        timestamp: e.ledger().timestamp(),
-    }.publish(&e);
-    
-    Ok(())
 }
