@@ -1,5 +1,5 @@
 use soroban_sdk::{Env, Vec, Address, Map, BytesN};
-use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, LockupConfig, BeneficiaryReassignment, VetoVote, TokenSupplyInfo, LSTConfig, TvlCapConfig, RateLimitConfig, RelayerConfig};
+use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, LockupConfig, BeneficiaryReassignment, VetoVote, TokenSupplyInfo, LSTConfig, TvlCapConfig, RateLimitConfig, RelayerConfig, ConfidentialGrant, MasterViewingKey};
 
 pub const CLAIM_HISTORY: &str = "CLAIM_HISTORY";
 pub const AUTHORIZED_PAYOUT_ADDRESS: &str = "AUTHORIZED_PAYOUT_ADDRESS";
@@ -391,4 +391,47 @@ pub fn get_contract_total_unvested(e: &Env) -> i128 {
 
 pub fn set_contract_total_unvested(e: &Env, total: i128) {
     e.storage().instance().set(&CONTRACT_TOTAL_UNVESTED, &total);
+}
+
+// ========== ISSUE #269: Zero-Knowledge Confidential Grant Amounts ==========
+pub const CONFIDENTIAL_GRANTS: &str = "CONFIDENTIAL_GRANTS";
+pub const MASTER_VIEWING_KEY: &str = "MASTER_VIEWING_KEY";
+pub const NULLIFIER_SET: &str = "NULLIFIER_SET";
+
+// Confidential grant storage functions
+pub fn get_confidential_grant(e: &Env, vesting_id: u32) -> Option<ConfidentialGrant> {
+    e.storage().instance().get(&(CONFIDENTIAL_GRANTS, vesting_id))
+}
+
+pub fn set_confidential_grant(e: &Env, vesting_id: u32, grant: &ConfidentialGrant) {
+    e.storage().instance().set(&(CONFIDENTIAL_GRANTS, vesting_id), grant);
+}
+
+pub fn remove_confidential_grant(e: &Env, vesting_id: u32) {
+    e.storage().instance().remove(&(CONFIDENTIAL_GRANTS, vesting_id));
+}
+
+// Master viewing key storage functions
+pub fn get_master_viewing_key(e: &Env) -> Option<MasterViewingKey> {
+    e.storage().instance().get(&MASTER_VIEWING_KEY)
+}
+
+pub fn set_master_viewing_key(e: &Env, key: &MasterViewingKey) {
+    e.storage().instance().set(&MASTER_VIEWING_KEY, key);
+}
+
+pub fn remove_master_viewing_key(e: &Env) {
+    e.storage().instance().remove(&MASTER_VIEWING_KEY);
+}
+
+// Nullifier set in Persistent storage (for permanent tracking)
+pub fn is_nullifier_in_set(e: &Env, nullifier_hash: &BytesN<32>) -> bool {
+    e.storage()
+        .persistent()
+        .get(&(NULLIFIER_SET, nullifier_hash))
+        .unwrap_or(false)
+}
+
+pub fn add_nullifier_to_set(e: &Env, nullifier_hash: &BytesN<32>) {
+    e.storage().persistent().set(&(NULLIFIER_SET, nullifier_hash), &true);
 }

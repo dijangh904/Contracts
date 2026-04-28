@@ -66,4 +66,12 @@ pub enum Error {
     // 🛡️ Self-Destruct Prevention (800s)
     /// #231: Cannot upgrade/delete contract while unvested balance > 0
     UpgradeBlockedByUnvestedFunds = 800,
+
+    // 🔐 Zero-Knowledge Privacy (1000s)
+    /// #269: ZK proof verification failed
+    InvalidZKProof = 1000,
+    /// #269: Attempted to claim more than the shielded amount
+    OverClaimAttempt = 1001,
+    /// #269: Master viewing key not authorized for clawback
+    ViewingKeyUnauthorized = 1002,
 }

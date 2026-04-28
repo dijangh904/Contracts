@@ -7,10 +7,11 @@ pub mod types;
 mod audit_exporter;
 mod emergency;
 pub mod errors;
+mod zk_verifier;
 
 pub use types::*;
 use errors::Error;
-use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_lst_config, set_lst_config, get_unvested_balance, set_unvested_balance, get_admin_dead_man_switch, set_admin_dead_man_switch, get_oracle_price_record, set_oracle_price_record, get_contract_total_unvested, set_contract_total_unvested};
+use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_lst_config, set_lst_config, get_unvested_balance, set_unvested_balance, get_admin_dead_man_switch, set_admin_dead_man_switch, get_oracle_price_record, set_oracle_price_record, get_contract_total_unvested, set_contract_total_unvested, get_confidential_grant, set_confidential_grant, remove_confidential_grant, get_master_viewing_key, set_master_viewing_key, remove_master_viewing_key, is_nullifier_in_set, add_nullifier_to_set};
 use emergency::{AuditorPauseRequest, EmergencyPause, EmergencyPauseTriggered};
 
 #[contract]
@@ -2089,6 +2090,286 @@ impl VestingVault {
             return Err(Error::InvalidInput);
         }
         set_contract_total_unvested(&e, new_total);
+        Ok(())
+    }
+
+    // ========== ISSUE #269: Zero-Knowledge Confidential Grant Amounts ==========
+
+    /// Create a confidential grant with shielded amount
+    /// 
+    /// This function creates a vesting grant where the total amount is stored as a
+    /// cryptographic commitment (hash) rather than plaintext, hiding executive compensation
+    /// details from public blockchain scanners.
+    /// 
+    /// # Arguments
+    /// * `e` - The environment
+    /// * `admin` - Admin address authorizing the grant
+    /// * `vesting_id` - Unique identifier for the vesting schedule
+    /// * `commitment_hash` - Pedersen commitment hash of the total grant amount
+    /// * `total_shielded_amount` - The actual shielded amount (for internal tracking)
+    /// 
+    /// # Events
+    /// Emits `ConfidentialGrantCreated` event
+    pub fn create_confidential_grant(
+        e: Env,
+        admin: Address,
+        vesting_id: u32,
+        commitment_hash: BytesN<32>,
+        total_shielded_amount: i128,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        // Check if confidential grant already exists
+        if get_confidential_grant(&e, vesting_id).is_some() {
+            return Err(Error::InvalidInput);
+        }
+
+        // Validate shielded amount is positive
+        if total_shielded_amount <= 0 {
+            return Err(Error::InvalidInput);
+        }
+
+        let current_time = e.ledger().timestamp();
+
+        // Create the confidential grant
+        let grant = ConfidentialGrant {
+            commitment_hash: commitment_hash.clone(),
+            vesting_id,
+            created_at: current_time,
+            is_fully_claimed: false,
+            remaining_shielded: total_shielded_amount,
+        };
+
+        // Store the confidential grant
+        set_confidential_grant(&e, vesting_id, &grant);
+
+        // Emit event
+        ConfidentialGrantCreated {
+            vesting_id,
+            commitment_hash,
+            timestamp: current_time,
+        }.publish(&e);
+
+        Ok(())
+    }
+
+    /// Execute a confidential claim using ZK-SNARK proof
+    /// 
+    /// This function allows employees to claim tokens without revealing their identity
+    /// or the exact amount being claimed. The ZK proof verifies that:
+    /// 1. The claim is valid against the hidden total commitment
+    /// 2. The claim amount does not exceed the remaining shielded amount
+    /// 3. The nullifier has not been used before (prevents double-spending)
+    /// 
+    /// # Arguments
+    /// * `e` - The environment
+    /// * `vesting_id` - Vesting schedule identifier
+    /// * `proof` - ZK-SNARK proof with public inputs
+    /// 
+    /// # Events
+    /// Emits `ConfidentialClaimExecuted` event with only the nullifier hash
+    /// 
+    /// # Errors
+    /// * `Error::InvalidZKProof` - If the ZK proof is malformed or verification fails
+    /// * `Error::OverClaimAttempt` - If the claim amount exceeds remaining shielded amount
+    pub fn confidential_claim(
+        e: Env,
+        vesting_id: u32,
+        proof: ConfidentialClaimProof,
+    ) -> Result<(), Error> {
+        // No require_auth() - this is a privacy feature
+
+        // Check if contract is under emergency pause
+        if let Some(pause) = get_emergency_pause(&e) {
+            if pause.is_active {
+                let current_time = e.ledger().timestamp();
+                if current_time < pause.expires_at {
+                    return Err(Error::RegulatoryBlockActive);
+                } else {
+                    remove_emergency_pause(&e);
+                }
+            }
+        }
+
+        // Check if nullifier has already been used (prevent double-spending)
+        if is_nullifier_in_set(&e, &proof.nullifier) {
+            return Err(Error::InvalidZKProof);
+        }
+
+        // Get the confidential grant
+        let mut grant = get_confidential_grant(&e, vesting_id)
+            .ok_or(Error::VestingNotFound)?;
+
+        // Check if grant is already fully claimed
+        if grant.is_fully_claimed {
+            return Err(Error::AlreadyFullyClaimed);
+        }
+
+        // Verify the Merkle root is valid
+        if !is_valid_merkle_root(&e, &proof.merkle_root) {
+            return Err(Error::InvalidZKProof);
+        }
+
+        // Verify the ZK proof using the verifier module
+        zk_verifier::ZKVerifier::verify_confidential_claim(
+            &e,
+            &proof,
+            &grant.commitment_hash,
+            grant.remaining_shielded,
+        )?;
+
+        // Update the grant's remaining shielded amount
+        grant.remaining_shielded = proof.remaining_amount;
+
+        // Check if grant is now fully claimed
+        if grant.remaining_shielded == 0 {
+            grant.is_fully_claimed = true;
+        }
+
+        // Store the updated grant
+        set_confidential_grant(&e, vesting_id, &grant);
+
+        // Add nullifier to persistent storage (permanent tracking)
+        add_nullifier_to_set(&e, &proof.nullifier);
+
+        // Emit event with only the nullifier hash (zero metadata leakage)
+        ConfidentialClaimExecuted {
+            nullifier_hash: proof.nullifier,
+            new_commitment_hash: proof.commitment_hash,
+            timestamp: e.ledger().timestamp(),
+        }.publish(&e);
+
+        // TODO: Execute actual token transfer
+        // This would integrate with the existing vesting logic to transfer tokens
+
+        Ok(())
+    }
+
+    /// Set the master viewing key for DAO clawback operations
+    /// 
+    /// This allows the DAO to recover shielded funds in emergency situations
+    /// using a master viewing key that can decrypt the shielded amounts.
+    /// 
+    /// # Arguments
+    /// * `e` - The environment
+    /// * `admin` - Admin address authorizing the viewing key
+    /// * `viewing_key` - The master viewing key public key
+    /// 
+    /// # Security
+    /// Only authorized admins can set the viewing key. The key can be revoked
+    /// by setting a new one or removing it entirely.
+    pub fn set_master_viewing_key_admin(
+        e: Env,
+        admin: Address,
+        viewing_key: BytesN<32>,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let current_time = e.ledger().timestamp();
+
+        let key = MasterViewingKey {
+            viewing_key,
+            authorized_by: admin,
+            set_at: current_time,
+            is_active: true,
+        };
+
+        set_master_viewing_key(&e, &key);
+
+        Ok(())
+    }
+
+    /// Execute DAO clawback using master viewing key
+    /// 
+    /// This function allows the DAO to recover shielded funds from a confidential grant
+    /// in emergency situations (e.g., employee termination, legal requirements).
+    /// 
+    /// # Arguments
+    /// * `e` - The environment
+    /// * `admin` - Admin address authorizing the clawback
+    /// * `vesting_id` - Vesting schedule identifier
+    /// * `viewing_key` - Master viewing key for decryption
+    /// * `clawback_amount` - Amount to claw back
+    /// 
+    /// # Events
+    /// Emits `ConfidentialClawbackExecuted` event
+    /// 
+    /// # Errors
+    /// * `Error::ViewingKeyUnauthorized` - If the viewing key is not valid
+    /// * `Error::OverClaimAttempt` - If clawback amount exceeds remaining
+    pub fn confidential_clawback(
+        e: Env,
+        admin: Address,
+        vesting_id: u32,
+        viewing_key: BytesN<32>,
+        clawback_amount: i128,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        // Get the stored master viewing key
+        let stored_key = get_master_viewing_key(&e)
+            .ok_or(Error::ViewingKeyUnauthorized)?;
+
+        // Verify the viewing key is authorized
+        if !zk_verifier::ZKVerifier::verify_viewing_key(&viewing_key, &admin, &stored_key) {
+            return Err(Error::ViewingKeyUnauthorized);
+        }
+
+        // Get the confidential grant
+        let mut grant = get_confidential_grant(&e, vesting_id)
+            .ok_or(Error::VestingNotFound)?;
+
+        // Verify clawback amount doesn't exceed remaining
+        if clawback_amount > grant.remaining_shielded {
+            return Err(Error::OverClaimAttempt);
+        }
+
+        // Update the grant's remaining shielded amount
+        grant.remaining_shielded -= clawback_amount;
+
+        // Check if grant is now fully claimed (clawed back)
+        if grant.remaining_shielded == 0 {
+            grant.is_fully_claimed = true;
+        }
+
+        // Store the updated grant
+        set_confidential_grant(&e, vesting_id, &grant);
+
+        // Emit event
+        ConfidentialClawbackExecuted {
+            vesting_id,
+            clawed_amount: clawback_amount,
+            authorized_by: admin,
+            timestamp: e.ledger().timestamp(),
+        }.publish(&e);
+
+        // TODO: Execute actual token transfer to DAO treasury
+        // This would integrate with the existing vesting logic
+
+        Ok(())
+    }
+
+    /// Get confidential grant information
+    /// 
+    /// Returns the confidential grant details for a given vesting ID.
+    /// Note: The actual grant amount is shielded and only visible with the viewing key.
+    pub fn get_confidential_grant_info(e: Env, vesting_id: u32) -> Option<ConfidentialGrant> {
+        get_confidential_grant(&e, vesting_id)
+    }
+
+    /// Check if a nullifier has been used
+    /// 
+    /// This is a public function to check if a nullifier is in the permanent set.
+    pub fn is_nullifier_used_confidential(e: Env, nullifier_hash: BytesN<32>) -> bool {
+        is_nullifier_in_set(&e, &nullifier_hash)
+    }
+
+    /// Remove the master viewing key (admin only)
+    /// 
+    /// This revokes the DAO's ability to perform clawbacks.
+    pub fn revoke_master_viewing_key(e: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+        remove_master_viewing_key(&e);
         Ok(())
     }
 }

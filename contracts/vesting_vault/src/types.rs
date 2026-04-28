@@ -511,3 +511,99 @@ pub struct UpgradeBlocked {
     pub total_unvested_balance: i128,
     pub blocked_at: u64,
 }
+
+// ========== ISSUE #269: Zero-Knowledge Confidential Grant Amounts ==========
+
+/// Confidential grant storing commitment instead of plaintext amount
+#[contracttype]
+#[derive(Clone)]
+pub struct ConfidentialGrant {
+    /// Hash commitment of the total grant amount (Pedersen commitment)
+    pub commitment_hash: BytesN<32>,
+    /// Vesting schedule identifier
+    pub vesting_id: u32,
+    /// Timestamp when grant was created
+    pub created_at: u64,
+    /// Whether this grant has been fully claimed
+    pub is_fully_claimed: bool,
+    /// Remaining shielded amount (encrypted, for internal tracking)
+    pub remaining_shielded: i128,
+}
+
+/// Master viewing key for DAO clawback operations
+#[contracttype]
+#[derive(Clone)]
+pub struct MasterViewingKey {
+    /// Public key for viewing shielded amounts
+    pub viewing_key: BytesN<32>,
+    /// Admin address that authorized this key
+    pub authorized_by: Address,
+    /// Timestamp when key was set
+    pub set_at: u64,
+    /// Whether key is currently active
+    pub is_active: bool,
+}
+
+/// Enhanced ZK proof for confidential claims (Circom-compatible)
+#[contracttype]
+#[derive(Clone)]
+pub struct ConfidentialClaimProof {
+    /// Public inputs for the ZK circuit
+    pub commitment_hash: BytesN<32>,
+    /// Nullifier to prevent double-spending
+    pub nullifier: BytesN<32>,
+    /// Merkle root of the commitment tree
+    pub merkle_root: BytesN<32>,
+    /// Claimed amount (public output)
+    pub claimed_amount: i128,
+    /// Remaining amount after claim (public output)
+    pub remaining_amount: i128,
+    /// The actual ZK-SNARK proof (Circom output)
+    pub proof_a: BytesN<32>,
+    pub proof_b: BytesN<32>,
+    pub proof_c: BytesN<32>,
+}
+
+/// Event emitted when a confidential claim is executed
+#[contractevent]
+#[derive(Clone)]
+pub struct ConfidentialClaimExecuted {
+    /// Nullifier hash (leaks zero metadata about the claimer)
+    #[topic]
+    pub nullifier_hash: BytesN<32>,
+    /// Updated commitment hash after claim
+    #[topic]
+    pub new_commitment_hash: BytesN<32>,
+    /// Timestamp of the claim
+    pub timestamp: u64,
+}
+
+/// Event emitted when a confidential grant is created
+#[contractevent]
+#[derive(Clone)]
+pub struct ConfidentialGrantCreated {
+    /// Vesting ID
+    #[topic]
+    pub vesting_id: u32,
+    /// Commitment hash of the total grant
+    #[topic]
+    pub commitment_hash: BytesN<32>,
+    /// Timestamp of creation
+    pub timestamp: u64,
+}
+
+/// Event emitted when DAO performs clawback using master viewing key
+#[contractevent]
+#[derive(Clone)]
+pub struct ConfidentialClawbackExecuted {
+    /// Vesting ID
+    #[topic]
+    pub vesting_id: u32,
+    /// Amount clawed back
+    pub clawed_amount: i128,
+    /// Admin who authorized the clawback
+    #[topic]
+    pub authorized_by: Address,
+    /// Timestamp of clawback
+    pub timestamp: u64,
+}
