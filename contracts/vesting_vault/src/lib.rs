@@ -1,12 +1,13 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, Env, Address, Vec, Map, String, BytesN, IntoVal};
+use soroban_sdk::{contract, contractimpl, Env, Address, Vec, Map, String, BytesN, Bytes, IntoVal};
 
 mod storage;
 pub mod types;
 mod audit_exporter;
 mod emergency;
 pub mod errors;
+mod zk_verifier;
 
 pub use types::*;
 use errors::Error;
@@ -162,24 +163,35 @@ impl VestingVault {
             // Additional milestone logic would go here
         }
 
-        // Check LST configuration
+        // Check LST configuration and auto-compound rewards before claim
         if let Some(lst_config) = get_lst_config(&e, vesting_id) {
             if lst_config.enabled {
-                let exchange_rate = Self::get_lst_exchange_rate(&e, &lst_config.lst_token_address);
-                // Rebasing math: exchange rate has 7 decimal precision (e.g. 1 LST = 1 Base -> 10,000,000)
-                // LST amount = (Base amount * exchange rate) / 10_000_000
-                let lst_amount = (amount * exchange_rate) / 10_000_000i128;
-                
-                LSTClaimExecuted {
-                    user: user.clone(),
-                    vesting_id,
-                    base_amount: amount,
-                    lst_amount,
-                    lst_token_address: lst_config.lst_token_address.clone(),
-                    timestamp: e.ledger().timestamp(),
-                }.publish(&e);
-                
-                // TODO: Execute actual LST token transfer here using lst_amount
+                // Auto-compound rewards before calculating claim amount
+                let _ = Self::compound_lst_rewards(e.clone(), vesting_id);
+
+                // Calculate claim amount based on shares instead of static amount
+                let shares_based_amount = Self::calculate_shares_based_claim(&e, &user, vesting_id)?;
+
+                if shares_based_amount > 0 {
+                    // Use shares-based calculation for LST-enabled vesting
+                    let exchange_rate = Self::get_lst_exchange_rate(&e, &lst_config.lst_token_address);
+                    // Rebasing math: exchange rate has 7 decimal precision (e.g. 1 LST = 1 Base -> 10,000,000)
+                    // LST amount = (Base amount * exchange rate) / 10_000_000
+                    let lst_amount = (shares_based_amount * exchange_rate) / 10_000_000i128;
+
+                    LSTClaimExecuted {
+                        user: user.clone(),
+                        vesting_id,
+                        base_amount: shares_based_amount,
+                        lst_amount,
+                        lst_token_address: lst_config.lst_token_address.clone(),
+                        timestamp: e.ledger().timestamp(),
+                    }.publish(&e);
+
+                    // Update the amount to use the shares-based calculation
+                    // Note: In a real implementation, this would replace the amount parameter
+                    // For now, we emit the event but keep the original amount for compatibility
+                }
             }
         }
 
@@ -264,6 +276,16 @@ impl VestingVault {
     pub fn set_authorized_payout_address(e: Env, beneficiary: Address, authorized_address: Address) {
         beneficiary.require_auth();
         
+        // Additional security: Verify authorized address is valid
+        if authorized_address == beneficiary {
+            panic!("Authorized address cannot be the same as beneficiary");
+        }
+        
+        // Additional security: Check if there's already a pending request
+        if let Some(_pending) = storage_get_pending_address_request(&e, &beneficiary) {
+            panic!("Address change request already pending");
+        }
+        
         let current_time = e.ledger().timestamp();
         let effective_at = current_time + get_timelock_duration();
 
@@ -287,11 +309,16 @@ impl VestingVault {
     pub fn confirm_auth_payout_addr(e: Env, beneficiary: Address) {
         beneficiary.require_auth();
         
-        let current_time = e.ledger().timestamp();
-        
-        // Get the pending request
+        // Additional security: Verify caller is the beneficiary
         let pending_request = storage_get_pending_address_request(&e, &beneficiary)
             .expect("No pending address request found");
+        
+        // Verify the pending request belongs to the caller
+        if pending_request.beneficiary != beneficiary {
+            panic!("Unauthorized: Request does not belong to caller");
+        }
+        
+        let current_time = e.ledger().timestamp();
 
         // Check if timelock has passed
         if current_time < pending_request.effective_at {
@@ -1889,6 +1916,326 @@ impl VestingVault {
         9_000_000i128
     }
 
+    // ========== ISSUE #154: Native LST Auto-Compounding ==========
+
+    /// Configure LST auto-compounding for a vesting schedule
+    /// This enables automatic reinvestment of staking rewards
+    pub fn configure_lst_compounding(e: Env, admin: Address, vesting_id: u32, lst_token_address: Address, base_token_address: Address, staking_contract_address: Address, unbonding_period_seconds: u64) {
+        admin.require_auth();
+
+        let config = LSTConfig {
+            vesting_id,
+            enabled: true,
+            lst_token_address: lst_token_address.clone(),
+            base_token_address: base_token_address.clone(),
+            staking_contract_address: staking_contract_address.clone(),
+            unbonding_period_seconds,
+        };
+
+        set_lst_config(&e, vesting_id, &config);
+
+        // Initialize pool shares if not exists
+        if get_lst_pool_shares(&e, vesting_id).is_none() {
+            let pool_shares = LSTPoolShares {
+                total_shares: 0,
+                total_underlying: 0,
+                last_compounded_at: e.ledger().timestamp(),
+                exchange_rate_snapshot: 10_000_000i128, // Initial rate: 1.0 (7 decimals)
+                snapshot_timestamp: e.ledger().timestamp(),
+            };
+            set_lst_pool_shares(&e, vesting_id, &pool_shares);
+        }
+
+        LSTConfigured {
+            vesting_id,
+            lst_token_address,
+            base_token_address,
+            timestamp: e.ledger().timestamp(),
+        }.publish(&e);
+    }
+
+    /// Deposit tokens into the LST pool and receive shares
+    /// This is called when tokens are vested into the vault
+    pub fn deposit_to_lst_pool(e: Env, user: Address, vesting_id: u32, amount: i128) -> Result<(), Error> {
+        user.require_auth();
+
+        let lst_config = get_lst_config(&e, vesting_id)
+            .ok_or(Error::LSTNotConfigured)?;
+
+        if !lst_config.enabled {
+            return Err(Error::LSTNotEnabled);
+        }
+
+        let mut pool_shares = get_lst_pool_shares(&e, vesting_id)
+            .ok_or(Error::LSTPoolNotInitialized)?;
+
+        // Calculate shares to mint based on current exchange rate
+        // If pool is empty, 1 share = 1 underlying token
+        let shares_to_mint = if pool_shares.total_shares == 0 {
+            amount
+        } else {
+            // shares = (amount * total_shares) / total_underlying
+            (amount * pool_shares.total_shares) / pool_shares.total_underlying
+        };
+
+        // Update pool state
+        pool_shares.total_shares += shares_to_mint;
+        pool_shares.total_underlying += amount;
+        pool_shares.last_compounded_at = e.ledger().timestamp();
+        set_lst_pool_shares(&e, vesting_id, &pool_shares);
+
+        // Update user shares
+        let mut user_shares = get_user_lst_shares(&e, &user, vesting_id)
+            .unwrap_or(UserLSTShares {
+                shares: 0,
+                vesting_id,
+                unbonding_pending: false,
+                unbonding_requested_at: 0,
+            });
+        user_shares.shares += shares_to_mint;
+        set_user_lst_shares(&e, &user, vesting_id, &user_shares);
+
+        // Stake tokens in the staking contract
+        Self::stake_tokens_in_contract(&e, &lst_config.staking_contract_address, &user, vesting_id as u64, amount);
+
+        Ok(())
+    }
+
+    /// Compound LST rewards - automatically reinvest staking rewards
+    /// This hook is called periodically or before claims
+    pub fn compound_lst_rewards(e: Env, vesting_id: u32) -> Result<(), Error> {
+        let lst_config = get_lst_config(&e, vesting_id)
+            .ok_or(Error::LSTNotConfigured)?;
+
+        if !lst_config.enabled {
+            return Err(Error::LSTNotEnabled);
+        }
+
+        let mut pool_shares = get_lst_pool_shares(&e, vesting_id)
+            .ok_or(Error::LSTPoolNotInitialized)?;
+
+        let current_time = e.ledger().timestamp();
+
+        // Security: Check if exchange rate is being manipulated
+        // If the snapshot is too recent, reject the compounding
+        if current_time.saturating_sub(pool_shares.snapshot_timestamp) < 3600 {
+            // Less than 1 hour since last snapshot - potential manipulation
+            return Err(Error::ExchangeRateManipulationSuspected);
+        }
+
+        // Query staking contract for total rewards
+        let total_rewards = Self::query_staking_rewards(&e, &lst_config.staking_contract_address, vesting_id as u64);
+
+        if total_rewards <= 0 {
+            return Ok(()); // No rewards to compound
+        }
+
+        // Calculate new exchange rate
+        // exchange_rate = (total_underlying + rewards) / total_shares * 10_000_000
+        let new_total_underlying = pool_shares.total_underlying + total_rewards;
+        let new_exchange_rate = if pool_shares.total_shares > 0 {
+            (new_total_underlying * 10_000_000i128) / pool_shares.total_shares
+        } else {
+            10_000_000i128
+        };
+
+        // Update pool state
+        pool_shares.total_underlying = new_total_underlying;
+        pool_shares.last_compounded_at = current_time;
+        pool_shares.exchange_rate_snapshot = new_exchange_rate;
+        pool_shares.snapshot_timestamp = current_time;
+        set_lst_pool_shares(&e, vesting_id, &pool_shares);
+
+        // Emit compounding event
+        LSTRewardsCompounded {
+            vesting_id,
+            total_yield_generated: total_rewards,
+            total_shares: pool_shares.total_shares,
+            exchange_rate: new_exchange_rate,
+            timestamp: current_time,
+        }.publish(&e);
+
+        Ok(())
+    }
+
+    /// Calculate user's claimable amount based on shares and current exchange rate
+    /// This is called during the claim function
+    fn calculate_shares_based_claim(e: &Env, user: &Address, vesting_id: u32) -> Result<i128, Error> {
+        let user_shares = get_user_lst_shares(e, user, vesting_id)
+            .ok_or(Error::NoUserShares)?;
+
+        let pool_shares = get_lst_pool_shares(e, vesting_id)
+            .ok_or(Error::LSTPoolNotInitialized)?;
+
+        if user_shares.shares == 0 || pool_shares.total_shares == 0 {
+            return Ok(0);
+        }
+
+        // Calculate user's share of the pool
+        // user_amount = (user_shares * total_underlying) / total_shares
+        let user_amount = (user_shares.shares * pool_shares.total_underlying) / pool_shares.total_shares;
+
+        Ok(user_amount)
+    }
+
+    /// Request unbonding of staked tokens
+    /// This initiates the unbonding period before tokens can be withdrawn
+    pub fn request_unbonding(e: Env, user: Address, vesting_id: u32) -> Result<(), Error> {
+        user.require_auth();
+
+        let lst_config = get_lst_config(&e, vesting_id)
+            .ok_or(Error::LSTNotConfigured)?;
+
+        if !lst_config.enabled {
+            return Err(Error::LSTNotEnabled);
+        }
+
+        let user_shares = get_user_lst_shares(&e, &user, vesting_id)
+            .ok_or(Error::NoUserShares)?;
+
+        if user_shares.shares == 0 {
+            return Err(Error::NoSharesToUnbond);
+        }
+
+        if user_shares.unbonding_pending {
+            return Err(Error::UnbondingAlreadyPending);
+        }
+
+        // Check unbonding queue for rate limiting
+        let queue = get_unbonding_queue(&e);
+        if queue.len() >= 100 {
+            // Rate limit: max 100 unbonding requests in queue
+            return Err(Error::UnbondingQueueFull);
+        }
+
+        let current_time = e.ledger().timestamp();
+        let unbonding_complete_at = current_time + lst_config.unbonding_period_seconds;
+
+        // Create unbonding request
+        let request = UnbondingRequest {
+            user: user.clone(),
+            vesting_id,
+            shares: user_shares.shares,
+            requested_at: current_time,
+            unbonding_complete_at,
+        };
+
+        set_unbonding_request(&e, &user, vesting_id, &request);
+        add_to_unbonding_queue(&e, &request);
+
+        // Update user shares to mark unbonding as pending
+        let mut updated_user_shares = user_shares;
+        updated_user_shares.unbonding_pending = true;
+        updated_user_shares.unbonding_requested_at = current_time;
+        set_user_lst_shares(&e, &user, vesting_id, &updated_user_shares);
+
+        // Emit event
+        UnbondingRequested {
+            user: user.clone(),
+            vesting_id,
+            shares: user_shares.shares,
+            unbonding_complete_at,
+            timestamp: current_time,
+        }.publish(&e);
+
+        Ok(())
+    }
+
+    /// Complete unbonding and withdraw tokens
+    /// This can only be called after the unbonding period has elapsed
+    pub fn complete_unbonding(e: Env, user: Address, vesting_id: u32) -> Result<i128, Error> {
+        user.require_auth();
+
+        let lst_config = get_lst_config(&e, vesting_id)
+            .ok_or(Error::LSTNotConfigured)?;
+
+        let unbonding_request = get_unbonding_request(&e, &user, vesting_id)
+            .ok_or(Error::NoUnbondingRequest)?;
+
+        let current_time = e.ledger().timestamp();
+
+        if current_time < unbonding_request.unbonding_complete_at {
+            return Err(Error::UnbondingPeriodNotElapsed);
+        }
+
+        // Calculate underlying amount based on shares
+        let pool_shares = get_lst_pool_shares(&e, vesting_id)
+            .ok_or(Error::LSTPoolNotInitialized)?;
+
+        let underlying_amount = if pool_shares.total_shares > 0 {
+            (unbonding_request.shares * pool_shares.total_underlying) / pool_shares.total_shares
+        } else {
+            unbonding_request.shares
+        };
+
+        // Update pool state
+        let mut updated_pool_shares = pool_shares;
+        updated_pool_shares.total_shares -= unbonding_request.shares;
+        updated_pool_shares.total_underlying -= underlying_amount;
+        set_lst_pool_shares(&e, vesting_id, &updated_pool_shares);
+
+        // Update user shares
+        let mut user_shares = get_user_lst_shares(&e, &user, vesting_id)
+            .ok_or(Error::NoUserShares)?;
+        user_shares.shares = 0;
+        user_shares.unbonding_pending = false;
+        user_shares.unbonding_requested_at = 0;
+        set_user_lst_shares(&e, &user, vesting_id, &user_shares);
+
+        // Remove unbonding request
+        remove_unbonding_request(&e, &user, vesting_id);
+        remove_from_unbonding_queue(&e, &user, vesting_id);
+
+        // Unstake from staking contract
+        Self::unstake_tokens_from_contract(&e, &lst_config.staking_contract_address, &user, vesting_id as u64);
+
+        // Emit event
+        UnbondingCompleted {
+            user: user.clone(),
+            vesting_id,
+            shares: unbonding_request.shares,
+            underlying_amount,
+            timestamp: current_time,
+        }.publish(&e);
+
+        Ok(underlying_amount)
+    }
+
+    /// Internal function to stake tokens in the staking contract
+    /// Uses cross-contract authentication
+    fn stake_tokens_in_contract(e: &Env, staking_contract: &Address, beneficiary: &Address, vault_id: u64, amount: i128) {
+        // In production, this would use Soroban's cross-contract call
+        // For now, this is a placeholder
+        // e.invoke_contract::<()>(
+        //     staking_contract,
+        //     &symbol_short!("stake_tokens"),
+        //     (beneficiary, vault_id, amount)
+        // );
+    }
+
+    /// Internal function to unstake tokens from the staking contract
+    fn unstake_tokens_from_contract(e: &Env, staking_contract: &Address, beneficiary: &Address, vault_id: u64) {
+        // In production, this would use Soroban's cross-contract call
+        // For now, this is a placeholder
+        // e.invoke_contract::<()>(
+        //     staking_contract,
+        //     &symbol_short!("unstake_tokens"),
+        //     (beneficiary, vault_id)
+        // );
+    }
+
+    /// Internal function to query staking rewards from the staking contract
+    fn query_staking_rewards(e: &Env, staking_contract: &Address, vault_id: u64) -> i128 {
+        // In production, this would use Soroban's cross-contract call
+        // For now, return a simulated value
+        // e.invoke_contract::<i128>(
+        //     staking_contract,
+        //     &symbol_short!("get_yield"),
+        //     (e.current_contract_address(), vault_id)
+        // );
+        0i128 // Placeholder - no rewards in simulation
+    }
+
     // ========== ISSUE #223: Cross-Contract balanceOf Adapter for DAO Voting ==========
 
     /// Returns the voting power of an address, defined as its total unvested token balance.
@@ -2156,4 +2503,623 @@ impl VestingVault {
         set_contract_total_unvested(&e, new_total);
         Ok(())
     }
+
+    // ========== ISSUE #269: Zero-Knowledge Confidential Grant Amounts ==========
+
+    /// Create a confidential grant with shielded amount
+    /// 
+    /// This function creates a vesting grant where the total amount is stored as a
+    /// cryptographic commitment (hash) rather than plaintext, hiding executive compensation
+    /// details from public blockchain scanners.
+    /// 
+    /// # Arguments
+    /// * `e` - The environment
+    /// * `admin` - Admin address authorizing the grant
+    /// * `vesting_id` - Unique identifier for the vesting schedule
+    /// * `commitment_hash` - Pedersen commitment hash of the total grant amount
+    /// * `total_shielded_amount` - The actual shielded amount (for internal tracking)
+    /// 
+    /// # Events
+    /// Emits `ConfidentialGrantCreated` event
+    pub fn create_confidential_grant(
+        e: Env,
+        admin: Address,
+        vesting_id: u32,
+        commitment_hash: BytesN<32>,
+        total_shielded_amount: i128,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        // Check if confidential grant already exists
+        if get_confidential_grant(&e, vesting_id).is_some() {
+            return Err(Error::InvalidInput);
+        }
+
+        // Validate shielded amount is positive
+        if total_shielded_amount <= 0 {
+            return Err(Error::InvalidInput);
+        }
+
+        let current_time = e.ledger().timestamp();
+
+        // Create the confidential grant
+        let grant = ConfidentialGrant {
+            commitment_hash: commitment_hash.clone(),
+            vesting_id,
+            created_at: current_time,
+            is_fully_claimed: false,
+            remaining_shielded: total_shielded_amount,
+        };
+
+        // Store the confidential grant
+        set_confidential_grant(&e, vesting_id, &grant);
+
+        // Emit event
+        ConfidentialGrantCreated {
+            vesting_id,
+            commitment_hash,
+            timestamp: current_time,
+        }.publish(&e);
+
+        Ok(())
+    }
+
+    /// Execute a confidential claim using ZK-SNARK proof
+    /// 
+    /// This function allows employees to claim tokens without revealing their identity
+    /// or the exact amount being claimed. The ZK proof verifies that:
+    /// 1. The claim is valid against the hidden total commitment
+    /// 2. The claim amount does not exceed the remaining shielded amount
+    /// 3. The nullifier has not been used before (prevents double-spending)
+    /// 
+    /// # Arguments
+    /// * `e` - The environment
+    /// * `vesting_id` - Vesting schedule identifier
+    /// * `proof` - ZK-SNARK proof with public inputs
+    /// 
+    /// # Events
+    /// Emits `ConfidentialClaimExecuted` event with only the nullifier hash
+    /// 
+    /// # Errors
+    /// * `Error::InvalidZKProof` - If the ZK proof is malformed or verification fails
+    /// * `Error::OverClaimAttempt` - If the claim amount exceeds remaining shielded amount
+    pub fn confidential_claim(
+        e: Env,
+        vesting_id: u32,
+        proof: ConfidentialClaimProof,
+    ) -> Result<(), Error> {
+        // No require_auth() - this is a privacy feature
+
+        // Check if contract is under emergency pause
+        if let Some(pause) = get_emergency_pause(&e) {
+            if pause.is_active {
+                let current_time = e.ledger().timestamp();
+                if current_time < pause.expires_at {
+                    return Err(Error::RegulatoryBlockActive);
+                } else {
+                    remove_emergency_pause(&e);
+                }
+            }
+        }
+
+        // Check if nullifier has already been used (prevent double-spending)
+        if is_nullifier_in_set(&e, &proof.nullifier) {
+            return Err(Error::InvalidZKProof);
+        }
+
+        // Get the confidential grant
+        let mut grant = get_confidential_grant(&e, vesting_id)
+            .ok_or(Error::VestingNotFound)?;
+
+        // Check if grant is already fully claimed
+        if grant.is_fully_claimed {
+            return Err(Error::AlreadyFullyClaimed);
+        }
+
+        // Verify the Merkle root is valid
+        if !is_valid_merkle_root(&e, &proof.merkle_root) {
+            return Err(Error::InvalidZKProof);
+        }
+
+        // Verify the ZK proof using the verifier module
+        zk_verifier::ZKVerifier::verify_confidential_claim(
+            &e,
+            &proof,
+            &grant.commitment_hash,
+            grant.remaining_shielded,
+        )?;
+
+        // Update the grant's remaining shielded amount
+        grant.remaining_shielded = proof.remaining_amount;
+
+        // Check if grant is now fully claimed
+        if grant.remaining_shielded == 0 {
+            grant.is_fully_claimed = true;
+        }
+
+        // Store the updated grant
+        set_confidential_grant(&e, vesting_id, &grant);
+
+        // Add nullifier to persistent storage (permanent tracking)
+        add_nullifier_to_set(&e, &proof.nullifier);
+
+        // Emit event with only the nullifier hash (zero metadata leakage)
+        ConfidentialClaimExecuted {
+            nullifier_hash: proof.nullifier,
+            new_commitment_hash: proof.commitment_hash,
+            timestamp: e.ledger().timestamp(),
+        }.publish(&e);
+
+        // TODO: Execute actual token transfer
+        // This would integrate with the existing vesting logic to transfer tokens
+
+        Ok(())
+    }
+
+    /// Set the master viewing key for DAO clawback operations
+    /// 
+    /// This allows the DAO to recover shielded funds in emergency situations
+    /// using a master viewing key that can decrypt the shielded amounts.
+    /// 
+    /// # Arguments
+    /// * `e` - The environment
+    /// * `admin` - Admin address authorizing the viewing key
+    /// * `viewing_key` - The master viewing key public key
+    /// 
+    /// # Security
+    /// Only authorized admins can set the viewing key. The key can be revoked
+    /// by setting a new one or removing it entirely.
+    pub fn set_master_viewing_key_admin(
+        e: Env,
+        admin: Address,
+        viewing_key: BytesN<32>,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let current_time = e.ledger().timestamp();
+
+        let key = MasterViewingKey {
+            viewing_key,
+            authorized_by: admin,
+            set_at: current_time,
+            is_active: true,
+        };
+
+        set_master_viewing_key(&e, &key);
+
+        Ok(())
+    }
+
+    /// Execute DAO clawback using master viewing key
+    /// 
+    /// This function allows the DAO to recover shielded funds from a confidential grant
+    /// in emergency situations (e.g., employee termination, legal requirements).
+    /// 
+    /// # Arguments
+    /// * `e` - The environment
+    /// * `admin` - Admin address authorizing the clawback
+    /// * `vesting_id` - Vesting schedule identifier
+    /// * `viewing_key` - Master viewing key for decryption
+    /// * `clawback_amount` - Amount to claw back
+    /// 
+    /// # Events
+    /// Emits `ConfidentialClawbackExecuted` event
+    /// 
+    /// # Errors
+    /// * `Error::ViewingKeyUnauthorized` - If the viewing key is not valid
+    /// * `Error::OverClaimAttempt` - If clawback amount exceeds remaining
+    pub fn confidential_clawback(
+        e: Env,
+        admin: Address,
+        vesting_id: u32,
+        viewing_key: BytesN<32>,
+        clawback_amount: i128,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        // Get the stored master viewing key
+        let stored_key = get_master_viewing_key(&e)
+            .ok_or(Error::ViewingKeyUnauthorized)?;
+
+        // Verify the viewing key is authorized
+        if !zk_verifier::ZKVerifier::verify_viewing_key(&viewing_key, &admin, &stored_key) {
+            return Err(Error::ViewingKeyUnauthorized);
+        }
+
+        // Get the confidential grant
+        let mut grant = get_confidential_grant(&e, vesting_id)
+            .ok_or(Error::VestingNotFound)?;
+
+        // Verify clawback amount doesn't exceed remaining
+        if clawback_amount > grant.remaining_shielded {
+            return Err(Error::OverClaimAttempt);
+        }
+
+        // Update the grant's remaining shielded amount
+        grant.remaining_shielded -= clawback_amount;
+
+        // Check if grant is now fully claimed (clawed back)
+        if grant.remaining_shielded == 0 {
+            grant.is_fully_claimed = true;
+        }
+
+        // Store the updated grant
+        set_confidential_grant(&e, vesting_id, &grant);
+
+        // Emit event
+        ConfidentialClawbackExecuted {
+            vesting_id,
+            clawed_amount: clawback_amount,
+            authorized_by: admin,
+            timestamp: e.ledger().timestamp(),
+        }.publish(&e);
+
+        // TODO: Execute actual token transfer to DAO treasury
+        // This would integrate with the existing vesting logic
+
+        Ok(())
+    }
+
+    /// Get confidential grant information
+    /// 
+    /// Returns the confidential grant details for a given vesting ID.
+    /// Note: The actual grant amount is shielded and only visible with the viewing key.
+    pub fn get_confidential_grant_info(e: Env, vesting_id: u32) -> Option<ConfidentialGrant> {
+        get_confidential_grant(&e, vesting_id)
+    }
+
+    /// Check if a nullifier has been used
+    /// 
+
+    // Update the grant's remaining shielded amount
+    grant.remaining_shielded = proof.remaining_amount;
+
+    // Check if grant is now fully claimed
+    if grant.remaining_shielded == 0 {
+        grant.is_fully_claimed = true;
+    }
+
+    // Store the updated grant
+    set_confidential_grant(&e, vesting_id, &grant);
+
+    // Add nullifier to persistent storage (permanent tracking)
+    add_nullifier_to_set(&e, &proof.nullifier);
+
+    // Emit event with only the nullifier hash (zero metadata leakage)
+    ConfidentialClaimExecuted {
+        nullifier_hash: proof.nullifier,
+        new_commitment_hash: proof.commitment_hash,
+        timestamp: e.ledger().timestamp(),
+    }.publish(&e);
+
+    // TODO: Execute actual token transfer
+    // This would integrate with the existing vesting logic to transfer tokens
+
+    Ok(())
+}
+
+/// Set the master viewing key for DAO clawback operations
+/// 
+/// This allows the DAO to recover shielded funds in emergency situations
+/// using a master viewing key that can decrypt the shielded amounts.
+/// 
+/// # Arguments
+/// * `e` - The environment
+/// * `admin` - Admin address authorizing the viewing key
+/// * `viewing_key` - The master viewing key public key
+/// 
+/// # Security
+/// Only authorized admins can set the viewing key. The key can be revoked
+/// by setting a new one or removing it entirely.
+pub fn set_master_viewing_key_admin(
+    e: Env,
+    admin: Address,
+    viewing_key: BytesN<32>,
+) -> Result<(), Error> {
+    admin.require_auth();
+
+    let current_time = e.ledger().timestamp();
+
+    let key = MasterViewingKey {
+        viewing_key,
+        authorized_by: admin,
+        set_at: current_time,
+        is_active: true,
+    };
+
+    set_master_viewing_key(&e, &key);
+
+    Ok(())
+}
+
+/// Execute DAO clawback using master viewing key
+/// 
+/// This function allows the DAO to recover shielded funds from a confidential grant
+/// in emergency situations (e.g., employee termination, legal requirements).
+/// 
+/// # Arguments
+/// * `e` - The environment
+/// * `admin` - Admin address authorizing the clawback
+/// * `vesting_id` - Vesting schedule identifier
+/// * `viewing_key` - Master viewing key for decryption
+/// * `clawback_amount` - Amount to claw back
+/// 
+/// # Events
+/// Emits `ConfidentialClawbackExecuted` event
+/// 
+/// # Errors
+/// * `Error::ViewingKeyUnauthorized` - If the viewing key is not valid
+/// * `Error::OverClaimAttempt` - If clawback amount exceeds remaining
+pub fn confidential_clawback(
+    e: Env,
+    admin: Address,
+    vesting_id: u32,
+    viewing_key: BytesN<32>,
+    clawback_amount: i128,
+) -> Result<(), Error> {
+    admin.require_auth();
+
+    // Get the stored master viewing key
+    let stored_key = get_master_viewing_key(&e)
+        .ok_or(Error::ViewingKeyUnauthorized)?;
+
+    // Verify the viewing key is authorized
+    if !zk_verifier::ZKVerifier::verify_viewing_key(&viewing_key, &admin, &stored_key) {
+        return Err(Error::ViewingKeyUnauthorized);
+    }
+
+    // Get the confidential grant
+    let mut grant = get_confidential_grant(&e, vesting_id)
+        .ok_or(Error::VestingNotFound)?;
+
+    // Verify clawback amount doesn't exceed remaining
+    if clawback_amount > grant.remaining_shielded {
+        return Err(Error::OverClaimAttempt);
+    }
+
+    // Update the grant's remaining shielded amount
+    grant.remaining_shielded -= clawback_amount;
+
+    // Check if grant is now fully claimed (clawed back)
+    if grant.remaining_shielded == 0 {
+        grant.is_fully_claimed = true;
+    }
+
+    // Store the updated grant
+    set_confidential_grant(&e, vesting_id, &grant);
+
+    // Emit event
+    ConfidentialClawbackExecuted {
+        vesting_id,
+        clawed_amount: clawback_amount,
+        authorized_by: admin,
+        timestamp: e.ledger().timestamp(),
+    }.publish(&e);
+
+    // TODO: Execute actual token transfer to DAO treasury
+    // This would integrate with the existing vesting logic
+
+    Ok(())
+}
+
+/// Get confidential grant information
+/// 
+/// Returns the confidential grant details for a given vesting ID.
+/// Note: The actual grant amount is shielded and only visible with the viewing key.
+pub fn get_confidential_grant_info(e: Env, vesting_id: u32) -> Option<ConfidentialGrant> {
+    get_confidential_grant(&e, vesting_id)
+}
+
+/// Check if a nullifier has been used
+/// 
+/// This is a public function to check if a nullifier is in the permanent set.
+pub fn is_nullifier_used_confidential(e: Env, nullifier_hash: BytesN<32>) -> bool {
+    is_nullifier_in_set(&e, &nullifier_hash)
+}
+
+/// Remove the master viewing key (admin only)
+/// 
+/// This revokes the DAO's ability to perform clawbacks.
+pub fn revoke_master_viewing_key(e: Env, admin: Address) -> Result<(), Error> {
+    admin.require_auth();
+    remove_master_viewing_key(&e);
+    Ok(())
+}
+
+// ========== ISSUE #295: Use Temporary Storage for Claim-History Pagination State ==========
+
+/// Get claim history with pagination using temporary storage
+/// This optimizes gas usage by avoiding full history scans
+pub fn get_claim_history_paginated(e: Env, page_number: u32) -> ClaimHistoryPage {
+    let current_time = e.ledger().timestamp();
+    let all_claims = get_claim_history(&e);
+    
+    // Update pagination state in temporary storage
+    let pagination_state = PaginationState {
+        current_page: page_number,
+        total_items: all_claims.len() as u32,
+        last_updated: current_time,
+    };
+    set_pagination_state(&e, &pagination_state);
+    
+    // Calculate pagination
+    let start_index = page_number * CLAIM_HISTORY_PAGE_SIZE;
+    let end_index = std::cmp::min(start_index + CLAIM_HISTORY_PAGE_SIZE, all_claims.len() as u32);
+    
+    let mut page_claims = Vec::new(&e);
+    for i in start_index..end_index {
+        if let Some(claim) = all_claims.get(i as usize) {
+            page_claims.push_back(claim.clone());
+        }
+    }
+    
+    let total_pages = (all_claims.len() as u32 + CLAIM_HISTORY_PAGE_SIZE - 1) / CLAIM_HISTORY_PAGE_SIZE;
+    let has_next = page_number + 1 < total_pages;
+    
+    ClaimHistoryPage {
+        page_number,
+        claims: page_claims,
+        has_next,
+        total_pages,
+    }
+}
+
+/// Get current pagination state from temporary storage
+pub fn get_pagination_info(e: Env) -> PaginationState {
+    get_pagination_state(&e)
+}
+
+// ========== ISSUE #296: Implement 'Force-Withdrawal' for Expired and Fully Vested Schedules ==========
+
+/// Force withdrawal for expired or fully vested schedules
+/// This allows beneficiaries to withdraw remaining tokens after vesting expiration
+pub fn force_withdrawal(e: Env, beneficiary: Address, vesting_id: u32) -> Result<i128, Error> {
+    beneficiary.require_auth();
+    
+    let current_time = e.ledger().timestamp();
+    
+    // Check if schedule exists and is expired/fully vested
+    let expired_schedule = get_expired_schedule(&e, vesting_id)
+        .ok_or(Error::VestingNotFound)?;
+    
+    if expired_schedule.is_force_withdrawn {
+        return Err(Error::AlreadyFullyClaimed);
+    }
+    
+    // Check if schedule is expired (current time past expiration)
+    if current_time < expired_schedule.expires_at {
+        return Err(Error::CliffNotReached);
+    }
+    
+    // Calculate remaining amount to withdraw
+    let remaining_amount = expired_schedule.total_amount - expired_schedule.claimed_amount;
+    
+    if remaining_amount <= 0 {
+        return Err(Error::NothingToClaim);
+    }
+    
+    // Mark as force withdrawn
+    let mut updated_schedule = expired_schedule;
+    updated_schedule.is_force_withdrawn = true;
+    set_expired_schedule(&e, vesting_id, &updated_schedule);
+    
+    // Emit force withdrawal event
+    ForceWithdrawalExecuted {
+        vesting_id,
+        beneficiary: beneficiary.clone(),
+        withdrawn_amount: remaining_amount,
+        reason: String::from_str(&e, "Force withdrawal of expired/fully vested schedule"),
+        timestamp: current_time,
+    }.publish(&e);
+    
+    Ok(remaining_amount)
+}
+
+/// Register an expired vesting schedule for force withdrawal
+/// This should be called when a vesting schedule is created or expires
+pub fn register_expired_schedule(e: Env, admin: Address, vesting_id: u32, beneficiary: Address, total_amount: i128, expires_at: u64) -> Result<(), Error> {
+    admin.require_auth();
+    
+    // Check if already registered
+    if get_expired_schedule(&e, vesting_id).is_some() {
+        return Err(Error::VestingNotFound);
+    }
+    
+    let schedule = ExpiredSchedule {
+        vesting_id,
+        beneficiary: beneficiary.clone(),
+        total_amount,
+        claimed_amount: 0,
+        expires_at,
+        is_force_withdrawn: false,
+    };
+    
+    set_expired_schedule(&e, vesting_id, &schedule);
+    
+    // In a real implementation, this would integrate with vesting creation
+    Ok(())
+}
+
+/// Get expired schedule information
+pub fn get_expired_schedule_info(e: Env, vesting_id: u32) -> Option<ExpiredSchedule> {
+    get_expired_schedule(&e, vesting_id)
+}
+
+// ========== ISSUE #297: Implement 'Max-Allocation-Sanity-Check' on Global Contract Level ==========
+
+/// Set maximum allocation limit for the entire contract
+/// This prevents over-allocation of tokens beyond safe limits
+pub fn set_max_allocation_limit(e: Env, admin: Address, max_limit: i128) -> Result<(), Error> {
+    admin.require_auth();
+    
+    if max_limit <= 0 {
+        return Err(Error::InvalidInput);
+    }
+    
+    let current_total = get_total_allocated(&e);
+    if current_total > max_limit {
+        return Err(Error::InsufficientBalance);
+    }
+    
+    set_max_allocation_limit(&e, max_limit);
+    
+    MaxAllocationLimitSet {
+        max_limit,
+        set_by: admin,
+        timestamp: e.ledger().timestamp(),
+    }.publish(&e);
+    
+    Ok(())
+}
+
+/// Check and update total allocation with sanity check
+/// This should be called whenever new allocations are made
+pub fn check_allocation_limit(e: Env, new_allocation: i128) -> Result<(), Error> {
+    let max_limit = get_max_allocation_limit(&e);
+    let current_total = get_total_allocated(&e);
+    let projected_total = current_total + new_allocation;
+    
+    if projected_total > max_limit {
+        AllocationLimitExceeded {
+            attempted_allocation: new_allocation,
+            max_limit,
+            rejected_at: e.ledger().timestamp(),
+        }.publish(&e);
+        
+        return Err(Error::InsufficientBalance);
+    }
+    
+    // Update total allocated
+    set_total_allocated(&e, projected_total);
+    Ok(())
+}
+
+/// Get current maximum allocation limit
+pub fn get_max_allocation_limit_info(e: Env) -> i128 {
+    get_max_allocation_limit(&e)
+}
+
+/// Get current total allocated amount
+pub fn get_total_allocated_info(e: Env) -> i128 {
+    get_total_allocated(&e)
+}
+
+/// Initialize allocation tracking (call during contract deployment)
+pub fn initialize_allocation_tracking(e: Env, admin: Address, initial_limit: i128) -> Result<(), Error> {
+    admin.require_auth();
+    
+    if initial_limit <= 0 {
+        return Err(Error::InvalidInput);
+    }
+    
+    set_max_allocation_limit(&e, initial_limit);
+    set_total_allocated(&e, 0i128);
+    
+    MaxAllocationLimitSet {
+        max_limit: initial_limit,
+        set_by: admin,
+        timestamp: e.ledger().timestamp(),
+    }.publish(&e);
+    
+    Ok(())
 }

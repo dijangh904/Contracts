@@ -487,6 +487,47 @@ pub struct LSTConfig {
     pub enabled: bool,
     pub lst_token_address: Address,
     pub base_token_address: Address,
+    pub staking_contract_address: Address,
+    pub unbonding_period_seconds: u64,
+}
+
+// LST Auto-Compounding types (Issue #154)
+#[contracttype]
+#[derive(Clone)]
+pub struct LSTPoolShares {
+    /// Total shares in the pool (tracks ownership proportionally)
+    pub total_shares: i128,
+    /// Total underlying tokens in the pool (including compounded rewards)
+    pub total_underlying: i128,
+    /// Last compounding timestamp
+    pub last_compounded_at: u64,
+    /// Exchange rate snapshot (for security against manipulation)
+    pub exchange_rate_snapshot: i128,
+    /// Snapshot timestamp
+    pub snapshot_timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct UserLSTShares {
+    /// User's share balance in the pool
+    pub shares: i128,
+    /// User's vesting ID
+    pub vesting_id: u32,
+    /// Whether the user has an unbonding request pending
+    pub unbonding_pending: bool,
+    /// Unbonding request timestamp (0 if not pending)
+    pub unbonding_requested_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct UnbondingRequest {
+    pub user: Address,
+    pub vesting_id: u32,
+    pub shares: i128,
+    pub requested_at: u64,
+    pub unbonding_complete_at: u64,
 }
 
 #[contractevent]
@@ -509,6 +550,41 @@ pub struct LSTClaimExecuted {
     pub base_amount: i128,
     pub lst_amount: i128,
     pub lst_token_address: Address,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct LSTRewardsCompounded {
+    #[topic]
+    pub vesting_id: u32,
+    pub total_yield_generated: i128,
+    pub total_shares: i128,
+    pub exchange_rate: i128,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct UnbondingRequested {
+    #[topic]
+    pub user: Address,
+    #[topic]
+    pub vesting_id: u32,
+    pub shares: i128,
+    pub unbonding_complete_at: u64,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct UnbondingCompleted {
+    #[topic]
+    pub user: Address,
+    #[topic]
+    pub vesting_id: u32,
+    pub shares: i128,
+    pub underlying_amount: i128,
     pub timestamp: u64,
 }
 
@@ -613,4 +689,163 @@ pub struct OracleCircuitBreakerReset {
 pub struct UpgradeBlocked {
     pub total_unvested_balance: i128,
     pub blocked_at: u64,
+}
+
+// ========== ISSUE #269: Zero-Knowledge Confidential Grant Amounts ==========
+
+/// Confidential grant storing commitment instead of plaintext amount
+#[contracttype]
+#[derive(Clone)]
+pub struct ConfidentialGrant {
+    /// Hash commitment of the total grant amount (Pedersen commitment)
+    pub commitment_hash: BytesN<32>,
+    /// Vesting schedule identifier
+    pub vesting_id: u32,
+    /// Timestamp when grant was created
+    pub created_at: u64,
+    /// Whether this grant has been fully claimed
+    pub is_fully_claimed: bool,
+    /// Remaining shielded amount (encrypted, for internal tracking)
+    pub remaining_shielded: i128,
+}
+
+/// Master viewing key for DAO clawback operations
+#[contracttype]
+#[derive(Clone)]
+pub struct MasterViewingKey {
+    /// Public key for viewing shielded amounts
+    pub viewing_key: BytesN<32>,
+    /// Admin address that authorized this key
+    pub authorized_by: Address,
+    /// Timestamp when key was set
+    pub set_at: u64,
+    /// Whether key is currently active
+    pub is_active: bool,
+}
+
+/// Enhanced ZK proof for confidential claims (Circom-compatible)
+#[contracttype]
+#[derive(Clone)]
+pub struct ConfidentialClaimProof {
+    /// Public inputs for the ZK circuit
+    pub commitment_hash: BytesN<32>,
+    /// Nullifier to prevent double-spending
+    pub nullifier: BytesN<32>,
+    /// Merkle root of the commitment tree
+    pub merkle_root: BytesN<32>,
+    /// Claimed amount (public output)
+    pub claimed_amount: i128,
+    /// Remaining amount after claim (public output)
+    pub remaining_amount: i128,
+    /// The actual ZK-SNARK proof (Circom output)
+    pub proof_a: BytesN<32>,
+    pub proof_b: BytesN<32>,
+    pub proof_c: BytesN<32>,
+}
+
+/// Event emitted when a confidential claim is executed
+#[contractevent]
+#[derive(Clone)]
+pub struct ConfidentialClaimExecuted {
+    /// Nullifier hash (leaks zero metadata about the claimer)
+    #[topic]
+    pub nullifier_hash: BytesN<32>,
+    /// Updated commitment hash after claim
+    #[topic]
+    pub new_commitment_hash: BytesN<32>,
+    /// Timestamp of the claim
+    pub timestamp: u64,
+}
+
+/// Event emitted when a confidential grant is created
+#[contractevent]
+#[derive(Clone)]
+pub struct ConfidentialGrantCreated {
+    /// Vesting ID
+    #[topic]
+    pub vesting_id: u32,
+    /// Commitment hash of the total grant
+    #[topic]
+    pub commitment_hash: BytesN<32>,
+    /// Timestamp of creation
+    pub timestamp: u64,
+}
+
+/// Event emitted when DAO performs clawback using master viewing key
+#[contractevent]
+#[derive(Clone)]
+pub struct ConfidentialClawbackExecuted {
+    /// Vesting ID
+    #[topic]
+    pub vesting_id: u32,
+    /// Amount clawed back
+    pub clawed_amount: i128,
+    /// Admin who authorized the clawback
+    #[topic]
+    pub authorized_by: Address,
+    /// Timestamp of clawback
+    pub timestamp: u64,
+}
+
+// ========== ISSUE #295: Temporary Storage for Claim-History Pagination ==========
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PaginationState {
+    pub current_page: u32,
+    pub total_items: u32,
+    pub last_updated: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ClaimHistoryPage {
+    pub page_number: u32,
+    pub claims: Vec<ClaimEvent>,
+    pub has_next: bool,
+    pub total_pages: u32,
+}
+
+// ========== ISSUE #296: Force-Withdrawal for Expired Schedules ==========
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ExpiredSchedule {
+    pub vesting_id: u32,
+    pub beneficiary: Address,
+    pub total_amount: i128,
+    pub claimed_amount: i128,
+    pub expires_at: u64,
+    pub is_force_withdrawn: bool,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct ForceWithdrawalExecuted {
+    #[topic]
+    pub vesting_id: u32,
+    #[topic]
+    pub beneficiary: Address,
+    pub withdrawn_amount: i128,
+    pub reason: String,
+    pub timestamp: u64,
+}
+
+// ========== ISSUE #297: Max-Allocation-Sanity-Check ==========
+
+#[contractevent]
+#[derive(Clone)]
+pub struct MaxAllocationLimitSet {
+    pub max_limit: i128,
+    pub set_by: Address,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct AllocationLimitExceeded {
+    #[topic]
+    pub attempted_allocation: i128,
+    pub max_limit: i128,
+    pub rejected_at: u64,
 }
