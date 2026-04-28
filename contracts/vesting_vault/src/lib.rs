@@ -10,7 +10,8 @@ pub mod errors;
 
 pub use types::*;
 use errors::Error;
-use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_lst_config, set_lst_config, get_unvested_balance, set_unvested_balance, get_admin_dead_man_switch, set_admin_dead_man_switch, get_oracle_price_record, set_oracle_price_record, get_contract_total_unvested, set_contract_total_unvested, get_tax_config, set_tax_config, get_cumulative_taxes, add_cumulative_taxes };
+use storage::*;
+use storage::{get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request};
 use emergency::{AuditorPauseRequest, EmergencyPause, EmergencyPauseTriggered};
 
 #[contract]
@@ -233,7 +234,6 @@ impl VestingVault {
                         gross_amount: gross,
                         tax_amount: tax,
                         net_amount: net,
-                        tax_asset: cfg.tax_asset.clone(),
                         timestamp: e.ledger().timestamp(),
                     }.publish(&e);
 
@@ -991,6 +991,12 @@ impl VestingVault {
         
         simulated_destination_amount
     }
+
+    /// Helper to simulate path payment result. Returns a conservative estimate.
+    fn simulate_path_payment_result(_e: &Env, source_amount: i128, _destination_asset: &Address, _path: &Vec<Address>) -> i128 {
+        // For now, assume 1:1 with no fees. Replace with DEX or oracle integration.
+        source_amount
+    }
     
     /// Check if a user's tokens are unlocked for a specific vesting schedule
     pub fn is_user_unlocked(e: Env, user: Address, vesting_id: u32) -> bool {
@@ -1235,7 +1241,7 @@ impl VestingVault {
         set_beneficiary_reassignment(&e, reassignment_id, &reassignment);
         
         // Emit reassignment request event
-        BeneficiaryReassignmentRequested {
+        e.events().publish(("beneficiary_reassignment_requested", reassignment_id), BeneficiaryReassignmentRequested {
             reassignment_id,
             vesting_id,
             current_beneficiary: current_beneficiary.clone(),
@@ -1243,16 +1249,16 @@ impl VestingVault {
             total_amount,
             effective_at,
             requires_governance_veto,
-        }.publish(&e);
+        });
         
         // If governance veto is required, start veto period
         if requires_governance_veto {
-            VetoPeriodStarted {
+            e.events().publish(("veto_period_started", reassignment_id), VetoPeriodStarted {
                 reassignment_id,
                 vesting_id,
                 veto_deadline: effective_at,
                 threshold_percentage: threshold,
-            }.publish(&e);
+            });
         }
     }
     
@@ -1274,7 +1280,7 @@ impl VestingVault {
         // Check if governance veto was triggered
         if reassignment.requires_governance_veto {
             let veto_votes = get_veto_votes(&e, reassignment_id);
-            let total_veto_power = veto_votes.iter()
+            let total_veto_power: i128 = veto_votes.iter()
                 .filter(|vote| vote.vote_for_veto)
                 .map(|vote| vote.voting_power)
                 .sum();
@@ -1296,13 +1302,13 @@ impl VestingVault {
         // For now, we'll just emit the event
         
         // Emit execution event
-        BeneficiaryReassignmentExecuted {
+        e.events().publish(("beneficiary_reassignment_executed", reassignment_id), BeneficiaryReassignmentExecuted {
             reassignment_id,
             vesting_id: reassignment.vesting_id,
             old_beneficiary: reassignment.current_beneficiary,
             new_beneficiary: reassignment.new_beneficiary,
             executed_at: current_time,
-        }.publish(&e);
+        });
     }
     
     /// Cast a vote for or against a beneficiary reassignment
@@ -1343,17 +1349,17 @@ impl VestingVault {
         add_veto_vote(&e, reassignment_id, &vote);
         
         // Emit vote event
-        VetoVoteCast {
+        e.events().publish(("veto_vote_cast", reassignment_id), VetoVoteCast {
             voter: voter.clone(),
             reassignment_id,
             vote_for_veto,
             voting_power,
             voted_at: current_time,
-        }.publish(&e);
+        });
         
         // Check if veto threshold is reached
         let all_votes = get_veto_votes(&e, reassignment_id);
-        let total_veto_power = all_votes.iter()
+        let total_veto_power: i128 = all_votes.iter()
             .filter(|vote| vote.vote_for_veto)
             .map(|vote| vote.voting_power)
             .sum();
@@ -1367,12 +1373,12 @@ impl VestingVault {
             remove_beneficiary_reassignment(&e, reassignment_id);
             
             // Emit veto event
-            ReassignmentVetoed {
+            e.events().publish(("reassignment_vetoed", reassignment_id), ReassignmentVetoed {
                 reassignment_id,
                 veto_triggered_by: voter,
                 veto_power: total_veto_power,
                 vetoed_at: current_time,
-            }.publish(&e);
+            });
         }
     }
     
@@ -1408,7 +1414,7 @@ impl VestingVault {
     /// Get veto status for a reassignment
     pub fn get_veto_status(e: Env, reassignment_id: u32) -> (bool, i128, i128) {
         let votes = get_veto_votes(&e, reassignment_id);
-        let total_veto_power = votes.iter()
+        let total_veto_power: i128 = votes.iter()
             .filter(|vote| vote.vote_for_veto)
             .map(|vote| vote.voting_power)
             .sum();

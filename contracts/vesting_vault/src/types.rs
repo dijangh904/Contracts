@@ -103,8 +103,105 @@ pub struct TaxWithheld {
     pub gross_amount: i128,
     pub tax_amount: i128,
     pub net_amount: i128,
-    pub tax_asset: Option<Address>,
     pub timestamp: u64,
+}
+
+// Backwards-compatible tax withholding config used by other helpers
+#[contracttype]
+#[derive(Clone)]
+pub struct TaxWithholdingConfig {
+    pub tax_treasury_address: Address,
+    pub tax_withholding_bps: u32,
+    pub enabled: bool,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct TaxWithholdingConfigured {
+    pub tax_treasury_address: Address,
+    pub tax_withholding_bps: u32,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct TaxWithholdingDisabled {
+    pub timestamp: u64,
+}
+
+// SEP-12 Oracle config
+#[contracttype]
+#[derive(Clone)]
+pub struct SEP12IdentityOracle {
+    pub contract_address: Address,
+    pub enabled: bool,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct SEP12OracleConfigured {
+    pub oracle_address: Address,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct SEP12KYCDisabled {
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct KYCCheckFailed {
+    #[topic]
+    pub beneficiary: Address,
+    pub reason: String,
+    pub timestamp: u64,
+}
+
+// Token metadata registry
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenMetadata {
+    pub asset_address: Address,
+    pub decimals: u32,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct TokenMetadataRegistered {
+    pub asset_address: Address,
+    pub decimals: u32,
+    pub timestamp: u64,
+}
+
+// Vesting grant for revocability expiration
+#[contracttype]
+#[derive(Clone)]
+pub struct VestingGrant {
+    pub vesting_id: u32,
+    pub beneficiary: Address,
+    pub created_at: u64,
+    pub is_revocable: bool,
+    pub revocability_expires_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct VestingGrantCreated {
+    pub vesting_id: u32,
+    pub beneficiary: Address,
+    pub is_revocable: bool,
+    pub revocability_expires_at: u64,
+    pub created_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct RevocabilityExpired {
+    pub vesting_id: u32,
+    pub beneficiary: Address,
+    pub expired_at: u64,
 }
 
 // Reputation bridge types
@@ -323,77 +420,61 @@ pub struct TokenSupplyInfo {
     pub last_updated: u64,
 }
 
-// Governance veto events
-#[contractevent]
+// Governance veto events (use contracttype to avoid macro issues)
+#[contracttype]
 #[derive(Clone)]
 pub struct BeneficiaryReassignmentRequested {
-    #[topic]
     pub reassignment_id: u32,
-    #[topic]
     pub vesting_id: u32,
-    #[topic]
     pub current_beneficiary: Address,
-    #[topic]
     pub new_beneficiary: Address,
     pub total_amount: i128,
     pub effective_at: u64,
     pub requires_governance_veto: bool,
 }
 
-#[contractevent]
+#[contracttype]
 #[derive(Clone)]
 pub struct BeneficiaryReassignmentExecuted {
-    #[topic]
     pub reassignment_id: u32,
-    #[topic]
     pub vesting_id: u32,
-    #[topic]
     pub old_beneficiary: Address,
-    #[topic]
     pub new_beneficiary: Address,
     pub executed_at: u64,
 }
 
-#[contractevent]
+#[contracttype]
 #[derive(Clone)]
 pub struct VetoPeriodStarted {
-    #[topic]
     pub reassignment_id: u32,
-    #[topic]
     pub vesting_id: u32,
     pub veto_deadline: u64,
     pub threshold_percentage: u32,
 }
 
-#[contractevent]
+#[contracttype]
 #[derive(Clone)]
 pub struct VetoVoteCast {
-    #[topic]
     pub voter: Address,
-    #[topic]
     pub reassignment_id: u32,
     pub vote_for_veto: bool,
     pub voting_power: i128,
     pub voted_at: u64,
 }
 
-#[contractevent]
+#[contracttype]
 #[derive(Clone)]
 pub struct ReassignmentVetoed {
-    #[topic]
     pub reassignment_id: u32,
-    #[topic]
     pub veto_triggered_by: Address,
     pub veto_power: i128,
     pub vetoed_at: u64,
 }
 
-#[contractevent]
+#[contracttype]
 #[derive(Clone)]
 pub struct ReassignmentApproved {
-    #[topic]
     pub reassignment_id: u32,
-    #[topic]
     pub approved_at: u64,
     pub total_veto_power: i128,
 }

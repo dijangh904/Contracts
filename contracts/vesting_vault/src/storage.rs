@@ -1,5 +1,5 @@
 use soroban_sdk::{Env, Vec, Address, Map, BytesN};
-use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, LockupConfig, BeneficiaryReassignment, VetoVote, TokenSupplyInfo, LSTConfig, TvlCapConfig, RateLimitConfig, RelayerConfig};
+use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, LockupConfig, BeneficiaryReassignment, VetoVote, TokenSupplyInfo, LSTConfig};
 
 pub const CLAIM_HISTORY: &str = "CLAIM_HISTORY";
 pub const AUTHORIZED_PAYOUT_ADDRESS: &str = "AUTHORIZED_PAYOUT_ADDRESS";
@@ -365,6 +365,50 @@ pub fn get_lst_config(e: &Env, vesting_id: u32) -> Option<LSTConfig> {
 
 pub fn set_lst_config(e: &Env, vesting_id: u32, config: &LSTConfig) {
     e.storage().instance().set(&(LST_CONFIGS, vesting_id), config);
+}
+
+// --- Tax withholding backwards-compatible wrappers ---
+pub const TAX_WITHHOLDING_CONFIG: &str = "TAX_WITHHOLDING_CONFIG";
+
+pub fn set_tax_withholding_config(e: &Env, cfg: &crate::types::TaxWithholdingConfig) {
+    e.storage().instance().set(&TAX_WITHHOLDING_CONFIG, cfg);
+}
+
+pub fn get_tax_withholding_config(e: &Env) -> Option<crate::types::TaxWithholdingConfig> {
+    e.storage().instance().get(&TAX_WITHHOLDING_CONFIG)
+}
+
+// --- SEP-12 oracle config storage ---
+pub const SEP12_ORACLE: &str = "SEP12_ORACLE";
+
+pub fn set_sep12_identity_oracle(e: &Env, oracle: &crate::types::SEP12IdentityOracle) {
+    e.storage().instance().set(&SEP12_ORACLE, oracle);
+}
+
+pub fn get_sep12_identity_oracle(e: &Env) -> Option<crate::types::SEP12IdentityOracle> {
+    e.storage().instance().get(&SEP12_ORACLE)
+}
+
+// --- Token metadata storage ---
+pub const TOKEN_METADATA: &str = "TOKEN_METADATA";
+
+pub fn set_token_metadata(e: &Env, asset: &Address, metadata: &crate::types::TokenMetadata) {
+    e.storage().instance().set(&(TOKEN_METADATA, asset.clone()), metadata);
+}
+
+pub fn get_token_metadata(e: &Env, asset: &Address) -> Option<crate::types::TokenMetadata> {
+    e.storage().instance().get(&(TOKEN_METADATA, asset.clone()))
+}
+
+// --- Vesting grant storage ---
+pub const VESTING_GRANT: &str = "VESTING_GRANT"; // keyed by vesting_id
+
+pub fn set_vesting_grant(e: &Env, vesting_id: u32, grant: &crate::types::VestingGrant) {
+    e.storage().instance().set(&(VESTING_GRANT, vesting_id), grant);
+}
+
+pub fn get_vesting_grant(e: &Env, vesting_id: u32) -> Option<crate::types::VestingGrant> {
+    e.storage().instance().get(&(VESTING_GRANT, vesting_id))
 }
 
 // ========== ISSUE #223: Voting Power (Total Unvested Balance per address) ==========
