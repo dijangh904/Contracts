@@ -208,6 +208,8 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
         
         Grant storage grant = grants[beneficiary];
         uint256 claimable = _calculateClaimableAmount(grant);
+        
+        require(claimable > 0, "No tokens to claim");
 
         require(!grant.isEscrowed, "Tokens in escrow");
 
@@ -216,8 +218,6 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
         if (claimable > remaining) {
             claimable = remaining;
         }
-        
-        require(claimable > 0, "No tokens to claim");
         
         // Check sanctions before processing claim
         if (sanctionsOracle.isSanctioned(beneficiary)) {
