@@ -384,6 +384,47 @@ pub struct LSTConfig {
     pub enabled: bool,
     pub lst_token_address: Address,
     pub base_token_address: Address,
+    pub staking_contract_address: Address,
+    pub unbonding_period_seconds: u64,
+}
+
+// LST Auto-Compounding types (Issue #154)
+#[contracttype]
+#[derive(Clone)]
+pub struct LSTPoolShares {
+    /// Total shares in the pool (tracks ownership proportionally)
+    pub total_shares: i128,
+    /// Total underlying tokens in the pool (including compounded rewards)
+    pub total_underlying: i128,
+    /// Last compounding timestamp
+    pub last_compounded_at: u64,
+    /// Exchange rate snapshot (for security against manipulation)
+    pub exchange_rate_snapshot: i128,
+    /// Snapshot timestamp
+    pub snapshot_timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct UserLSTShares {
+    /// User's share balance in the pool
+    pub shares: i128,
+    /// User's vesting ID
+    pub vesting_id: u32,
+    /// Whether the user has an unbonding request pending
+    pub unbonding_pending: bool,
+    /// Unbonding request timestamp (0 if not pending)
+    pub unbonding_requested_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct UnbondingRequest {
+    pub user: Address,
+    pub vesting_id: u32,
+    pub shares: i128,
+    pub requested_at: u64,
+    pub unbonding_complete_at: u64,
 }
 
 #[contractevent]
@@ -406,6 +447,41 @@ pub struct LSTClaimExecuted {
     pub base_amount: i128,
     pub lst_amount: i128,
     pub lst_token_address: Address,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct LSTRewardsCompounded {
+    #[topic]
+    pub vesting_id: u32,
+    pub total_yield_generated: i128,
+    pub total_shares: i128,
+    pub exchange_rate: i128,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct UnbondingRequested {
+    #[topic]
+    pub user: Address,
+    #[topic]
+    pub vesting_id: u32,
+    pub shares: i128,
+    pub unbonding_complete_at: u64,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct UnbondingCompleted {
+    #[topic]
+    pub user: Address,
+    #[topic]
+    pub vesting_id: u32,
+    pub shares: i128,
+    pub underlying_amount: i128,
     pub timestamp: u64,
 }
 

@@ -1,17 +1,19 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
 
-describe("VestingVault with Sanctions Oracle", function () {
+describe("VestingVault with Sanctions Oracle and KPI Multiplier", function () {
     let vestingVault;
     let sanctionsOracle;
+    let revenueOracle;
     let token;
-    let owner, beneficiary, sanctionedUser, otherUser;
+    let owner, beneficiary, sanctionedUser, otherUser, keeper;
     
     const GRANT_AMOUNT = ethers.parseEther("1000");
     const VESTING_DURATION = 365 * 24 * 60 * 60; // 1 year in seconds
+    const TARGET_REVENUE = ethers.parseEther("1000000"); // 1M target revenue
     
     beforeEach(async function () {
-        [owner, beneficiary, sanctionedUser, otherUser] = await ethers.getSigners();
+        [owner, beneficiary, sanctionedUser, otherUser, keeper] = await ethers.getSigners();
         
         // Deploy mock ERC20 token
         const MockToken = await ethers.getContractFactory("MockERC20");
@@ -23,11 +25,22 @@ describe("VestingVault with Sanctions Oracle", function () {
         sanctionsOracle = await SanctionsOracle.deploy(owner.address);
         await sanctionsOracle.waitForDeployment();
         
+        // Deploy revenue oracle
+        const RevenueOracle = await ethers.getContractFactory("RevenueOracle");
+        revenueOracle = await RevenueOracle.deploy(
+            TARGET_REVENUE,
+            TARGET_REVENUE,
+            owner.address,
+            keeper.address
+        );
+        await revenueOracle.waitForDeployment();
+        
         // Deploy vesting vault
         const VestingVault = await ethers.getContractFactory("VestingVault");
         vestingVault = await VestingVault.deploy(
             await token.getAddress(),
             await sanctionsOracle.getAddress(),
+            await revenueOracle.getAddress(),
             owner.address
         );
         await vestingVault.waitForDeployment();
@@ -264,6 +277,247 @@ describe("VestingVault with Sanctions Oracle", function () {
             const finalGrant = await vestingVault.getGrant(beneficiary.address);
             expect(finalGrant.isEscrowed).to.be.false;
             expect(finalGrant.claimed).to.equal(GRANT_AMOUNT / 2n);
+        });
+    });
+    
+    describe("KPI Multiplier Functionality", function () {
+        it("Should default to 1.0x multiplier when oracle is at target", async function () {
+            const multiplier = await vestingVault.getCurrentKPIMultiplier();
+            expect(multiplier).to.equal(10000); // 1.0x in basis points
+        });
+        
+        it("Should accelerate vesting when revenue exceeds target", async function () {
+            // Update revenue to 2x target
+            await revenueOracle.connect(keeper).updateRevenue(TARGET_REVENUE * 2n);
+            
+            // Update KPI multiplier
+            await vestingVault.updateKPIMultiplier();
+            
+            const multiplier = await vestingVault.getCurrentKPIMultiplier();
+            expect(multiplier).to.equal(20000); // 2.0x in basis points
+            
+            // Fast forward 6 months
+            await ethers.provider.send("evm_increaseTime", [VESTING_DURATION / 2]);
+            await ethers.provider.send("evm_mine");
+            
+            // With 2.0x multiplier, should vest 100% (6 months * 2.0x = 12 months equivalent)
+            const claimableAmount = await vestingVault.getClaimableAmount(beneficiary.address);
+            expect(claimableAmount).to.equal(GRANT_AMOUNT);
+        });
+        
+        it("Should slow vesting when revenue is below target", async function () {
+            // Update revenue to 0.5x target
+            await revenueOracle.connect(keeper).updateRevenue(TARGET_REVENUE / 2n);
+            
+            // Update KPI multiplier
+            await vestingVault.updateKPIMultiplier();
+            
+            const multiplier = await vestingVault.getCurrentKPIMultiplier();
+            expect(multiplier).to.equal(5000); // 0.5x in basis points
+            
+            // Fast forward 6 months
+            await ethers.provider.send("evm_increaseTime", [VESTING_DURATION / 2]);
+            await ethers.provider.send("evm_mine");
+            
+            // With 0.5x multiplier, should vest 25% (6 months * 0.5x = 3 months equivalent)
+            const claimableAmount = await vestingVault.getClaimableAmount(beneficiary.address);
+            expect(claimableAmount).to.equal(GRANT_AMOUNT / 4n);
+        });
+        
+        it("Should cap multiplier at 2.0x maximum", async function () {
+            // Update revenue to 5x target
+            await revenueOracle.connect(keeper).updateRevenue(TARGET_REVENUE * 5n);
+            
+            // Update KPI multiplier
+            await vestingVault.updateKPIMultiplier();
+            
+            const multiplier = await vestingVault.getCurrentKPIMultiplier();
+            expect(multiplier).to.equal(20000); // Capped at 2.0x
+        });
+        
+        it("Should cap multiplier at 0.5x minimum", async function () {
+            // Update revenue to 0.1x target
+            await revenueOracle.connect(keeper).updateRevenue(TARGET_REVENUE / 10n);
+            
+            // Update KPI multiplier
+            await vestingVault.updateKPIMultiplier();
+            
+            const multiplier = await vestingVault.getCurrentKPIMultiplier();
+            expect(multiplier).to.equal(5000); // Capped at 0.5x
+        });
+        
+        it("Should default to 1.0x when oracle is unhealthy", async function () {
+            // Mark oracle as unhealthy
+            await revenueOracle.markUnhealthy();
+            
+            // Update KPI multiplier
+            await vestingVault.updateKPIMultiplier();
+            
+            const multiplier = await vestingVault.getCurrentKPIMultiplier();
+            expect(multiplier).to.equal(10000); // Default to 1.0x
+        });
+        
+        it("Should emit KPIMultiplierUpdated event", async function () {
+            await revenueOracle.connect(keeper).updateRevenue(TARGET_REVENUE * 2n);
+            
+            await expect(vestingVault.updateKPIMultiplier())
+                .to.emit(vestingVault, "KPIMultiplierUpdated")
+                .withArgs(10000, TARGET_REVENUE * 2n, 20000, await ethers.provider.getBlock("latest").then(b => b.timestamp + 1));
+        });
+        
+        it("Should store KPI history", async function () {
+            await revenueOracle.connect(keeper).updateRevenue(TARGET_REVENUE * 2n);
+            await vestingVault.updateKPIMultiplier();
+            
+            const historyCount = await vestingVault.getKPIHistoryCount();
+            expect(historyCount).to.equal(1);
+            
+            const [multipliers, oracleInputs, timestamps] = await vestingVault.getKPIHistory(0, 10);
+            expect(multipliers[0]).to.equal(20000);
+            expect(oracleInputs[0]).to.equal(TARGET_REVENUE * 2n);
+            expect(timestamps[0]).to.be.gt(0);
+        });
+        
+        it("Should prune old KPI history when exceeding max", async function () {
+            // Add more than MAX_KPI_HISTORY entries
+            for (let i = 0; i < 105; i++) {
+                await revenueOracle.connect(keeper).updateRevenue(TARGET_REVENUE + BigInt(i * 1000));
+                await ethers.provider.send("evm_increaseTime", [3600]); // 1 hour
+                await ethers.provider.send("evm_mine");
+                await vestingVault.updateKPIMultiplier();
+            }
+            
+            const historyCount = await vestingVault.getKPIHistoryCount();
+            expect(historyCount).to.be.lte(100); // MAX_KPI_HISTORY
+        });
+        
+        it("Should cap claimable amount at maximum grant", async function () {
+            // Set multiplier to 2.0x
+            await revenueOracle.connect(keeper).updateRevenue(TARGET_REVENUE * 2n);
+            await vestingVault.updateKPIMultiplier();
+            
+            // Fast forward full duration
+            await ethers.provider.send("evm_increaseTime", [VESTING_DURATION]);
+            await ethers.provider.send("evm_mine");
+            
+            // Even with 2.0x multiplier, should not exceed grant amount
+            const claimableAmount = await vestingVault.getClaimableAmount(beneficiary.address);
+            expect(claimableAmount).to.equal(GRANT_AMOUNT);
+        });
+    });
+    
+    describe("KPI Multiplier with Fluctuating Oracle Data", function () {
+        it("Should handle revenue fluctuations smoothly", async function () {
+            // Start with 1.0x
+            await ethers.provider.send("evm_increaseTime", [VESTING_DURATION / 4]);
+            await ethers.provider.send("evm_mine");
+            let claimable = await vestingVault.getClaimableAmount(beneficiary.address);
+            expect(claimable).to.equal(GRANT_AMOUNT / 4n);
+            
+            // Increase to 1.5x
+            await revenueOracle.connect(keeper).updateRevenue(TARGET_REVENUE * 15n / 10n);
+            await vestingVault.updateKPIMultiplier();
+            
+            await ethers.provider.send("evm_increaseTime", [VESTING_DURATION / 4]);
+            await ethers.provider.send("evm_mine");
+            
+            // Should have accelerated vesting
+            claimable = await vestingVault.getClaimableAmount(beneficiary.address);
+            expect(claimable).to.be.gt(GRANT_AMOUNT / 2n);
+            
+            // Decrease to 0.75x
+            await revenueOracle.connect(keeper).updateRevenue(TARGET_REVENUE * 75n / 100n);
+            await vestingVault.updateKPIMultiplier();
+            
+            await ethers.provider.send("evm_increaseTime", [VESTING_DURATION / 4]);
+            await ethers.provider.send("evm_mine");
+            
+            // Should have slowed vesting
+            claimable = await vestingVault.getClaimableAmount(beneficiary.address);
+            expect(claimable).to.be.lt(GRANT_AMOUNT * 3n / 4n);
+        });
+        
+        it("Should prevent underflow with extreme multiplier changes", async function () {
+            // Set to minimum multiplier
+            await revenueOracle.connect(keeper).updateRevenue(TARGET_REVENUE / 10n);
+            await vestingVault.updateKPIMultiplier();
+            
+            await ethers.provider.send("evm_increaseTime", [VESTING_DURATION / 2]);
+            await ethers.provider.send("evm_mine");
+            
+            const claimable1 = await vestingVault.getClaimableAmount(beneficiary.address);
+            expect(claimable1).to.equal(GRANT_AMOUNT / 4n);
+            
+            // Claim tokens
+            await vestingVault.claim(beneficiary.address);
+            
+            // Set to maximum multiplier
+            await revenueOracle.connect(keeper).updateRevenue(TARGET_REVENUE * 10n);
+            await vestingVault.updateKPIMultiplier();
+            
+            await ethers.provider.send("evm_increaseTime", [VESTING_DURATION / 2]);
+            await ethers.provider.send("evm_mine");
+            
+            // Should not underflow
+            const claimable2 = await vestingVault.getClaimableAmount(beneficiary.address);
+            expect(claimable2).to.be.gt(0);
+            expect(claimable2).to.be.lte(GRANT_AMOUNT * 3n / 4n);
+        });
+        
+        it("Should handle oracle call failures gracefully", async function () {
+            // This test simulates oracle failure by using a broken oracle
+            // In a real scenario, this would be a separate mock oracle that reverts
+            // For now, we test the unhealthy path
+            await revenueOracle.markUnhealthy();
+            await vestingVault.updateKPIMultiplier();
+            
+            await ethers.provider.send("evm_increaseTime", [VESTING_DURATION / 2]);
+            await ethers.provider.send("evm_mine");
+            
+            // Should default to 1.0x when oracle is unhealthy
+            const claimable = await vestingVault.getClaimableAmount(beneficiary.address);
+            expect(claimable).to.equal(GRANT_AMOUNT / 2n);
+        });
+    });
+    
+    describe("Revenue Oracle TWAP Protection", function () {
+        it("Should calculate 30-day TWAP correctly", async function () {
+            // Add multiple data points over time
+            const revenues = [
+                TARGET_REVENUE,
+                TARGET_REVENUE * 11n / 10n,
+                TARGET_REVENUE * 12n / 10n,
+                TARGET_REVENUE * 9n / 10n,
+                TARGET_REVENUE
+            ];
+            
+            for (let i = 0; i < revenues.length; i++) {
+                await revenueOracle.connect(keeper).updateRevenue(revenues[i]);
+                await ethers.provider.send("evm_increaseTime", [7 * 24 * 60 * 60]); // 7 days
+                await ethers.provider.send("evm_mine");
+            }
+            
+            const twap = await revenueOracle.get30DayTWAP();
+            expect(twap).to.be.gt(0);
+            expect(twap).to.be.lt(TARGET_REVENUE * 2n);
+        });
+        
+        it("Should prevent flash loan manipulation with TWAP", async function () {
+            // Simulate flash loan attack: spike revenue temporarily
+            await revenueOracle.connect(keeper).updateRevenue(TARGET_REVENUE * 100n);
+            
+            // TWAP should still be close to target due to averaging
+            const twap = await revenueOracle.get30DayTWAP();
+            expect(twap).to.be.lt(TARGET_REVENUE * 10n); // Not 100x
+        });
+        
+        it("Should enforce minimum update interval", async function () {
+            await revenueOracle.connect(keeper).updateRevenue(TARGET_REVENUE * 2n);
+            
+            // Try to update again immediately (should fail)
+            await expect(
+                revenueOracle.connect(keeper).updateRevenue(TARGET_REVENUE * 3n)
+            ).to.be.revertedWith("Update too frequent");
         });
     });
 });
