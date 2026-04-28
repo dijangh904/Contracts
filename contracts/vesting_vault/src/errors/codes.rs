@@ -10,12 +10,24 @@ pub enum Error {
 
     // ⏳ Vesting (200s)
     VestingNotFound = 200,
+    VaultNotFound = 201,
+    AlreadyInitialized = 202,
+    NotInitialized = 203,
+    ContractPaused = 204,
     CliffNotReached = 205,
     NothingToClaim = 206,
     AlreadyFullyClaimed = 207,
+    VaultRevoked = 208,
+    VaultFrozen = 209,
+    InvalidSchedule = 210,
+    MilestoneNotCompleted = 211,
+    InvalidAmount = 212,
+    VaultNotInitialized = 213,
 
     // 💰 Financial (300s)
     InsufficientBalance = 300,
+    InsufficientFunds = 301,
+    TransferFailed = 302,
 
     // 📜 Compliance (400s)
     KycNotCompleted = 400,
@@ -46,6 +58,14 @@ pub enum Error {
     // 🗳️ Governance / DAO (500s)
     /// #223: No unvested balance found for the queried address
     NoUnvestedBalance = 500,
+    AlreadyVoted = 501,
+    VotingPeriodEnded = 502,
+    QuorumNotMet = 503,
+    /// Timelock period has not yet elapsed
+    TimelockNotElapsed = 504,
+    PathPaymentNotConfigured = 505,
+    PathPaymentDisabled = 506,
+    InsufficientLiquidity = 507,
 
     // 🔑 Admin Recovery (600s)
     /// #226: Admin dead-man's switch not configured

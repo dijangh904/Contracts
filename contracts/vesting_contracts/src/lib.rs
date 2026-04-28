@@ -618,7 +618,7 @@ impl VestingContract {
             AdminAction::AddAdmin(admin) => {
                 let mut admins = Self::get_admins(env.clone());
                 if admins.iter().any(|a| a == admin) {
-                    panic!("Admin already exists");
+                    return Err(Error::AlreadyInitialized);
                 }
                 admins.push_back(admin);
                 env.storage().instance().set(&DataKey::AdminSet, &admins);
@@ -633,18 +633,18 @@ impl VestingContract {
                     }
                 }
                 if new_admins.len() == orig_len {
-                    panic!("Admin not found");
+                    return Err(Error::Unauthorized);
                 }
                 let quorum = Self::get_quorum_threshold(env.clone());
                 if new_admins.len() < quorum {
-                    panic!("Cannot have fewer admins than quorum");
+                    return Err(Error::InvalidInput);
                 }
                 env.storage().instance().set(&DataKey::AdminSet, &new_admins);
             },
             AdminAction::UpdateQuorum(new_quorum) => {
                 let admins = Self::get_admins(env.clone());
                 if new_quorum == 0 || new_quorum > admins.len() as u32 {
-                    panic!("Invalid quorum");
+                    return Err(Error::InvalidInput);
                 }
                 env.storage().instance().set(&DataKey::QuorumThreshold, &new_quorum);
             },
@@ -684,7 +684,7 @@ impl VestingContract {
             },
             AdminAction::InitializeMerkleRoot(merkle_root, total_schedules) => {
                 if env.storage().instance().has(&DataKey::MerkleRoot) {
-                    panic!("Merkle root already initialized");
+                    return Err(Error::AlreadyInitialized);
                 }
                 env.storage().instance().set(&DataKey::MerkleRoot, &merkle_root);
                 MerkleRootInitialized {
@@ -705,7 +705,7 @@ impl VestingContract {
 
     fn do_revoke_vault_internal(env: &Env, vault_id: u64, treasury: Address) {
         let mut vault = Self::get_vault_internal(env, vault_id);
-        if vault.is_irrevocable { panic!("Vault is irrevocable"); }
+        if vault.is_irrevocable { return Err(Error::VaultFrozen); }
         let stake_info = get_stake_info(env, vault_id);
         if stake_info.stake_state != StakeState::Unstaked {
             Self::do_unstake(env, vault_id, &mut vault);
@@ -739,6 +739,7 @@ impl VestingContract {
         }.publish(&env);
     }
 
+    /// Return the number of admin signatures collected for a multisig proposal.
     pub fn admin_proposal_signature_count(env: Env, proposal_id: u64) -> u32 {
         let admins = Self::get_admins(env.clone());
         let mut count: u32 = 0;
@@ -751,13 +752,16 @@ impl VestingContract {
         count
     }
 
+    /// Sign a pending multisig admin proposal.
+    ///
+    /// Once the quorum threshold is reached the proposal is executed automatically.
     pub fn sign_admin_proposal(env: Env, signer: Address, proposal_id: u64) {
         signer.require_auth();
-        if !Self::is_admin(env.clone(), signer.clone()) { panic!("Not an admin"); }
+        if !Self::is_admin(env.clone(), signer.clone()) { return Err(Error::Unauthorized); }
         let proposal = Self::get_admin_proposal(&env, proposal_id);
-        if proposal.is_executed { panic!("Proposal already executed"); }
+        if proposal.is_executed { return Err(Error::ProposalAlreadyExecuted); }
         let sig_key = DataKey::AdminProposalSignature(proposal_id, signer.clone());
-        if env.storage().instance().get::<_, bool>(&sig_key).unwrap_or(false) { panic!("Already signed"); }
+        if env.storage().instance().get::<_, bool>(&sig_key).unwrap_or(false) { return Err(Error::AlreadyVoted); }
         env.storage().instance().set(&sig_key, &true);
         let sig_count = Self::admin_proposal_signature_count(env.clone(), proposal_id);
         let quorum = Self::get_quorum_threshold(env.clone());
@@ -780,9 +784,12 @@ impl VestingContract {
         }
     }
 
+    /// Propose an admin action that requires multisig approval.
+    ///
+    /// Returns the new proposal ID.
     pub fn propose_admin_action(env: Env, proposer: Address, action: AdminAction) -> u64 {
         proposer.require_auth();
-        if !Self::is_admin(env.clone(), proposer.clone()) { panic!("Not an admin"); }
+        if !Self::is_admin(env.clone(), proposer.clone()) { return Err(Error::Unauthorized); }
         let now = env.ledger().timestamp();
         let proposal_id = Self::increment_admin_proposal_count(&env);
         let proposal = AdminProposal { id: proposal_id, action: action.clone(), proposer: proposer.clone(), created_at: now, is_executed: false };
@@ -810,21 +817,27 @@ impl VestingContract {
         proposal_id
     }
 
+    /// Return the current list of admin addresses.
     pub fn get_admins(env: Env) -> Vec<Address> {
         env.storage().instance().get(&DataKey::AdminSet).unwrap_or(Vec::new(&env))
     }
 
+    /// Return the current multisig quorum threshold.
     pub fn get_quorum_threshold(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::QuorumThreshold).unwrap_or(1u32)
     }
 
+    /// Returns `true` if `addr` is a registered admin.
     pub fn is_admin(env: Env, addr: Address) -> bool {
         let admins = Self::get_admins(env);
         admins.iter().any(|a| a == addr)
     }
 
+    /// Initialise the contract with a single admin and the total token supply.
+    ///
+    /// Can only be called once.
     pub fn initialize(env: Env, admin: Address, initial_supply: i128) {
-        if env.storage().instance().has(&DataKey::AdminSet) { panic!("Already initialized"); }
+        if env.storage().instance().has(&DataKey::AdminSet) { return Err(Error::AlreadyInitialized); }
         let mut admins = Vec::new(&env);
         admins.push_back(admin.clone());
         env.storage().instance().set(&DataKey::AdminSet, &admins);
@@ -841,10 +854,16 @@ impl VestingContract {
         env.storage().instance().set(&DataKey::TotalLockedValue, &initial_supply);
     }
 
+    /// Initialise the contract in multisig mode.
+    ///
+    /// # Parameters
+    /// - `admins`           – List of admin addresses (at least one required).
+    /// - `quorum_threshold` – Minimum signatures required to execute a proposal.
+    /// - `initial_supply`   – Total token supply for governance calculations.
     pub fn initialize_multisig(env: Env, admins: Vec<Address>, quorum_threshold: u32, initial_supply: i128) {
-        if env.storage().instance().has(&DataKey::AdminSet) { panic!("Already initialized"); }
-        if admins.len() == 0 { panic!("At least one admin required"); }
-        if quorum_threshold == 0 || quorum_threshold > admins.len() as u32 { panic!("Invalid quorum threshold"); }
+        if env.storage().instance().has(&DataKey::AdminSet) { return Err(Error::AlreadyInitialized); }
+        if admins.len() == 0 { return Err(Error::InvalidInput); }
+        if quorum_threshold == 0 || quorum_threshold > admins.len() as u32 { return Err(Error::InvalidInput); }
         env.storage().instance().set(&DataKey::AdminSet, &admins);
         env.storage().instance().set(&DataKey::QuorumThreshold, &quorum_threshold);
         env.storage().instance().set(&DataKey::AdminAddress, &admins.get(0).unwrap());
@@ -859,29 +878,36 @@ impl VestingContract {
         env.storage().instance().set(&DataKey::TotalLockedValue, &initial_supply);
     }
 
+    /// Set the vesting token contract address (admin only).
     pub fn set_token(env: Env, token: Address) {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         env.storage().instance().set(&DataKey::Token, &token);
     }
 
+    /// Set the NFT minter contract address used for vesting-status NFTs (admin only).
     pub fn set_nft_minter(env: Env, minter: Address) {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         env.storage().instance().set(&DataKey::NFTMinter, &minter);
     }
 
+    /// Add a token address to the vesting whitelist (admin only).
     pub fn add_to_whitelist(env: Env, token: Address) {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         env.storage().instance().set(&DataKey::Token, &token);
     }
 
+    /// Propose a contract upgrade via the 72-hour governance challenge period.
+    ///
+    /// Returns the new proposal ID.
     pub fn propose_contract_upgrade(env: Env, new_contract: Address) -> u64 {
         Self::require_admin(&env);
         Self::create_governance_proposal(env, GovernanceAction::ContractUpgrade(new_contract))
     }
 
+    /// Accept a pending admin-rotation proposal (called by the proposed new admin).
     pub fn accept_ownership(env: Env) {
         let proposed: Address = env.storage().instance().get(&DataKey::ProposedAdmin).expect("No proposed admin");
         proposed.require_auth();
@@ -889,19 +915,26 @@ impl VestingContract {
         env.storage().instance().remove(&DataKey::ProposedAdmin);
     }
 
+    /// Propose an emergency pause or resume via the governance challenge period.
+    ///
+    /// Returns the new proposal ID.
     pub fn propose_emergency_pause(env: Env, pause_state: bool) -> u64 {
         Self::require_admin(&env);
         Self::create_governance_proposal(env, GovernanceAction::EmergencyPause(pause_state))
     }
 
 
+    /// Cast a governance vote on a proposal.
+    ///
+    /// Voting power equals the voter's total locked (unvested) token balance.
+    /// A "No" vote exceeding 51 % of total locked value cancels the proposal.
     pub fn vote_on_proposal(env: Env, voter: Address, proposal_id: u64, is_yes: bool) {
         // Voter must authorize the action
         voter.require_auth();
         let vote_weight = Self::get_voter_locked_value(&env, &voter);
         
         if vote_weight <= 0 {
-            panic!("No voting power - no locked tokens");
+            return Err(Error::InsufficientBalance);
         }
 
         let mut proposal = Self::get_proposal(&env, proposal_id);
@@ -909,17 +942,17 @@ impl VestingContract {
         // Check if voting is still open
         let now = env.ledger().timestamp();
         if now >= proposal.challenge_end {
-            panic!("Voting period has ended");
+            return Err(Error::VotingPeriodEnded);
         }
         
         if proposal.is_executed || proposal.is_cancelled {
-            panic!("Proposal is no longer active");
+            return Err(Error::ProposalExpired);
         }
 
         // Check if already voted
         let vote_key = DataKey::GovernanceVotes(proposal_id, voter.clone());
         if env.storage().instance().has(&vote_key) {
-            panic!("Already voted on this proposal");
+            return Err(Error::AlreadyVoted);
         }
 
         // Record vote
@@ -949,17 +982,19 @@ impl VestingContract {
         }.publish(&env);
     }
 
+    /// Execute a governance proposal after the 72-hour challenge period has elapsed
+    /// and the veto threshold has not been reached.
     pub fn execute_proposal(env: Env, proposal_id: u64) {
         let mut proposal = Self::get_proposal(&env, proposal_id);
         let now = env.ledger().timestamp();
 
         // Check challenge period has ended
         if now < proposal.challenge_end {
-            panic!("Challenge period not yet ended");
+            return Err(Error::VotingPeriodEnded);
         }
 
         if proposal.is_executed || proposal.is_cancelled {
-            panic!("Proposal already processed");
+            return Err(Error::ProposalAlreadyExecuted);
         }
 
         // Check if proposal passes (no veto from 51%+ of locked value)
@@ -987,9 +1022,10 @@ impl VestingContract {
     }
 
     // Legacy pause function - now requires governance proposal
+    /// Toggle the global contract pause state (admin only).
     pub fn toggle_pause(env: Env) {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         let paused = env.storage().instance().get(&DataKey::IsPaused).unwrap_or(false);
         env.storage().instance().set(&DataKey::IsPaused, &(!paused));
     }
@@ -1006,7 +1042,7 @@ impl VestingContract {
         step_duration: u64
     ) -> u64 {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         Self::create_vault_full_internal(&env, owner, amount, start_time, end_time, keeper_fee, is_revocable, is_transferable, step_duration)
     }
 
@@ -1022,13 +1058,16 @@ impl VestingContract {
         step_duration: u64
     ) -> u64 {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         Self::create_vault_lazy_internal(&env, owner, amount, start_time, end_time, keeper_fee, is_revocable, is_transferable, step_duration)
     }
 
+    /// Create multiple lazy-initialised vaults in a single transaction.
+    ///
+    /// Returns the list of newly created vault IDs.
     pub fn batch_create_vaults_lazy(env: Env, data: BatchCreateData) -> Vec<u64> {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         let total_amount = Self::validate_batch_data(&data);
         Self::reserve_admin_balance_for_batch(&env, total_amount);
         let mut ids = Vec::new(&env);
@@ -1049,9 +1088,12 @@ impl VestingContract {
         ids
     }
 
+    /// Create multiple fully-initialised vaults in a single transaction.
+    ///
+    /// Returns the list of newly created vault IDs.
     pub fn batch_create_vaults_full(env: Env, data: BatchCreateData) -> Vec<u64> {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         let total_amount = Self::validate_batch_data(&data);
         Self::reserve_admin_balance_for_batch(&env, total_amount);
 
@@ -1084,9 +1126,12 @@ impl VestingContract {
         ids
     }
 
+    /// Add multiple vesting schedules in a single transaction.
+    ///
+    /// Returns the list of newly created vault IDs.
     pub fn batch_add_schedules(env: Env, schedules: Vec<ScheduleConfig>) -> Vec<u64> {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         let mut total_amount = 0i128;
         for s in schedules.iter() {
             for a in s.asset_basket.iter() { total_amount += a.total_amount; }
@@ -1117,11 +1162,11 @@ impl VestingContract {
     /// Stores a single 32-byte root hash that represents thousands of vesting schedules
     pub fn initialize_merkle_root(env: Env, merkle_root: BytesN<32>, total_schedules: u32) {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         
         // Check if Merkle root already exists
         if env.storage().instance().has(&DataKey::MerkleRoot) {
-            panic!("Merkle root already initialized");
+            return Err(Error::AlreadyInitialized);
         }
         
         // Store the Merkle root
@@ -1151,18 +1196,18 @@ impl VestingContract {
         
         // Verify the Merkle proof
         if !Self::verify_merkle_proof(&env, &proof, &stored_root) {
-            panic!("Invalid Merkle proof");
+            return Err(Error::InvalidInput);
         }
         
         // Check if schedule already activated for this beneficiary
         if env.storage().instance().has(&DataKey::ActivatedSchedule(beneficiary.clone())) {
-            panic!("Schedule already activated for beneficiary");
+            return Err(Error::AlreadyInitialized);
         }
         
         // Verify leaf data matches proof
         let computed_leaf_hash = Self::hash_vesting_leaf(&env, &leaf);
         if computed_leaf_hash != proof.leaf_hash {
-            panic!("Leaf data does not match proof");
+            return Err(Error::InvalidInput);
         }
         
         // Create the vault with the leaf data
@@ -1278,21 +1323,21 @@ impl VestingContract {
 
         // Validate asset basket
         if !Self::validate_asset_basket(&asset_basket) {
-            panic!("Asset basket percentages must sum to 10000 (100%)");
+            return Err(Error::InvalidInput);
         }
 
         if asset_basket.is_empty() {
-            panic!("Asset basket cannot be empty");
+            return Err(Error::InvalidInput);
         }
 
         // Validate timing
         if start_time >= end_time {
-            panic!("Start time must be before end time");
+            return Err(Error::InvalidSchedule);
         }
 
         let max_duration = 10 * 365 * 24 * 60 * 60; // 10 years in seconds
         if end_time - start_time > max_duration {
-            panic!("Duration exceeds maximum allowed");
+            return Err(Error::InvalidSchedule);
         }
 
         let vault_id = Self::increment_vault_count(&env);
@@ -1347,21 +1392,21 @@ impl VestingContract {
 
         // Validate asset basket
         if !Self::validate_asset_basket(&asset_basket) {
-            panic!("Asset basket percentages must sum to 10000 (100%)");
+            return Err(Error::InvalidInput);
         }
 
         if asset_basket.is_empty() {
-            panic!("Asset basket cannot be empty");
+            return Err(Error::InvalidInput);
         }
 
         // Validate timing
         if start_time >= end_time {
-            panic!("Start time must be before end time");
+            return Err(Error::InvalidSchedule);
         }
 
         let max_duration = 10 * 365 * 24 * 60 * 60; // 10 years in seconds
         if end_time - start_time > max_duration {
-            panic!("Duration exceeds maximum allowed");
+            return Err(Error::InvalidSchedule);
         }
 
         let vault_id = Self::increment_vault_count(&env);
@@ -1397,7 +1442,7 @@ impl VestingContract {
         let mut vault = Self::get_vault_internal(&env, vault_id);
 
         if vault.is_initialized {
-            panic!("Vault already initialized");
+            return Err(Error::AlreadyInitialized);
         }
 
         let admin = Self::get_admin(env.clone());
@@ -1431,22 +1476,22 @@ impl VestingContract {
 
         // Check if legal document signatures are required and verified
         if vault.requires_legal_signatures && !vault.legal_documents_signed {
-            panic!("Legal document signatures required before claiming tokens");
+            return Err(Error::LegalSignatureMissing);
         }
 
         // Check if beneficiary reassignment is in progress
         if let Some(reassignment) = BeneficiaryReassignment::get_reassignment_status(&env, vault_id) {
             match &reassignment.status {
                 ReassignmentStatus::Pending(_) => {
-                    panic!("Beneficiary reassignment in progress - claims paused");
+                    return Err(Error::VaultFrozen);
                 }
                 ReassignmentStatus::Approved => {
-                    panic!("Beneficiary reassignment approved - claims paused");
+                    return Err(Error::VaultFrozen);
                 }
                 ReassignmentStatus::Completed => {
                     // Check if reassignment completed to current owner
                     if reassignment.new_beneficiary != vault.owner {
-                        panic!("Vault owner mismatch after reassignment");
+                        return Err(Error::Unauthorized);
                     }
                 }
                 ReassignmentStatus::Rejected => {
@@ -1736,35 +1781,35 @@ impl VestingContract {
         Self::require_not_paused(&env);
         let mut vault = Self::get_vault_internal(&env, vault_id);
         if vault.is_frozen {
-            panic!("Vault frozen");
+            return Err(Error::VaultFrozen);
         }
         if !vault.is_initialized {
-            panic!("Vault not initialized");
+            return Err(Error::VaultNotInitialized);
         }
 
         // Check if this specific vault schedule is paused
         if Self::is_vault_paused(env.clone(), vault_id) {
-            panic!("Vault schedule paused");
+            return Err(Error::ContractPaused);
         }
 
         // Check if legal document signatures are required and verified
         if vault.requires_legal_signatures && !vault.legal_documents_signed {
-            panic!("Legal document signatures required before claiming tokens");
+            return Err(Error::LegalSignatureMissing);
         }
 
         // Check if beneficiary reassignment is in progress
         if let Some(reassignment) = BeneficiaryReassignment::get_reassignment_status(&env, vault_id) {
             match &reassignment.status {
                 ReassignmentStatus::Pending(_) => {
-                    panic!("Beneficiary reassignment in progress - claims paused");
+                    return Err(Error::VaultFrozen);
                 }
                 ReassignmentStatus::Approved => {
-                    panic!("Beneficiary reassignment approved - claims paused");
+                    return Err(Error::VaultFrozen);
                 }
                 ReassignmentStatus::Completed => {
                     // Check if reassignment completed to current owner
                     if reassignment.new_beneficiary != vault.owner {
-                        panic!("Vault owner mismatch after reassignment");
+                        return Err(Error::Unauthorized);
                     }
                 }
                 ReassignmentStatus::Rejected => {
@@ -1783,13 +1828,13 @@ impl VestingContract {
 
         // For backward compatibility, only work with single-asset vaults
         if vault.allocations.len() != 1 {
-            panic!("Use claim_tokens_diversified for multi-asset vaults");
+            return Err(Error::InvalidInput);
         }
 
         let allocation = vault.allocations.get(0).unwrap();
         let vested = Self::calculate_claimable_for_asset(&env, vault_id, &vault, 0);
         if claim_amount > vested - allocation.released_amount {
-            panic!("Insufficient vested tokens");
+            return Err(Error::InsufficientBalance);
         }
 
         // --- Pro-Rata Yield Distribution ---
@@ -1830,7 +1875,7 @@ impl VestingContract {
             if allocation.asset_id == xlm_addr {
                 let total_left = allocation.total_amount - (allocation.released_amount + claim_amount);
                 if total_left < 20_000_000 {
-                    panic!("Claim would leave insufficient XLM for gas (need 2 XLM reserve)");
+                    return Err(Error::InsufficientBalance);
                 }
             }
         }
@@ -1904,19 +1949,22 @@ impl VestingContract {
         total_claimed >= total_amount
     }
 
+    /// Set the milestone list for a vault (admin only).
     pub fn set_milestones(env: Env, vault_id: u64, milestones: Vec<Milestone>) {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         env.storage().instance().set(&DataKey::VaultMilestones(vault_id), &milestones);
     }
 
+    /// Return the milestone list for a vault.
     pub fn get_milestones(env: Env, vault_id: u64) -> Vec<Milestone> {
         env.storage().instance().get(&DataKey::VaultMilestones(vault_id)).unwrap_or(Vec::new(&env))
     }
 
+    /// Mark a milestone as completed, unlocking the associated token tranche (admin only).
     pub fn unlock_milestone(env: Env, vault_id: u64, milestone_id: u64) {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         let mut milestones: Vec<Milestone> = Self::get_milestones(env.clone(), vault_id);
         let mut found = false;
         for (i, m) in milestones.iter().enumerate() {
@@ -1928,22 +1976,24 @@ impl VestingContract {
                 break;
             }
         }
-        if !found { panic!("Milestone not found"); }
+        if !found { return Err(Error::MilestoneNotCompleted); }
         env.storage().instance().set(&DataKey::VaultMilestones(vault_id), &milestones);
     }
 
+    /// Freeze or unfreeze a vault, blocking all claims while frozen (admin only).
     pub fn freeze_vault(env: Env, vault_id: u64, freeze: bool) {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         let mut vault = Self::get_vault_internal(&env, vault_id);
         vault.is_frozen = freeze;
         env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
     }
 
+    /// Pause a specific vesting schedule, blocking claims until resumed.
     pub fn pause_specific_schedule(env: Env, vault_id: u64, reason: String) {
         Self::require_pause_authority(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
-        if env.storage().instance().has(&DataKey::PausedVault(vault_id)) { panic!("Already paused"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
+        if env.storage().instance().has(&DataKey::PausedVault(vault_id)) { return Err(Error::ContractPaused); }
         let pause_info = PausedVault {
             vault_id,
             pause_timestamp: env.ledger().timestamp(),
@@ -1953,49 +2003,60 @@ impl VestingContract {
         env.storage().instance().set(&DataKey::PausedVault(vault_id), &pause_info);
     }
 
+    /// Resume a previously paused vesting schedule.
     pub fn resume_specific_schedule(env: Env, vault_id: u64) {
         Self::require_pause_authority(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
-        if !env.storage().instance().has(&DataKey::PausedVault(vault_id)) { panic!("Not paused"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
+        if !env.storage().instance().has(&DataKey::PausedVault(vault_id)) { return Err(Error::InvalidInput); }
         env.storage().instance().remove(&DataKey::PausedVault(vault_id));
     }
 
+    /// Set the address authorised to pause individual schedules (admin only).
     pub fn set_pause_authority(env: Env, authority: Address) {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         env.storage().instance().set(&DataKey::PauseAuthority, &authority);
     }
 
+    /// Return the current pause authority address, or `None` if not set.
     pub fn get_pause_authority(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::PauseAuthority)
     }
 
+    /// Returns `true` if the specified vault is currently paused.
     pub fn is_vault_paused(env: Env, vault_id: u64) -> bool {
         env.storage().instance().has(&DataKey::PausedVault(vault_id))
     }
 
+    /// Return the pause record for a vault, or `None` if not paused.
     pub fn get_paused_vault_info(env: Env, vault_id: u64) -> Option<PausedVault> {
         env.storage().instance().get(&DataKey::PausedVault(vault_id))
     }
 
+    /// Permanently mark a vault as irrevocable (admin only).
+    ///
+    /// Once set this cannot be undone; the admin can never revoke the vault.
     pub fn mark_irrevocable(env: Env, vault_id: u64) {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         let mut vault = Self::get_vault_internal(&env, vault_id);
         vault.is_irrevocable = true;
         env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
     }
 
+    /// Configure a performance-based cliff condition for a vault (admin only).
     pub fn set_performance_cliff(env: Env, vault_id: u64, cliff: PerformanceCliff) {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         env.storage().instance().set(&DataKey::VaultPerformanceCliff(vault_id), &cliff);
     }
 
+    /// Return the performance cliff configuration for a vault, or `None` if not set.
     pub fn get_performance_cliff(env: Env, vault_id: u64) -> Option<PerformanceCliff> {
         env.storage().instance().get(&DataKey::VaultPerformanceCliff(vault_id))
     }
 
+    /// Returns `true` if the performance cliff condition for a vault has been met.
     pub fn is_cliff_passed(env: Env, vault_id: u64) -> bool {
         if let Some(cliff) = Self::get_performance_cliff(env.clone(), vault_id) {
             OracleClient::is_cliff_passed(&env, &cliff, vault_id)
@@ -2020,7 +2081,7 @@ impl VestingContract {
         cliff: PerformanceCliff
     ) -> u64 {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         let vault_id = Self::create_vault_full_internal(
             &env,
             owner,
@@ -2148,7 +2209,7 @@ impl VestingContract {
             if allocation.asset_id == asset_id {
                 let available = allocation.total_amount - allocation.released_amount - allocation.locked_amount;
                 if amount > available {
-                    panic!("Insufficient available tokens for locking");
+                    return Err(Error::InsufficientBalance);
                 }
 
                 let mut updated_allocation = allocation.clone();
@@ -2160,7 +2221,7 @@ impl VestingContract {
         }
 
         if !found {
-            panic!("Asset not found in vault");
+            return Err(Error::VaultNotFound);
         }
 
         env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
@@ -2170,7 +2231,7 @@ impl VestingContract {
     pub fn lock_tokens(env: Env, vault_id: u64, amount: i128) {
         let vault = Self::get_vault_internal(&env, vault_id);
         if vault.allocations.len() != 1 {
-            panic!("Use lock_tokens_for_asset for multi-asset vaults");
+            return Err(Error::InvalidInput);
         }
 
         let asset_id = vault.allocations.get(0).unwrap().asset_id.clone();
@@ -2193,7 +2254,7 @@ impl VestingContract {
         for (i, allocation) in vault.allocations.iter().enumerate() {
             if allocation.asset_id == asset_id {
                 if amount > allocation.locked_amount {
-                    panic!("Cannot unlock more than locked amount");
+                    return Err(Error::InsufficientBalance);
                 }
 
                 let mut updated_allocation = allocation.clone();
@@ -2205,7 +2266,7 @@ impl VestingContract {
         }
 
         if !found {
-            panic!("Asset not found in vault");
+            return Err(Error::VaultNotFound);
         }
 
         env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
@@ -2215,7 +2276,7 @@ impl VestingContract {
     pub fn unlock_tokens(env: Env, vault_id: u64, amount: i128) {
         let vault = Self::get_vault_internal(&env, vault_id);
         if vault.allocations.len() != 1 {
-            panic!("Use unlock_tokens_for_asset for multi-asset vaults");
+            return Err(Error::InvalidInput);
         }
 
         let asset_id = vault.allocations.get(0).unwrap().asset_id.clone();
@@ -2244,7 +2305,7 @@ impl VestingContract {
         for (i, allocation) in vault.allocations.iter().enumerate() {
             if allocation.asset_id == asset_id {
                 if amount > allocation.locked_amount {
-                    panic!("Cannot claim more than locked amount");
+                    return Err(Error::InsufficientBalance);
                 }
 
                 let mut updated_allocation = allocation.clone();
@@ -2256,7 +2317,7 @@ impl VestingContract {
         }
 
         if !found {
-            panic!("Asset not found in vault");
+            return Err(Error::VaultNotFound);
         }
 
         env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
@@ -2278,15 +2339,15 @@ impl VestingContract {
         let mut vault = Self::get_vault_internal(&env, vault_id);
 
         if vault.is_initialized {
-            panic!("Cannot update asset basket after initialization");
+            return Err(Error::AlreadyInitialized);
         }
 
         if !Self::validate_asset_basket(&new_basket) {
-            panic!("Asset basket percentages must sum to 10000 (100%)");
+            return Err(Error::InvalidInput);
         }
 
         if new_basket.is_empty() {
-            panic!("Asset basket cannot be empty");
+            return Err(Error::InvalidInput);
         }
 
         vault.allocations = new_basket;
@@ -2308,43 +2369,51 @@ impl VestingContract {
     pub fn claim_by_lender(env: Env, vault_id: u64, lender: Address, amount: i128) -> i128 {
         let vault = Self::get_vault_internal(&env, vault_id);
         if vault.allocations.len() != 1 {
-            panic!("Use claim_by_lender_for_asset for multi-asset vaults");
+            return Err(Error::InvalidInput);
         }
 
         let asset_id = vault.allocations.get(0).unwrap().asset_id.clone();
         Self::claim_by_lender_for_asset(env, vault_id, lender, asset_id, amount)
     }
 
+    /// Set the collateral bridge contract address (must be done via AdminProposal).
     pub fn set_collateral_bridge(_env: Env, _bridge_address: Address) {
-        panic!("Admin actions must be executed via AdminProposal: call propose_admin_action(AdminAction::SetCollateralBridge(...)) and sign_admin_proposal");
+        return Err(Error::MultisigNotActive);
     }
 
+    /// Returns `true` if the contract is globally paused.
     pub fn is_paused(env: Env) -> bool {
         env.storage().instance().get(&DataKey::IsPaused).unwrap_or(false)
     }
 
+    /// Return the current admin address.
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&DataKey::AdminAddress).expect("Admin not set")
     }
 
+    /// Return the vault record for `vault_id`.
     pub fn get_vault(env: Env, vault_id: u64) -> Vault {
         Self::get_vault_internal(&env, vault_id)
     }
 
 
+    /// Set the IPFS/Arweave metadata anchor CID (must be done via AdminProposal).
     pub fn set_metadata_anchor(_env: Env, _cid: String) {
-        panic!("Admin actions must be executed via AdminProposal: call propose_admin_action(AdminAction::SetMetadataAnchor(...)) and sign_admin_proposal");
+        return Err(Error::MultisigNotActive);
     }
 
+    /// Return the current metadata anchor CID.
     pub fn get_metadata_anchor(env: Env) -> String {
         env.storage().instance().get(&DataKey::MetadataAnchor)
             .unwrap_or(String::from_str(&env, ""))
     }
 
+    /// Return all vault IDs owned by `user`.
     pub fn get_user_vaults(env: Env, user: Address) -> Vec<u64> {
         env.storage().instance().get(&DataKey::UserVaults(user)).unwrap_or(Vec::new(&env))
     }
 
+    /// Return the governance voting power of `user` (= total unvested token balance).
     pub fn get_voting_power(env: Env, user: Address) -> i128 {
         // If this user has delegated their power to someone else, they have 0
         if env.storage().instance().has(&DataKey::VotingDelegate(user.clone())) {
@@ -2362,6 +2431,7 @@ impl VestingContract {
         total_power
     }
 
+    /// Delegate voting power from `beneficiary` to `representative`.
     pub fn delegate_voting_power(env: Env, beneficiary: Address, representative: Address) {
         beneficiary.require_auth();
         
@@ -2398,10 +2468,12 @@ impl VestingContract {
         }
     }
 
+    /// Accelerate all vesting schedules by a percentage (must be done via AdminProposal).
     pub fn accelerate_all_schedules(_env: Env, _percentage: u32) {
-        panic!("Admin actions must be executed via AdminProposal: call propose_admin_action(AdminAction::AccelerateAllSchedules(...)) and sign_admin_proposal");
+        return Err(Error::MultisigNotActive);
     }
 
+    /// Slash the unvested balance of a vault and transfer it to `treasury` (admin only).
     pub fn slash_unvested_balance(env: Env, vault_id: u64, treasury: Address) {
         Self::require_admin(&env);
         let mut vault = Self::get_vault_internal(&env, vault_id);
@@ -2413,7 +2485,7 @@ impl VestingContract {
         }
         let unvested = total_amount - vested;
         
-        if unvested <= 0 { panic!("Nothing to slash"); }
+        if unvested <= 0 { return Err(Error::NothingToClaim); }
         
         // Effectively stop the clock for this vault
         vault.end_time = env.ledger().timestamp();
@@ -2449,7 +2521,7 @@ impl VestingContract {
     /// Only callable by the admin.
     pub fn add_staking_contract(env: Env, staking_contract: Address) {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         let mut approved = get_approved_staking_contracts(&env);
         if !approved.contains(&staking_contract) {
             approved.push_back(staking_contract);
@@ -2457,9 +2529,10 @@ impl VestingContract {
         }
     }
 
+    /// Remove a staking contract from the approved whitelist (admin only).
     pub fn remove_staking_contract(env: Env, staking_contract: Address) {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         let approved = get_approved_staking_contracts(&env);
         let mut new_approved = Vec::new(&env);
         for a in approved.iter() {
@@ -2488,8 +2561,8 @@ impl VestingContract {
     pub fn auto_stake(env: Env, vault_id: u64, staking_contract: Address) {
         Self::require_not_paused(&env);
         let mut vault = Self::get_vault_internal(&env, vault_id);
-        if vault.is_frozen { panic!("Vault frozen"); }
-        if !vault.is_initialized { panic!("Vault not initialized"); }
+        if vault.is_frozen { return Err(Error::VaultFrozen); }
+        if !vault.is_initialized { return Err(Error::VaultNotInitialized); }
 
         // Auth: owner or admin â€” require owner auth (admin can mock_all_auths in tests)
         vault.owner.require_auth();
@@ -2499,14 +2572,14 @@ impl VestingContract {
 
         // Validate staking contract is whitelisted
         if !is_approved_staking_contract(&env, &staking_contract) {
-            panic!("UnauthorizedStakingContract");
+            return Err(Error::Unauthorized);
         }
 
         let mut stake_info = get_stake_info(&env, vault_id);
 
         // Cannot double-stake
         if stake_info.stake_state != StakeState::Unstaked {
-            panic!("AlreadyStaked");
+            return Err(Error::AlreadyStaked);
         }
 
         // Must have locked balance
@@ -2515,7 +2588,7 @@ impl VestingContract {
             locked += allocation.total_amount - allocation.released_amount;
         }
         if locked <= 0 {
-            panic!("InsufficientBalance");
+            return Err(Error::InsufficientBalance);
         }
 
         // Call the staking contract synchronously (Soroban: no async, direct call)
@@ -2564,7 +2637,7 @@ impl VestingContract {
         
         if vault.yield_destination == YieldDestination::Beneficiary {
             vault.owner.require_auth();
-            panic!("Yield distributed on token claim");
+            return Err(Error::InvalidInput);
         }
         // If DAO, anyone can trigger the harvest and it goes to the treasury.
 
@@ -2573,14 +2646,14 @@ impl VestingContract {
 
         // Guard: revoked vaults cannot claim yield
         if Self::is_vault_revoked(&env, vault_id) {
-            panic!("BeneficiaryRevoked");
+            return Err(Error::VaultRevoked);
         }
 
         let mut stake_info = get_stake_info(&env, vault_id);
 
         let staking_contract = match &stake_info.stake_state {
             StakeState::Staked(_, staking_contract) => staking_contract.clone(),
-            StakeState::Unstaked => panic!("NotStaked"),
+            StakeState::Unstaked => return Err(Error::StakeNotFound),
         };
 
         let yield_amount = call_claim_yield_for(&env, &staking_contract, &vault.owner, vault_id);
@@ -2631,7 +2704,7 @@ impl VestingContract {
             let mut vault = Self::get_vault_internal(&env, vault_id);
             
             if vault.is_irrevocable {
-                panic!("Vault {} is irrevocable", vault_id);
+                return Err(Error::VaultFrozen);
             }
             
             // Auto-unstake if staked
@@ -2690,9 +2763,13 @@ impl VestingContract {
         }
     }
     
+    /// Revoke a vault, transferring all unvested tokens to `treasury` (admin only).
+    ///
+    /// If the vault is currently staked, it is unstaked first.
+    /// Irrevocable vaults cannot be revoked.
     pub fn revoke_vault(env: Env, vault_id: u64, treasury: Address) {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         Self::do_revoke_vault_internal(&env, vault_id, treasury);
     }
 
@@ -2709,19 +2786,19 @@ impl VestingContract {
         Self::require_admin(&env);
 
         if penalty_pct > 100 {
-            panic!("penalty_pct must be 0-100");
+            return Err(Error::InvalidInput);
         }
 
         let mut vault = Self::get_vault_internal(&env, vault_id);
 
         if vault.is_irrevocable {
-            panic!("Vault is irrevocable");
+            return Err(Error::VaultFrozen);
         }
         if vault.is_frozen {
-            panic!("Vault already frozen");
+            return Err(Error::VaultFrozen);
         }
         if vault.allocations.len() != 1 {
-            panic!("Use diversified variant for multi-asset vaults");
+            return Err(Error::InvalidInput);
         }
 
         // Auto-unstake if staked
@@ -2735,7 +2812,7 @@ impl VestingContract {
         let unvested = allocation.total_amount - allocation.released_amount;
 
         if unvested <= 0 {
-            panic!("Nothing to revoke");
+            return Err(Error::NothingToClaim);
         }
 
         // penalty goes to treasury; remainder is immediately vested for beneficiary
@@ -2807,19 +2884,19 @@ impl VestingContract {
         Self::require_admin(&env);
 
         if clawback_amount <= 0 {
-            panic!("clawback_amount must be positive");
+            return Err(Error::InvalidAmount);
         }
 
         let mut vault = Self::get_vault_internal(&env, vault_id);
 
         if vault.is_irrevocable {
-            panic!("Vault is irrevocable");
+            return Err(Error::VaultFrozen);
         }
         if vault.is_frozen {
-            panic!("Vault is frozen");
+            return Err(Error::VaultFrozen);
         }
         if vault.allocations.len() != 1 {
-            panic!("Use diversified variant for multi-asset vaults");
+            return Err(Error::InvalidInput);
         }
 
         // Auto-unstake if staked
@@ -2837,7 +2914,7 @@ impl VestingContract {
         let unvested_amount = allocation.total_amount - vested_amount;
 
         if clawback_amount > unvested_amount {
-            panic!("clawback_amount exceeds available unvested tokens");
+            return Err(Error::InsufficientBalance);
         }
 
         // Transfer clawback amount to treasury
@@ -3022,7 +3099,7 @@ impl VestingContract {
 
     fn require_not_paused(env: &Env) {
         if env.storage().instance().get(&DataKey::IsPaused).unwrap_or(false) {
-            panic!("Paused");
+            return Err(Error::ContractPaused);
         }
     }
 
@@ -3041,10 +3118,10 @@ impl VestingContract {
 
     fn require_valid_duration(start: u64, end: u64) {
         if end <= start {
-            panic!("Invalid duration");
+            return Err(Error::InvalidSchedule);
         }
         if end - start > MAX_DURATION {
-            panic!("duration exceeds MAX_DURATION");
+            return Err(Error::InvalidSchedule);
         }
     }
 
@@ -3182,7 +3259,7 @@ impl VestingContract {
     fn sub_admin_balance(env: &Env, amount: i128) {
         let bal: i128 = env.storage().instance().get(&DataKey::AdminBalance).unwrap_or(0);
         if bal < amount {
-            panic!("Insufficient admin balance");
+            return Err(Error::InsufficientBalance);
         }
         env.storage()
             .instance()
@@ -3191,7 +3268,7 @@ impl VestingContract {
 
     fn reserve_admin_balance_for_batch(env: &Env, amount: i128) {
         let bal: i128 = env.storage().instance().get(&DataKey::AdminBalance).unwrap_or(0);
-        if bal < amount { panic!("Insufficient admin balance for batch"); }
+        if bal < amount { return Err(Error::InsufficientBalance); }
         env.storage().instance().set(&DataKey::AdminBalance, &(bal - amount));
     }
 
@@ -3207,14 +3284,14 @@ impl VestingContract {
         let contract_address = env.current_contract_address();
         let onchain_balance = token::Client::new(env, &token).balance(&contract_address);
         if onchain_balance < amount {
-            panic!("Insufficient deposited tokens for batch");
+            return Err(Error::InsufficientBalance);
         }
     }
 
     fn validate_batch_data(data: &BatchCreateData) -> i128 {
         let count = data.recipients.len();
         if count == 0 {
-            panic!("Empty batch");
+            return Err(Error::InvalidInput);
         }
         if data.asset_baskets.len() != count
             || data.start_times.len() != count
@@ -3222,7 +3299,7 @@ impl VestingContract {
             || data.keeper_fees.len() != count
             || !(data.step_durations.len() == count || data.step_durations.is_empty())
         {
-            panic!("Invalid batch data");
+            return Err(Error::InvalidInput);
         }
 
         let mut total_amount: i128 = 0;
@@ -3234,7 +3311,7 @@ impl VestingContract {
                 basket_total += allocation.total_amount;
             }
             if basket_total < 0 {
-                panic!("Invalid amount");
+                return Err(Error::InvalidAmount);
             }
 
             let start_time = data.start_times.get(i).unwrap();
@@ -3250,7 +3327,7 @@ impl VestingContract {
 
     fn _validate_schedule_configs(schedules: &Vec<ScheduleConfig>) -> i128 {
         if schedules.is_empty() {
-            panic!("Empty batch");
+            return Err(Error::InvalidInput);
         }
 
         let mut total_amount: i128 = 0;
@@ -3262,7 +3339,7 @@ impl VestingContract {
                 schedule_total += allocation.total_amount;
             }
             if schedule_total < 0 {
-                panic!("Invalid amount");
+                return Err(Error::InvalidAmount);
             }
 
             Self::require_valid_duration(schedule.start_time, schedule.end_time);
@@ -3322,7 +3399,7 @@ impl VestingContract {
 
         let staking_contract = match &stake_info.stake_state {
             StakeState::Staked(_, staking_contract) => staking_contract.clone(),
-            StakeState::Unstaked => panic!("NotStaked"),
+            StakeState::Unstaked => return Err(Error::StakeNotFound),
         };
 
         call_unstake_tokens(env, &staking_contract, &vault.owner, vault_id);
@@ -3394,10 +3471,10 @@ impl VestingContract {
         percentage: u32,
     ) -> AssetAllocationEntry {
         if total_amount <= 0 {
-            panic!("Asset amount must be positive");
+            return Err(Error::InvalidAmount);
         }
         if percentage == 0 || percentage > 10000 {
-            panic!("Asset percentage must be between 1 and 10000 basis points");
+            return Err(Error::InvalidInput);
         }
         
         AssetAllocationEntry {
@@ -3650,23 +3727,28 @@ impl VestingContract {
     }
 
     // Public getter functions for governance
+    /// Return the governance proposal record for `proposal_id`.
     pub fn get_proposal_info(env: Env, proposal_id: u64) -> GovernanceProposal {
     VestingContract::get_proposal(&env, proposal_id)
     }
 
+    /// Return the governance voting power of `voter`.
     pub fn get_voter_power(env: Env, voter: Address) -> i128 {
     VestingContract::get_voter_locked_value(&env, &voter)
     }
 
+    /// Return the total locked (unvested) token value across all vaults.
     pub fn get_total_locked(env: Env) -> i128 {
     VestingContract::get_total_locked_value(&env)
     }
 
+    /// Pause the contract globally (admin only, requires governance approval).
     pub fn pause(env: Env) {
         Self::get_admin(env.clone()).require_auth();
         env.storage().instance().set(&DataKey::IsPaused, &true);
     }
 
+    /// Resume the contract from a global pause (admin only).
     pub fn resume(env: Env) {
         Self::get_admin(env.clone()).require_auth();
         env.storage().instance().set(&DataKey::IsPaused, &false);
@@ -3674,11 +3756,12 @@ impl VestingContract {
 
     // --- Marketplace Functions (#89) ---
 
+    /// Authorise a marketplace contract to transfer a vault on behalf of its owner.
     pub fn authorize_marketplace_transfer(env: Env, vault_id: u64, marketplace: Address) {
         let vault = Self::get_vault_internal(&env, vault_id);
         vault.owner.require_auth();
         if !vault.is_transferable {
-            panic!("Vault not transferable");
+            return Err(Error::VaultFrozen);
         }
         let lock = MarketplaceLock {
             marketplace,
@@ -3687,6 +3770,7 @@ impl VestingContract {
         env.storage().instance().set(&DataKey::MarketplaceLock(vault_id), &lock);
     }
 
+    /// Complete a marketplace transfer, updating the vault owner to `new_owner`.
     pub fn complete_marketplace_transfer(env: Env, vault_id: u64, new_owner: Address) {
         let lock: MarketplaceLock = env.storage().instance().get(&DataKey::MarketplaceLock(vault_id)).expect("Vault not authorized for marketplace");
         lock.marketplace.require_auth();
@@ -3739,6 +3823,8 @@ impl VestingContract {
         }.publish(env);
     }
 
+    /// Extend a vesting schedule by `additional_duration` seconds and deposit
+    /// `additional_amount` extra tokens (admin only).
     pub fn renew_schedule(env: Env, vault_id: u64, additional_duration: u64, additional_amount: i128) {
         Self::require_admin(&env);
         Self::do_renew_vault_direct(&env, vault_id, additional_duration, additional_amount);
@@ -3831,7 +3917,7 @@ impl VestingContract {
     ) -> u64 {
         // Verify the creator is an accredited investor
         if !ZKVerifier::has_valid_accreditation(&env, owner.clone()) {
-            panic!("Creator must be an accredited investor");
+            return Err(Error::AccreditationStatusInvalid);
         }
 
         owner.require_auth();
@@ -3859,10 +3945,10 @@ impl VestingContract {
     ) {
         // Verify both parties are accredited investors
         if !ZKVerifier::has_valid_accreditation(&env, from.clone()) {
-            panic!("Sender must be an accredited investor");
+            return Err(Error::AccreditationStatusInvalid);
         }
         if !ZKVerifier::has_valid_accreditation(&env, to.clone()) {
-            panic!("Receiver must be an accredited investor");
+            return Err(Error::AccreditationStatusInvalid);
         }
 
         from.require_auth();
@@ -3972,7 +4058,7 @@ impl VestingContract {
         requires_legal_signatures: bool,
     ) -> u64 {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         
         let vault_id = Self::create_vault_full_internal(
             &env,
@@ -4298,7 +4384,7 @@ impl VestingContract {
         authorization_id: Option<BytesN<32>>,
     ) -> Result<u64, RegulatedAssetError> {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
 
         // Check if asset requires authorization
         if RegulatedAssetManager::requires_authorization(&env, asset_id.clone()) {
@@ -4348,34 +4434,34 @@ impl VestingContract {
         Self::require_not_paused(&env);
         let mut vault = Self::get_vault_internal(&env, vault_id);
         if vault.is_frozen {
-            panic!("Vault frozen");
+            return Err(Error::VaultFrozen);
         }
         if !vault.is_initialized {
-            panic!("Vault not initialized");
+            return Err(Error::VaultNotInitialized);
         }
 
         // Check if this specific vault schedule is paused
         if Self::is_vault_paused(env.clone(), vault_id) {
-            panic!("Vault schedule paused");
+            return Err(Error::ContractPaused);
         }
 
         // Check legal document signatures
         if vault.requires_legal_signatures && !vault.legal_documents_signed {
-            panic!("Legal document signatures required before claiming tokens");
+            return Err(Error::LegalSignatureMissing);
         }
 
         // Check beneficiary reassignment status
         if let Some(reassignment) = BeneficiaryReassignment::get_reassignment_status(&env, vault_id) {
             match &reassignment.status {
                 ReassignmentStatus::Pending(_) => {
-                    panic!("Beneficiary reassignment in progress - claims paused");
+                    return Err(Error::VaultFrozen);
                 }
                 ReassignmentStatus::Approved => {
-                    panic!("Beneficiary reassignment approved - claims paused");
+                    return Err(Error::VaultFrozen);
                 }
                 ReassignmentStatus::Completed => {
                     if reassignment.new_beneficiary != vault.owner {
-                        panic!("Vault owner mismatch after reassignment");
+                        return Err(Error::Unauthorized);
                     }
                 }
                 ReassignmentStatus::Rejected => {}
@@ -4385,7 +4471,7 @@ impl VestingContract {
 
         // Get the asset allocation
         if vault.allocations.len() != 1 {
-            panic!("Use claim_tokens_diversified_regulated for multi-asset vaults");
+            return Err(Error::InvalidInput);
         }
 
         let allocation = vault.allocations.get(0).unwrap();
@@ -4413,7 +4499,7 @@ impl VestingContract {
 
         let vested = Self::calculate_claimable_for_asset(&env, vault_id, &vault, 0);
         if claim_amount > vested - allocation.released_amount {
-            panic!("Insufficient vested tokens");
+            return Err(Error::InsufficientBalance);
         }
 
         let mut updated_allocation = allocation.clone();
@@ -4447,7 +4533,7 @@ impl VestingContract {
     /// This allows users to claim tokens and instantly swap them for USDC in one transaction
     pub fn configure_path_payment(env: Env, admin: Address, destination_asset: Address, min_destination_amount: i128, path: Vec<Address>) {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         
         let config = PathPaymentConfig {
             destination_asset: destination_asset.clone(),
@@ -4465,7 +4551,7 @@ impl VestingContract {
     /// Disable path payment feature
     pub fn disable_path_payment(env: Env, admin: Address) {
         Self::require_admin(&env);
-        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+        if Self::multisig_active(&env) { return Err(Error::MultisigNotActive); }
         
         if let Some(mut config) = env.storage().instance().get::<_, PathPaymentConfig>(&DataKey::PathPaymentConfig) {
             config.enabled = false;
@@ -4506,21 +4592,21 @@ impl VestingContract {
 
         // Check if legal document signatures are required and verified
         if vault.requires_legal_signatures && !vault.legal_documents_signed {
-            panic!("Legal document signatures required before claiming tokens");
+            return Err(Error::LegalSignatureMissing);
         }
 
         // Check beneficiary reassignment status
         if let Some(reassignment) = BeneficiaryReassignment::get_reassignment_status(&env, vault_id) {
             match &reassignment.status {
                 ReassignmentStatus::Pending(_) => {
-                    panic!("Beneficiary reassignment in progress - claims paused");
+                    return Err(Error::VaultFrozen);
                 }
                 ReassignmentStatus::Approved => {
-                    panic!("Beneficiary reassignment approved - claims paused");
+                    return Err(Error::VaultFrozen);
                 }
                 ReassignmentStatus::Completed => {
                     if reassignment.new_beneficiary != vault.owner {
-                        panic!("Vault owner mismatch after reassignment");
+                        return Err(Error::Unauthorized);
                     }
                 }
                 ReassignmentStatus::Rejected => {

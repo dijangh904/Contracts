@@ -19,6 +19,20 @@ pub struct VestingVault;
 #[contractimpl]
 impl VestingVault {
 
+    /// Claim vested tokens for a beneficiary.
+    ///
+    /// Runs the full compliance gate (KYC, sanctions, AML, etc.) before recording
+    /// the claim event.  The actual token transfer is left to the caller's vesting
+    /// logic; this function only validates and records.
+    ///
+    /// # Parameters
+    /// - `user`       – The beneficiary address; must sign the transaction.
+    /// - `vesting_id` – Identifier of the vesting schedule being claimed against.
+    /// - `amount`     – Number of tokens (in base units) to claim.
+    ///
+    /// # Errors
+    /// Returns a typed [`Error`] variant for every compliance failure (e.g.
+    /// `KycNotCompleted`, `AddressSanctioned`, `AmlThresholdExceeded`, …).
     pub fn claim(e: Env, user: Address, vesting_id: u32, amount: i128) -> Result<(), Error> {
         user.require_auth();
 
@@ -225,18 +239,18 @@ impl VestingVault {
 
     /// Confirms and activates a pending authorized payout address request
     /// Can only be called after the 48-hour timelock period has passed
-    pub fn confirm_auth_payout_addr(e: Env, beneficiary: Address) {
+    pub fn confirm_auth_payout_addr(e: Env, beneficiary: Address) -> Result<(), Error> {
         beneficiary.require_auth();
         
         let current_time = e.ledger().timestamp();
         
         // Get the pending request
         let pending_request = storage_get_pending_address_request(&e, &beneficiary)
-            .expect("No pending address request found");
+            .ok_or(Error::InvalidInput)?;
 
         // Check if timelock has passed
         if current_time < pending_request.effective_at {
-            panic!("Timelock period has not yet passed");
+            return Err(Error::TimelockNotElapsed);
         }
 
         // Create the authorized address record
@@ -280,11 +294,15 @@ impl VestingVault {
         storage_remove_pending_address_request(&e, &beneficiary);
     }
 
-    // 🔍 helper getter (needed for exporter)
+    /// Return the full on-chain claim history (needed by the audit exporter).
     pub fn get_all_claims(e: Env) -> Vec<ClaimEvent> {
         get_claim_history(&e)
     }
 
+    /// Return all claim events for a specific beneficiary.
+    ///
+    /// # Parameters
+    /// - `user` – The beneficiary whose claim history is requested.
     pub fn get_claims_by_user(e: Env, user: Address) -> Vec<ClaimEvent> {
         audit_exporter::export_claims_by_user(&e, user)
     }
@@ -292,25 +310,43 @@ impl VestingVault {
     // ========== ISSUE #140: Emergency Protocol Pause for Auditors ==========
     
     /// Initialize the auditor security team
-    pub fn initialize_auditors(e: Env, admin: Address, auditors: Vec<Address>) {
+    /// Initialise the 2-of-3 auditor multisig security team.
+    ///
+    /// # Parameters
+    /// - `admin`    – Must sign; only the admin may set auditors.
+    /// - `auditors` – Exactly 3 auditor addresses required.
+    ///
+    /// # Errors
+    /// - `InvalidInput` if `auditors.len() != 3`.
+    pub fn initialize_auditors(e: Env, admin: Address, auditors: Vec<Address>) -> Result<(), Error> {
         admin.require_auth();
         
         // Require exactly 3 auditors for 2-out-of-3 multisig
         if auditors.len() != 3 {
-            panic!("Must have exactly 3 auditors");
+            return Err(Error::InvalidInput);
         }
         
         set_auditors(&e, &auditors);
+
+        Ok(())
     }
 
     /// Request emergency pause by an auditor
-    pub fn request_emergency_pause(e: Env, auditor: Address, reason: String) {
+    /// Submit an emergency-pause request from an authorised auditor.
+    ///
+    /// When 2 of the 3 registered auditors have requested a pause the contract
+    /// is automatically frozen for the configured pause duration.
+    ///
+    /// # Errors
+    /// - `Unauthorized`  – caller is not a registered auditor.
+    /// - `AlreadyVoted`  – this auditor already submitted a request.
+    pub fn request_emergency_pause(e: Env, auditor: Address, reason: String) -> Result<(), Error> {
         auditor.require_auth();
         
         // Verify caller is an authorized auditor
         let authorized_auditors = get_auditors(&e);
         if !authorized_auditors.contains(&auditor) {
-            panic!("Not an authorized auditor");
+            return Err(Error::Unauthorized);
         }
         
         let current_time = e.ledger().timestamp();
@@ -318,7 +354,7 @@ impl VestingVault {
         
         // Check if auditor already requested
         if requests.contains_key(auditor.clone()) {
-            panic!("Auditor already requested pause");
+            return Err(Error::AlreadyVoted);
         }
         
         let request = AuditorPauseRequest {
@@ -334,6 +370,8 @@ impl VestingVault {
         if requests.len() >= 2 {
             Self::trigger_emergency_pause(&e);
         }
+
+        Ok(())
     }
 
     /// Internal function to trigger emergency pause
@@ -369,6 +407,7 @@ impl VestingVault {
     }
 
     /// Check if contract is currently paused
+    /// Returns `true` if the contract is currently under an active emergency pause.
     pub fn is_emergency_paused(e: Env) -> bool {
         if let Some(pause) = get_emergency_pause(&e) {
             if pause.is_active {
@@ -380,6 +419,7 @@ impl VestingVault {
     }
 
     /// Get current emergency pause status
+    /// Returns the current emergency-pause record, or `None` if no pause is active.
     pub fn get_emergency_pause_status(e: Env) -> Option<EmergencyPause> {
         get_emergency_pause(&e)
     }
@@ -442,18 +482,24 @@ impl VestingVault {
     // ========== ISSUE #139: Cross-Project Reputation Bonus Hook ==========
     
     /// Set the reputation bridge contract address
+    /// Set the cross-project reputation bridge contract address (admin only).
     pub fn set_reputation_bridge(e: Env, admin: Address, bridge_contract: Address) {
         admin.require_auth();
         set_reputation_bridge_contract(&e, &bridge_contract);
     }
 
     /// Apply reputation bonus based on cross-project success
-    pub fn apply_reputation_bonus(e: Env, beneficiary: Address) {
+    /// Apply a cliff-reduction reputation bonus for a beneficiary who has
+    /// achieved 100 % completion on a linked project.
+    ///
+    /// # Errors
+    /// - `AlreadyInitialized` – bonus has already been applied for this address.
+    pub fn apply_reputation_bonus(e: Env, beneficiary: Address) -> Result<(), Error> {
         beneficiary.require_auth();
         
         // Check if bonus already applied
         if has_reputation_bonus_applied(&e, &beneficiary) {
-            panic!("Reputation bonus already applied");
+            return Err(Error::AlreadyInitialized);
         }
         
         // Get reputation bridge contract
@@ -474,9 +520,12 @@ impl VestingVault {
             // Emit event
             ReputationBonusApplied { beneficiary: beneficiary.clone(), cliff_reduction_months: cliff_reduction, applied_at: current_time }.publish(&e);
         }
+
+        Ok(())
     }
 
     /// Check if user has reputation bonus applied
+    /// Returns `true` if the reputation bonus has already been applied for `beneficiary`.
     pub fn has_reputation_bonus(e: Env, beneficiary: Address) -> bool {
         has_reputation_bonus_applied(&e, &beneficiary)
     }
@@ -484,7 +533,14 @@ impl VestingVault {
     // ========== ISSUE #138: Milestone-Gated Step Vesting ==========
     
     /// Configure milestone vesting for a vesting schedule
-    pub fn configure_milestone_vesting(e: Env, admin: Address, vesting_id: u32, milestone_percentages: Vec<u32>) {
+    /// Configure milestone-gated step vesting for a schedule.
+    ///
+    /// Each entry in `milestone_percentages` is the percentage of total tokens
+    /// unlocked when that milestone is completed.  The values must sum to 100.
+    ///
+    /// # Errors
+    /// - `InvalidInput` – percentages do not sum to 100.
+    pub fn configure_milestone_vesting(e: Env, admin: Address, vesting_id: u32, milestone_percentages: Vec<u32>) -> Result<(), Error> {
         admin.require_auth();
         
         // Validate percentages sum to 100
@@ -494,7 +550,7 @@ impl VestingVault {
         }
         
         if total != 100 {
-            panic!("Milestone percentages must sum to 100");
+            return Err(Error::InvalidInput);
         }
         
         let _config = MilestoneConfig {
@@ -504,23 +560,32 @@ impl VestingVault {
         };
         
         set_milestone_configs(&e, vesting_id, &milestone_percentages);
+
+        Ok(())
     }
 
     /// Complete a milestone (admin only)
-    pub fn complete_milestone(e: Env, admin: Address, vesting_id: u32, milestone_number: u32) {
+    /// Mark a milestone as completed, unlocking the associated token tranche.
+    ///
+    /// Milestones must be completed sequentially (N-1 before N).
+    ///
+    /// # Errors
+    /// - `AlreadyInitialized`   – milestone already completed.
+    /// - `MilestoneNotCompleted` – previous milestone not yet completed.
+    pub fn complete_milestone(e: Env, admin: Address, vesting_id: u32, milestone_number: u32) -> Result<(), Error> {
         admin.require_auth();
         
         let mut status = get_milestone_status(&e, vesting_id);
         
         // Check if milestone already completed
         if status.contains_key(milestone_number) {
-            panic!("Milestone already completed");
+            return Err(Error::AlreadyInitialized);
         }
         
         // Check sequential completion (milestone N-1 must be completed)
         if milestone_number > 1 {
             if !status.contains_key(milestone_number - 1) {
-                panic!("Previous milestone must be completed first");
+                return Err(Error::MilestoneNotCompleted);
             }
         }
         
@@ -530,14 +595,18 @@ impl VestingVault {
         
         // Emit event
         MilestoneCompleted { vesting_id, milestone_number, completed_at: e.ledger().timestamp() }.publish(&e);
+
+        Ok(())
     }
 
     /// Get milestone status for a vesting schedule
+    /// Return the completion status map (`milestone_number -> completed`) for a schedule.
     pub fn get_milestone_status(e: Env, vesting_id: u32) -> Map<u32, bool> {
         get_milestone_status(&e, vesting_id)
     }
 
     /// Get milestone configuration for a vesting schedule
+    /// Return the milestone percentage configuration for a schedule, if set.
     pub fn get_milestone_config(e: Env, vesting_id: u32) -> Option<Vec<u32>> {
         get_milestone_configs(&e, vesting_id)
     }
@@ -546,12 +615,12 @@ impl VestingVault {
     
     /// Create a commitment for future private claims
     /// This function allows users to create a commitment that can be used for private claims later
-    pub fn create_commitment(e: Env, user: Address, vesting_id: u32, amount: i128, commitment_hash: BytesN<32>) {
+    pub fn create_commitment(e: Env, user: Address, vesting_id: u32, amount: i128, commitment_hash: BytesN<32>) -> Result<(), Error> {
         user.require_auth();
         
         // Check if commitment already exists
         if get_commitment(&e, &commitment_hash).is_some() {
-            panic!("Commitment already exists");
+            return Err(Error::AlreadyInitialized);
         }
         
         let current_time = e.ledger().timestamp();
@@ -570,11 +639,13 @@ impl VestingVault {
         
         // Emit event
         CommitmentCreated { commitment_hash, vesting_id, amount, created_at: current_time }.publish(&e);
+
+        Ok(())
     }
     
     /// Execute a private claim using ZK proof
     /// This function allows users to claim tokens without revealing their identity
-    pub fn private_claim(e: Env, zk_proof: ZKClaimProof, nullifier: Nullifier, amount: i128) {
+    pub fn private_claim(e: Env, zk_proof: ZKClaimProof, nullifier: Nullifier, amount: i128) -> Result<(), Error> {
         // No require_auth() - this is a privacy feature
         
         // Check if contract is under emergency pause
@@ -582,7 +653,7 @@ impl VestingVault {
             if pause.is_active {
                 let current_time = e.ledger().timestamp();
                 if current_time < pause.expires_at {
-                    panic!("Contract is under emergency pause until {}", pause.expires_at);
+                    return Err(Error::ContractPaused);
                 } else {
                     // Pause expired, remove it
                     remove_emergency_pause(&e);
@@ -592,25 +663,25 @@ impl VestingVault {
         
         // Check if nullifier has already been used (prevent double-spending)
         if is_nullifier_used(&e, &nullifier) {
-            panic!("Nullifier has already been used");
+            return Err(Error::AlreadyInitialized);
         }
         
         // Verify the commitment exists and is not used
         let commitment = get_commitment(&e, &zk_proof.commitment_hash)
-            .expect("Commitment not found");
+            .ok_or(Error::VaultNotFound)?;
         
         if commitment.is_used {
-            panic!("Commitment has already been used");
+            return Err(Error::AlreadyFullyClaimed);
         }
         
         // Verify the commitment amount matches the claim amount
         if commitment.amount != amount {
-            panic!("Claim amount does not match commitment amount");
+            return Err(Error::InvalidAmount);
         }
         
         // Verify the Merkle root is valid (for ZK proof verification)
         if !is_valid_merkle_root(&e, &zk_proof.merkle_root) {
-            panic!("Invalid Merkle root");
+            return Err(Error::InvalidInput);
         }
         
         // TODO: Verify actual ZK-SNARK proof
@@ -642,38 +713,46 @@ impl VestingVault {
         
         // TODO: Execute actual token transfer
         // This would integrate with the existing vesting logic
+
+        Ok(())
     }
     
     /// Add a Merkle root for ZK proof verification
     /// This function is called by the admin to add new Merkle roots
-    pub fn add_merkle_root_admin(e: Env, admin: Address, merkle_root: BytesN<32>) {
+    pub fn add_merkle_root_admin(e: Env, admin: Address, merkle_root: BytesN<32>) -> Result<(), Error> {
         admin.require_auth();
         
         // Check if Merkle root already exists
         if is_valid_merkle_root(&e, &merkle_root) {
-            panic!("Merkle root already exists");
+            return Err(Error::AlreadyInitialized);
         }
         
         // Add the Merkle root
         add_merkle_root(&e, &merkle_root);
+
+        Ok(())
     }
     
     /// Get all valid Merkle roots
+    /// Return all valid Merkle roots registered for ZK proof verification.
     pub fn get_merkle_roots(e: Env) -> Vec<BytesN<32>> {
         get_merkle_roots(&e)
     }
     
     /// Check if a nullifier has been used
+    /// Returns `true` if the given nullifier has already been consumed (double-spend guard).
     pub fn is_nullifier_used_public(e: Env, nullifier: Nullifier) -> bool {
         is_nullifier_used(&e, &nullifier)
     }
     
     /// Get commitment information
+    /// Return the commitment record for a given hash, or `None` if not found.
     pub fn get_commitment_info(e: Env, commitment_hash: BytesN<32>) -> Option<Commitment> {
         get_commitment(&e, &commitment_hash)
     }
     
     /// Get privacy claim history
+    /// Return the full history of private (ZK) claim events.
     pub fn get_privacy_claim_history(e: Env) -> Vec<PrivacyClaimEvent> {
         storage::get_privacy_claim_history(&e)
     }
@@ -741,7 +820,7 @@ impl VestingVault {
     
     /// Claim tokens with automatic path payment to USDC (Auto-Exit feature)
     /// This allows users to instantly swap their claimed tokens for USDC in one transaction
-    pub fn claim_with_path_payment(e: Env, user: Address, vesting_id: u32, amount: i128, min_destination_amount: Option<i128>) {
+    pub fn claim_with_path_payment(e: Env, user: Address, vesting_id: u32, amount: i128, min_destination_amount: Option<i128>) -> Result<(), Error> {
         user.require_auth();
 
         // Check if contract is under emergency pause
@@ -749,7 +828,7 @@ impl VestingVault {
             if pause.is_active {
                 let current_time = e.ledger().timestamp();
                 if current_time < pause.expires_at {
-                    panic!("Contract is under emergency pause until {}", pause.expires_at);
+                    return Err(Error::ContractPaused);
                 } else {
                     // Pause expired, remove it
                     remove_emergency_pause(&e);
@@ -759,10 +838,10 @@ impl VestingVault {
 
         // Get path payment configuration
         let config = get_path_payment_config(&e)
-            .expect("Path payment not configured");
+            .ok_or(Error::PathPaymentNotConfigured)?;
 
         if !config.enabled {
-            panic!("Path payment feature is disabled");
+            return Err(Error::PathPaymentDisabled);
         }
 
         // Use provided min_destination_amount or fallback to config
@@ -770,7 +849,7 @@ impl VestingVault {
         
         // Validate the amount
         if final_min_amount <= 0 {
-            panic!("Minimum destination amount must be positive");
+            return Err(Error::InvalidInput);
         }
 
         // TODO: Calculate actual vesting amounts and validate claim
@@ -778,12 +857,12 @@ impl VestingVault {
         let actual_claimable_amount = amount; // Placeholder - should calculate based on vesting schedule
         
         if actual_claimable_amount <= 0 {
-            panic!("No tokens available to claim");
+            return Err(Error::NothingToClaim);
         }
 
         // Execute the path payment using Stellar's built-in path_payment_strict_receive
         // This is the core of the Auto-Exit feature
-        let destination_amount = Self::execute_path_payment(&e, &user, actual_claimable_amount, &config.destination_asset, final_min_amount, &config.path);
+        let destination_amount = Self::execute_path_payment(&e, &user, actual_claimable_amount, &config.destination_asset, final_min_amount, &config.path)?;
         
         // Record the path payment claim event
         let current_time = e.ledger().timestamp();
@@ -811,6 +890,8 @@ impl VestingVault {
         
         // Emit the path payment claim event
         PathPaymentClaimExecuted { user: user.clone(), source_amount: actual_claimable_amount, destination_amount, destination_asset: config.destination_asset.clone(), timestamp: current_time, vesting_id }.publish(&e);
+
+        Ok(())
     }
     
     /// Simulate a path payment claim to show expected amounts without consuming gas
@@ -900,18 +981,20 @@ impl VestingVault {
     }
     
     /// Get current path payment configuration
+    /// Return the current path-payment (auto-exit) configuration, or `None` if not set.
     pub fn get_path_payment_config(e: Env) -> Option<PathPaymentConfig> {
         get_path_payment_config(&e)
     }
     
     /// Get path payment claim history
+    /// Return the history of all path-payment claim events.
     pub fn get_path_payment_claim_history(e: Env) -> Vec<PathPaymentClaimEvent> {
         get_path_payment_claim_history(&e)
     }
     
     /// Internal function to execute the path payment using Stellar's path_payment_strict_receive
     /// This is the core logic that enables the Auto-Exit feature
-    fn execute_path_payment(e: &Env, _beneficiary: &Address, source_amount: i128, destination_asset: &Address, min_destination_amount: i128, path: &Vec<Address>) -> i128 {
+    fn execute_path_payment(e: &Env, _beneficiary: &Address, source_amount: i128, destination_asset: &Address, min_destination_amount: i128, path: &Vec<Address>) -> Result<i128, Error> {
         // In a real Stellar Soroban implementation, this would use the built-in
         // path_payment_strict_receive function from the Stellar SDK
         
@@ -927,13 +1010,15 @@ impl VestingVault {
         let simulated_destination_amount = Self::simulate_path_payment_result(e, source_amount, destination_asset, path);
         
         if simulated_destination_amount < min_destination_amount {
-            panic!("Path payment failed: insufficient liquidity for minimum destination amount");
+            return Err(Error::InsufficientLiquidity);
         }
         
-        simulated_destination_amount
+        Ok(simulated_destination_amount)
     }
     
     /// Check if a user's tokens are unlocked for a specific vesting schedule
+    /// Returns `true` if the lock-up period for `user` on `vesting_id` has elapsed
+    /// (or no lock-up is configured).
     pub fn is_user_unlocked(e: Env, user: Address, vesting_id: u32) -> bool {
         if let Some(lockup_config) = get_lockup_config(&e, vesting_id) {
             if lockup_config.enabled {
@@ -949,6 +1034,8 @@ impl VestingVault {
     }
     
     /// Get the unlock time for a user's tokens
+    /// Return the Unix timestamp at which `user`'s tokens unlock for `vesting_id`,
+    /// or `None` if no lock-up is configured.
     pub fn get_user_unlock_time(e: Env, user: Address, vesting_id: u32) -> Option<u64> {
         if let Some(lockup_config) = get_lockup_config(&e, vesting_id) {
             if lockup_config.enabled {
@@ -1004,7 +1091,7 @@ impl VestingVault {
     
     /// Claim tokens with lock-up period handling
     /// This is the enhanced claim function that handles lock-up periods
-    pub fn claim_with_lockup(e: Env, user: Address, vesting_id: u32, amount: i128) {
+    pub fn claim_with_lockup(e: Env, user: Address, vesting_id: u32, amount: i128) -> Result<(), Error> {
         user.require_auth();
 
         // Check if contract is under emergency pause
@@ -1012,7 +1099,7 @@ impl VestingVault {
             if pause.is_active {
                 let current_time = e.ledger().timestamp();
                 if current_time < pause.expires_at {
-                    panic!("Contract is under emergency pause until {}", pause.expires_at);
+                    return Err(Error::ContractPaused);
                 } else {
                     // Pause expired, remove it
                     remove_emergency_pause(&e);
@@ -1027,7 +1114,7 @@ impl VestingVault {
                 
                 // Check if timelock has passed
                 if current_time < auth_address.effective_at {
-                    panic!("Authorized payout address is still in timelock period");
+                    return Err(Error::TimelockNotElapsed);
                 }
             }
         }
@@ -1060,6 +1147,8 @@ impl VestingVault {
         history.push_back(event);
 
         set_claim_history(&e, &history);
+
+        Ok(())
     }
     
     /// Internal function to issue wrapped tokens during lock-up period
@@ -1105,6 +1194,7 @@ impl VestingVault {
     // ========== ISSUE #114 & #212: Beneficiary Reassignment with Governance Veto ==========
 
     /// Initialize total token supply for governance calculations
+    /// Initialise the total token supply used for governance veto-power calculations.
     pub fn initialize_token_supply(e: Env, admin: Address, total_supply: i128) {
         admin.require_auth();
         
@@ -1117,6 +1207,7 @@ impl VestingVault {
     }
     
     /// Update total token supply (for dynamic supply tracking)
+    /// Update the total token supply (for dynamic supply tracking).
     pub fn update_token_supply(e: Env, admin: Address, new_total_supply: i128) {
         admin.require_auth();
         
@@ -1129,14 +1220,16 @@ impl VestingVault {
     }
     
     /// Set governance veto threshold percentage
-    pub fn set_governance_veto_threshold(e: Env, admin: Address, threshold_percentage: u32) {
+    pub fn set_governance_veto_threshold(e: Env, admin: Address, threshold_percentage: u32) -> Result<(), Error> {
         admin.require_auth();
         
         if threshold_percentage > 100 {
-            panic!("Threshold cannot exceed 100%");
+            return Err(Error::InvalidInput);
         }
         
         set_governance_veto_threshold(&e, threshold_percentage);
+
+        Ok(())
     }
     
     /// Request beneficiary reassignment with governance veto protection
@@ -1198,18 +1291,18 @@ impl VestingVault {
     }
     
     /// Execute beneficiary reassignment after timelock period
-    pub fn execute_beneficiary_reassignment(e: Env, reassignment_id: u32) {
+    pub fn execute_beneficiary_reassignment(e: Env, reassignment_id: u32) -> Result<(), Error> {
         let mut reassignment = get_beneficiary_reassignment(&e, reassignment_id)
-            .expect("Reassignment not found");
+            .ok_or(Error::VaultNotFound)?;
         
         if reassignment.is_executed {
-            panic!("Reassignment already executed");
+            return Err(Error::AlreadyInitialized);
         }
         
         let current_time = e.ledger().timestamp();
         
         if current_time < reassignment.effective_at {
-            panic!("Timelock period has not expired");
+            return Err(Error::TimelockNotElapsed);
         }
         
         // Check if governance veto was triggered
@@ -1225,7 +1318,7 @@ impl VestingVault {
             let veto_threshold = (supply_info.total_supply * threshold as i128) / 100;
             
             if total_veto_power >= veto_threshold {
-                panic!("Reassignment vetoed by governance");
+                return Err(Error::QuorumNotMet);
             }
         }
         
@@ -1244,33 +1337,35 @@ impl VestingVault {
             new_beneficiary: reassignment.new_beneficiary,
             executed_at: current_time,
         }.publish(&e);
+
+        Ok(())
     }
     
     /// Cast a vote for or against a beneficiary reassignment
-    pub fn cast_veto_vote(e: Env, voter: Address, reassignment_id: u32, vote_for_veto: bool, voting_power: i128) {
+    pub fn cast_veto_vote(e: Env, voter: Address, reassignment_id: u32, vote_for_veto: bool, voting_power: i128) -> Result<(), Error> {
         voter.require_auth();
         
         let reassignment = get_beneficiary_reassignment(&e, reassignment_id)
-            .expect("Reassignment not found");
+            .ok_or(Error::VaultNotFound)?;
         
         if !reassignment.requires_governance_veto {
-            panic!("This reassignment does not require governance veto");
+            return Err(Error::InvalidInput);
         }
         
         if reassignment.is_executed {
-            panic!("Reassignment already executed");
+            return Err(Error::AlreadyInitialized);
         }
         
         let current_time = e.ledger().timestamp();
         
         if current_time >= reassignment.effective_at {
-            panic!("Veto period has expired");
+            return Err(Error::VotingPeriodEnded);
         }
         
         // Check if voter has already voted
         let existing_votes = get_veto_votes(&e, reassignment_id);
         if existing_votes.iter().any(|vote| vote.voter == voter) {
-            panic!("Voter has already cast a vote");
+            return Err(Error::AlreadyVoted);
         }
         
         let vote = VetoVote {
@@ -1315,29 +1410,36 @@ impl VestingVault {
                 vetoed_at: current_time,
             }.publish(&e);
         }
+
+        Ok(())
     }
     
     /// Get beneficiary reassignment details
+    /// Return the reassignment record for `reassignment_id`, or `None` if not found.
     pub fn get_beneficiary_reassignment(e: Env, reassignment_id: u32) -> Option<BeneficiaryReassignment> {
         get_beneficiary_reassignment(&e, reassignment_id)
     }
     
     /// Get veto votes for a reassignment
+    /// Return all veto votes cast for a given reassignment.
     pub fn get_veto_votes(e: Env, reassignment_id: u32) -> Vec<VetoVote> {
         get_veto_votes(&e, reassignment_id)
     }
     
     /// Get current token supply info
+    /// Return the current token supply info used for governance calculations.
     pub fn get_token_supply_info(e: Env) -> TokenSupplyInfo {
         get_token_supply_info(&e)
     }
     
     /// Get current governance veto threshold
+    /// Return the current governance veto threshold percentage (0–100).
     pub fn get_governance_veto_threshold(e: Env) -> u32 {
         get_governance_veto_threshold(&e)
     }
     
     /// Check if a reassignment requires governance veto
+    /// Returns `true` if a reassignment of `amount` tokens requires a governance veto period.
     pub fn requires_governance_veto(e: Env, amount: i128) -> bool {
         let supply_info = get_token_supply_info(&e);
         let threshold = get_governance_veto_threshold(&e);
@@ -1347,6 +1449,7 @@ impl VestingVault {
     }
     
     /// Get veto status for a reassignment
+    /// Return `(is_vetoed, total_veto_power, veto_threshold)` for a reassignment.
     pub fn get_veto_status(e: Env, reassignment_id: u32) -> (bool, i128, i128) {
         let votes = get_veto_votes(&e, reassignment_id);
         let total_veto_power = votes.iter()
@@ -1366,12 +1469,12 @@ impl VestingVault {
     // ========== ISSUE #205: Automated Tax Withholding Logic ==========
     
     /// Configure tax withholding settings
-    pub fn configure_tax_withholding(e: Env, admin: Address, tax_treasury_address: Address, tax_withholding_bps: u32) {
+    pub fn configure_tax_withholding(e: Env, admin: Address, tax_treasury_address: Address, tax_withholding_bps: u32) -> Result<(), Error> {
         admin.require_auth();
         
         // Validate tax rate (basis points, 10000 = 100%)
         if tax_withholding_bps > 10000 {
-            panic!("Tax withholding rate cannot exceed 100%");
+            return Err(Error::InvalidInput);
         }
         
         let config = TaxWithholdingConfig {
@@ -1384,9 +1487,12 @@ impl VestingVault {
         
         // Emit configuration event
         TaxWithholdingConfigured { tax_treasury_address, tax_withholding_bps, timestamp: e.ledger().timestamp() }.publish(&e);
+
+        Ok(())
     }
     
     /// Disable tax withholding feature
+    /// Disable the tax withholding feature (admin only).
     pub fn disable_tax_withholding(e: Env, admin: Address) {
         admin.require_auth();
         
@@ -1400,6 +1506,7 @@ impl VestingVault {
     }
     
     /// Get current tax withholding configuration
+    /// Return the current tax withholding configuration, or `None` if not set.
     pub fn get_tax_withholding_config(e: Env) -> Option<TaxWithholdingConfig> {
         get_tax_withholding_config(&e)
     }
@@ -1438,6 +1545,7 @@ impl VestingVault {
     }
     
     /// Disable SEP-12 KYC checking
+    /// Disable SEP-12 KYC checking (admin only).
     pub fn disable_sep12_kyc(e: Env, admin: Address) {
         admin.require_auth();
         
@@ -1451,6 +1559,7 @@ impl VestingVault {
     }
     
     /// Get current SEP-12 Identity Oracle configuration
+    /// Return the current SEP-12 Identity Oracle configuration, or `None` if not set.
     pub fn get_sep12_oracle_config(e: Env) -> Option<SEP12IdentityOracle> {
         get_sep12_identity_oracle(&e)
     }
@@ -1490,12 +1599,12 @@ impl VestingVault {
     // ========== ISSUE #203: Handle Zero-Decimal Token Precision Safely ==========
     
     /// Register token metadata for precision handling
-    pub fn register_token_metadata(e: Env, admin: Address, asset_address: Address, decimals: u32) {
+    pub fn register_token_metadata(e: Env, admin: Address, asset_address: Address, decimals: u32) -> Result<(), Error> {
         admin.require_auth();
         
         // Validate decimals (0-18 typical range for Stellar assets)
         if decimals > 18 {
-            panic!("Token decimals cannot exceed 18");
+            return Err(Error::InvalidInput);
         }
         
         let metadata = TokenMetadata {
@@ -1507,9 +1616,12 @@ impl VestingVault {
         
         // Emit registration event
         TokenMetadataRegistered { asset_address, decimals, timestamp: e.ledger().timestamp() }.publish(&e);
+
+        Ok(())
     }
     
     /// Get token metadata
+    /// Return the registered token metadata for `asset_address`, or `None` if not registered.
     pub fn get_token_metadata_info(e: Env, asset_address: Address) -> Option<TokenMetadata> {
         get_token_metadata(&e, &asset_address)
     }
@@ -1556,12 +1668,12 @@ impl VestingVault {
     // ========== ISSUE #202: Implement Revocability Expiration (Cliff-Drop) ==========
     
     /// Create a new vesting grant with revocability expiration
-    pub fn create_vesting_grant(e: Env, admin: Address, vesting_id: u32, beneficiary: Address, is_revocable: bool) {
+    pub fn create_vesting_grant(e: Env, admin: Address, vesting_id: u32, beneficiary: Address, is_revocable: bool) -> Result<(), Error> {
         admin.require_auth();
         
         // Check if grant already exists
         if get_vesting_grant(&e, vesting_id).is_some() {
-            panic!("Vesting grant already exists");
+            return Err(Error::AlreadyInitialized);
         }
         
         let current_time = e.ledger().timestamp();
@@ -1585,6 +1697,8 @@ impl VestingVault {
             revocability_expires_at: grant.revocability_expires_at,
             created_at: current_time,
         }.publish(&e);
+
+        Ok(())
     }
     
     /// Check if a grant is still revocable
@@ -1618,6 +1732,7 @@ impl VestingVault {
     }
     
     /// Get vesting grant information
+    /// Return the vesting grant record for `vesting_id`, or `None` if not found.
     pub fn get_vesting_grant_info(e: Env, vesting_id: u32) -> Option<VestingGrant> {
         get_vesting_grant(&e, vesting_id)
     }
@@ -1841,12 +1956,14 @@ impl VestingVault {
 
     /// Admin function to record/update an address's unvested balance.
     /// Called when vaults are created or tokens are claimed to keep the balance current.
-    pub fn record_unvested_balance(e: Env, admin: Address, beneficiary: Address, unvested_amount: i128) {
+    pub fn record_unvested_balance(e: Env, admin: Address, beneficiary: Address, unvested_amount: i128) -> Result<(), Error> {
         admin.require_auth();
         if unvested_amount < 0 {
-            panic!("Unvested amount cannot be negative");
+            return Err(Error::InvalidInput);
         }
         set_unvested_balance(&e, &beneficiary, unvested_amount);
+
+        Ok(())
     }
 
     // ========== ISSUE #226: Admin Dead-Man's Switch ==========
