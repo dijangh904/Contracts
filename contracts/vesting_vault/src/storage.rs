@@ -1,9 +1,13 @@
 use soroban_sdk::{Env, Vec, Address, Map, BytesN};
-use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, LockupConfig, BeneficiaryReassignment, VetoVote, TokenSupplyInfo, LSTConfig, TvlCapConfig, RateLimitConfig, RelayerConfig, ConfidentialGrant, MasterViewingKey};
+use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, LockupConfig, BeneficiaryReassignment, VetoVote, TokenSupplyInfo, LSTConfig, TvlCapConfig, RateLimitConfig, RelayerConfig, ConfidentialGrant, MasterViewingKey, StreamPause};
 
 pub const CLAIM_HISTORY: &str = "CLAIM_HISTORY";
 pub const AUTHORIZED_PAYOUT_ADDRESS: &str = "AUTHORIZED_PAYOUT_ADDRESS";
 pub const PENDING_ADDRESS_REQUEST: &str = "PENDING_ADDRESS_REQUEST";
+
+// Stream pause storage keys for suspicious activity detection
+pub const STREAM_PAUSES: &str = "STREAM_PAUSES";
+pub const STREAM_PAUSE_HISTORY: &str = "STREAM_PAUSE_HISTORY";
 
 // Emergency pause storage keys
 pub const AUDITORS: &str = "AUDITORS";
@@ -440,4 +444,43 @@ pub fn is_nullifier_in_set(e: &Env, nullifier_hash: &BytesN<32>) -> bool {
 
 pub fn add_nullifier_to_set(e: &Env, nullifier_hash: &BytesN<32>) {
     e.storage().persistent().set(&(NULLIFIER_SET, nullifier_hash), &true);
+}
+
+// Stream pause functions for suspicious activity detection
+pub fn get_stream_pause(e: &Env, vesting_id: u32, beneficiary: &Address) -> Option<StreamPause> {
+    e.storage()
+        .instance()
+        .get(&(STREAM_PAUSES, vesting_id, beneficiary))
+}
+
+pub fn set_stream_pause(e: &Env, vesting_id: u32, beneficiary: &Address, pause: &StreamPause) {
+    e.storage()
+        .instance()
+        .set(&(STREAM_PAUSES, vesting_id, beneficiary), pause);
+}
+
+pub fn remove_stream_pause(e: &Env, vesting_id: u32, beneficiary: &Address) {
+    e.storage()
+        .instance()
+        .remove(&(STREAM_PAUSES, vesting_id, beneficiary));
+}
+
+pub fn is_stream_paused(e: &Env, vesting_id: u32, beneficiary: &Address) -> bool {
+    if let Some(pause) = get_stream_pause(e, vesting_id, beneficiary) {
+        return pause.is_active;
+    }
+    false
+}
+
+pub fn get_stream_pause_history(e: &Env) -> Vec<StreamPause> {
+    e.storage()
+        .instance()
+        .get(&STREAM_PAUSE_HISTORY)
+        .unwrap_or(Vec::new(e))
+}
+
+pub fn add_stream_pause_to_history(e: &Env, pause: &StreamPause) {
+    let mut history = get_stream_pause_history(e);
+    history.push_back(pause.clone());
+    e.storage().instance().set(&STREAM_PAUSE_HISTORY, &history);
 }

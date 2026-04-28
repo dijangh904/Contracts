@@ -62,6 +62,10 @@ pub enum Error {
     PoliticallyExposedPerson = 419,
     SanctionsListHit = 420,
 
+    // 🚨 Security (450s)
+    /// Stream paused due to suspicious activity detection
+    StreamPaused = 450,
+
     // ⚙️ System (900s)
     Overflow = 900,
 

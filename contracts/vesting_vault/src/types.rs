@@ -1,6 +1,52 @@
 use soroban_sdk::{contracttype, contractevent, Address, Vec, Map, String, BytesN, Bytes};
 
 #[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamPauseReason {
+    SuspiciousActivity,
+    AnomalousClaimPattern,
+    CompromisedAddress,
+    RapidWithdrawal,
+    UnusualBehavior,
+    ManualReview,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct StreamPause {
+    pub vesting_id: u32,
+    pub beneficiary: Address,
+    pub paused_at: u64,
+    pub paused_by: Address,
+    pub reason: StreamPauseReason,
+    pub is_active: bool,
+    pub notes: String,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct StreamPaused {
+    #[topic]
+    pub vesting_id: u32,
+    #[topic]
+    pub beneficiary: Address,
+    pub paused_at: u64,
+    pub paused_by: Address,
+    pub reason: StreamPauseReason,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct StreamUnpaused {
+    #[topic]
+    pub vesting_id: u32,
+    #[topic]
+    pub beneficiary: Address,
+    pub unpaused_at: u64,
+    pub unpaused_by: Address,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub struct ClaimEvent {
     pub beneficiary: Address,

@@ -11,7 +11,7 @@ mod zk_verifier;
 
 pub use types::*;
 use errors::Error;
-use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_lst_config, set_lst_config, get_unvested_balance, set_unvested_balance, get_admin_dead_man_switch, set_admin_dead_man_switch, get_oracle_price_record, set_oracle_price_record, get_contract_total_unvested, set_contract_total_unvested, get_confidential_grant, set_confidential_grant, remove_confidential_grant, get_master_viewing_key, set_master_viewing_key, remove_master_viewing_key, is_nullifier_in_set, add_nullifier_to_set};
+use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_lst_config, set_lst_config, get_unvested_balance, set_unvested_balance, get_admin_dead_man_switch, set_admin_dead_man_switch, get_oracle_price_record, set_oracle_price_record, get_contract_total_unvested, set_contract_total_unvested, get_confidential_grant, set_confidential_grant, remove_confidential_grant, get_master_viewing_key, set_master_viewing_key, remove_master_viewing_key, is_nullifier_in_set, add_nullifier_to_set, get_stream_pause, set_stream_pause, remove_stream_pause, is_stream_paused, get_stream_pause_history, add_stream_pause_to_history};
 use emergency::{AuditorPauseRequest, EmergencyPause, EmergencyPauseTriggered};
 
 #[contract]
@@ -22,6 +22,13 @@ impl VestingVault {
 
     pub fn claim(e: Env, user: Address, vesting_id: u32, amount: i128) -> Result<(), Error> {
         user.require_auth();
+
+        // ========== STREAM PAUSE CHECK ==========
+        
+        // Check if this specific stream is paused for suspicious activity
+        if is_stream_paused(&e, vesting_id, &user) {
+            return Err(Error::StreamPaused);
+        }
 
         // ========== COMPLIANCE CHECKS ==========
 
@@ -396,11 +403,104 @@ impl VestingVault {
         get_emergency_pause(&e)
     }
 
+    // ========== STREAM PAUSE FOR SUSPICIOUS ACTIVITY ==========
+    
+    /// Pause a specific vesting stream for suspicious activity
+    pub fn pause_stream(
+        e: Env,
+        admin: Address,
+        vesting_id: u32,
+        beneficiary: Address,
+        reason: types::StreamPauseReason,
+        notes: String,
+    ) {
+        admin.require_auth();
+        
+        let current_time = e.ledger().timestamp();
+        
+        let pause = types::StreamPause {
+            vesting_id,
+            beneficiary: beneficiary.clone(),
+            paused_at: current_time,
+            paused_by: admin.clone(),
+            reason: reason.clone(),
+            is_active: true,
+            notes: notes.clone(),
+        };
+        
+        set_stream_pause(&e, vesting_id, &beneficiary, &pause);
+        add_stream_pause_to_history(&e, &pause);
+        
+        // Emit event
+        types::StreamPaused {
+            vesting_id,
+            beneficiary: beneficiary.clone(),
+            paused_at: current_time,
+            paused_by: admin,
+            reason,
+        }.publish(&e);
+    }
+    
+    /// Unpause a specific vesting stream after review
+    pub fn unpause_stream(
+        e: Env,
+        admin: Address,
+        vesting_id: u32,
+        beneficiary: Address,
+    ) {
+        admin.require_auth();
+        
+        // Check if stream is actually paused
+        if !is_stream_paused(&e, vesting_id, &beneficiary) {
+            panic!("Stream is not paused");
+        }
+        
+        let current_time = e.ledger().timestamp();
+        
+        // Remove the pause
+        remove_stream_pause(&e, vesting_id, &beneficiary);
+        
+        // Emit event
+        types::StreamUnpaused {
+            vesting_id,
+            beneficiary: beneficiary.clone(),
+            unpaused_at: current_time,
+            unpaused_by: admin,
+        }.publish(&e);
+    }
+    
+    /// Check if a specific stream is paused
+    pub fn is_stream_paused_check(e: Env, vesting_id: u32, beneficiary: Address) -> bool {
+        is_stream_paused(&e, vesting_id, &beneficiary)
+    }
+    
+    /// Get stream pause details
+    pub fn get_stream_pause_info(e: Env, vesting_id: u32, beneficiary: Address) -> Option<types::StreamPause> {
+        get_stream_pause(&e, vesting_id, &beneficiary)
+    }
+    
+    /// Get all stream pause history
+    pub fn get_all_stream_pauses(e: Env) -> Vec<types::StreamPause> {
+        get_stream_pause_history(&e)
+    }
+
     // ========== ISSUE #137: Vesting Simulate Claim Dry-Run Helper ==========
     
     /// Simulate a claim to show exact amounts without consuming gas
     pub fn simulate_claim(e: Env, user: Address, _vesting_id: u32) -> ClaimSimulation {
         let current_time = e.ledger().timestamp();
+        
+        // Check if stream is paused for suspicious activity
+        if is_stream_paused(&e, _vesting_id, &user) {
+            return ClaimSimulation {
+                tokens_to_release: 0,
+                estimated_gas_fee: 0,
+                tax_withholding_amount: 0,
+                net_amount: 0,
+                can_claim: false,
+                reason: String::from_str(&e, "Stream paused due to suspicious activity"),
+            };
+        }
         
         // Check if contract is under emergency pause
         if let Some(pause) = get_emergency_pause(&e) {
@@ -756,6 +856,11 @@ impl VestingVault {
     pub fn claim_with_path_payment(e: Env, user: Address, vesting_id: u32, amount: i128, min_destination_amount: Option<i128>) {
         user.require_auth();
 
+        // Check if stream is paused for suspicious activity
+        if is_stream_paused(&e, vesting_id, &user) {
+            panic!("Stream paused due to suspicious activity");
+        }
+
         // Check if contract is under emergency pause
         if let Some(pause) = get_emergency_pause(&e) {
             if pause.is_active {
@@ -1018,6 +1123,11 @@ impl VestingVault {
     /// This is the enhanced claim function that handles lock-up periods
     pub fn claim_with_lockup(e: Env, user: Address, vesting_id: u32, amount: i128) {
         user.require_auth();
+
+        // Check if stream is paused for suspicious activity
+        if is_stream_paused(&e, vesting_id, &user) {
+            panic!("Stream paused due to suspicious activity");
+        }
 
         // Check if contract is under emergency pause
         if let Some(pause) = get_emergency_pause(&e) {
