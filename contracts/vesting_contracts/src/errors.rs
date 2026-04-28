@@ -25,7 +25,9 @@ pub enum Error {
     InvalidAmount = 209,
     VaultNotInitialized = 210,
     MilestoneNotCompleted = 211,
-    VestingExpired = 212,
+    MilestoneAlreadyTriggered = 212,
+    MilestoneNotSequential = 213,
+    VestingExpired = 214,
 
     // Financial (300s)
     InsufficientBalance = 300,

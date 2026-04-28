@@ -3798,6 +3798,203 @@ impl VestingContract {
         crate::kpi_vesting::kpi_verification_log(&env, vault_id)
     }
 
+    // --- Milestone-Gated Vesting Functions ---
+
+    /// Create a vault with milestone-based token release
+    /// Tokens are released only when milestones are triggered in sequence
+    pub fn create_milestone_vault(
+        env: Env,
+        owner: Address,
+        amount: i128,
+        start_time: u64,
+        end_time: u64,
+        keeper_fee: i128,
+        is_revocable: bool,
+        is_transferable: bool,
+        step_duration: u64,
+        milestones: Vec<u32>,
+    ) -> u64 {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+
+        // Validate milestones sum to 10000 (100%)
+        let total_percentage: u32 = milestones.iter().sum();
+        if total_percentage != 10000 {
+            panic!("Milestone percentages must sum to 10000 (100%)");
+        }
+
+        let vault_id = Self::create_vault_full_internal(
+            &env,
+            owner,
+            amount,
+            start_time,
+            end_time,
+            keeper_fee,
+            is_revocable,
+            is_transferable,
+            step_duration,
+        );
+
+        // Store milestone data
+        let milestone_data = crate::milestone::MilestoneData {
+            vault_id,
+            milestones: milestones.clone(),
+            current_milestone: 0,
+            triggered_milestones: Vec::new(&env),
+        };
+        env.storage().instance().set(&DataKey::VaultMilestones(vault_id), &milestone_data);
+
+        vault_id
+    }
+
+    /// Trigger a milestone (admin only)
+    /// Enforces sequential triggering: milestone N can only be triggered if milestone N-1 is complete
+    pub fn trigger_milestone(env: Env, vault_id: u64, milestone_id: u32, admin: Address) {
+        Self::require_admin(&env);
+        if Self::multisig_active(&env) { panic!("Use AdminProposal for multisig"); }
+
+        let mut milestone_data: crate::milestone::MilestoneData = env.storage().instance()
+            .get(&DataKey::VaultMilestones(vault_id))
+            .expect("Vault has no milestones configured");
+
+        // Check if milestone ID is valid
+        if milestone_id as usize >= milestone_data.milestones.len() {
+            panic!("Invalid milestone ID");
+        }
+
+        // Check if milestone is already triggered
+        if milestone_data.triggered_milestones.contains(&milestone_id) {
+            panic!("Milestone already triggered");
+        }
+
+        // ENFORCE SEQUENTIAL STATE MACHINE
+        // Milestone N can only be triggered if milestone N-1 has been triggered
+        // Exception: milestone 0 can always be triggered (first milestone)
+        if milestone_id > 0 {
+            let previous_milestone = milestone_id - 1;
+            if !milestone_data.triggered_milestones.contains(&previous_milestone) {
+                panic!("Cannot trigger milestone {} - previous milestone {} must be triggered first", milestone_id, previous_milestone);
+            }
+        }
+
+        // Trigger the milestone
+        milestone_data.triggered_milestones.push_back(milestone_id);
+        milestone_data.current_milestone = milestone_id;
+
+        // Store updated milestone data
+        env.storage().instance().set(&DataKey::VaultMilestones(vault_id), &milestone_data);
+
+        // Emit milestone event
+        crate::milestone::MilestoneEvent {
+            milestone_id,
+            is_triggered: true,
+            trigger_time: env.ledger().timestamp(),
+            triggered_by: admin,
+        }.publish(&env);
+    }
+
+    /// Claim tokens for triggered milestones
+    /// Beneficiary can only claim tokens for milestones that have been triggered
+    pub fn claim_milestone_tokens(env: Env, vault_id: u64) -> Result<i128, Error> {
+        Self::require_not_paused(&env);
+        let vault = Self::get_vault_internal(&env, vault_id);
+        
+        if vault.is_frozen {
+            return Err(Error::VaultFrozen);
+        }
+        if !vault.is_initialized {
+            return Err(Error::VaultNotInitialized);
+        }
+
+        vault.owner.require_auth();
+
+        // Get milestone data
+        let milestone_data: crate::milestone::MilestoneData = env.storage().instance()
+            .get(&DataKey::VaultMilestones(vault_id))
+            .expect("Vault has no milestones configured");
+
+        // Calculate claimable amount based on triggered milestones
+        let mut total_percentage_triggered = 0u32;
+        for milestone_id in milestone_data.triggered_milestones.iter() {
+            let idx = *milestone_id as usize;
+            if idx < milestone_data.milestones.len() {
+                total_percentage_triggered += milestone_data.milestones.get(idx).unwrap();
+            }
+        }
+
+        // Calculate total vault amount
+        let mut total_vault_amount = 0i128;
+        for allocation in vault.allocations.iter() {
+            total_vault_amount += allocation.total_amount;
+        }
+
+        // Calculate claimable amount based on triggered percentage
+        let claimable_amount = (total_vault_amount * total_percentage_triggered as i128) / 10000;
+
+        // Calculate already released amount
+        let mut already_released = 0i128;
+        for allocation in vault.allocations.iter() {
+            already_released += allocation.released_amount;
+        }
+
+        let actual_claimable = claimable_amount - already_released;
+
+        if actual_claimable <= 0 {
+            return Err(Error::NothingToClaim);
+        }
+
+        // Update vault allocations
+        let mut vault = Self::get_vault_internal(&env, vault_id);
+        let mut remaining_to_release = actual_claimable;
+        
+        for (i, allocation) in vault.allocations.iter().enumerate() {
+            let available = allocation.total_amount - allocation.released_amount;
+            let to_release = if available < remaining_to_release {
+                available
+            } else {
+                remaining_to_release
+            };
+            
+            if to_release > 0 {
+                let mut updated_allocation = allocation.clone();
+                updated_allocation.released_amount += to_release;
+                vault.allocations.set(i.try_into().unwrap(), updated_allocation);
+                remaining_to_release -= to_release;
+            }
+            
+            if remaining_to_release <= 0 {
+                break;
+            }
+        }
+
+        env.storage().instance().set(&DataKey::VaultData(vault_id), &vault);
+
+        // Transfer tokens to beneficiary
+        if vault.allocations.len() == 1 {
+            let allocation = vault.allocations.get(0).unwrap();
+            token::Client::new(&env, &allocation.asset_id)
+                .transfer(&env.current_contract_address(), &vault.owner, &actual_claimable);
+        } else {
+            // For multi-asset vaults, transfer proportionally
+            let mut remaining = actual_claimable;
+            for allocation in vault.allocations.iter() {
+                let asset_share = (allocation.total_amount * actual_claimable) / total_vault_amount;
+                if asset_share > 0 && remaining >= asset_share {
+                    token::Client::new(&env, &allocation.asset_id)
+                        .transfer(&env.current_contract_address(), &vault.owner, &asset_share);
+                    remaining -= asset_share;
+                }
+            }
+        }
+
+        Ok(actual_claimable)
+    }
+
+    /// Get milestone data for a vault
+    pub fn get_milestone_data(env: Env, vault_id: u64) -> Option<crate::milestone::MilestoneData> {
+        env.storage().instance().get(&DataKey::VaultMilestones(vault_id))
+    }
+
     // --- Zero-Knowledge Accredited Investor Verification Functions ---
 
     /// Verify accredited investor status using ZK proof
