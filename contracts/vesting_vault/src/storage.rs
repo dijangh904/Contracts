@@ -39,6 +39,12 @@ pub const REASSIGNMENT_COUNTER: &str = "REASSIGNMENT_COUNTER";
 pub const GOVERNANCE_VETO_THRESHOLD: &str = "GOVERNANCE_VETO_THRESHOLD"; // Percentage (e.g., 5 for 5%)
 pub const LST_CONFIGS: &str = "LST_CONFIGS";
 
+// LST Auto-Compounding storage keys (Issue #154)
+pub const LST_POOL_SHARES: &str = "LST_POOL_SHARES";
+pub const USER_LST_SHARES: &str = "USER_LST_SHARES";
+pub const UNBONDING_REQUESTS: &str = "UNBONDING_REQUESTS";
+pub const UNBONDING_QUEUE: &str = "UNBONDING_QUEUE";
+
 // 48 hours in seconds
 const TIMELOCK_DURATION: u64 = 172_800;
 

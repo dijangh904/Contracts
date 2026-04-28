@@ -17,6 +17,28 @@ pub enum Error {
     // 💰 Financial (300s)
     InsufficientBalance = 300,
 
+    // 🧪 LST Auto-Compounding (310s)
+    /// #154: LST not configured for this vesting schedule
+    LSTNotConfigured = 310,
+    /// #154: LST auto-compounding not enabled
+    LSTNotEnabled = 311,
+    /// #154: LST pool shares not initialized
+    LSTPoolNotInitialized = 312,
+    /// #154: User has no shares in the LST pool
+    NoUserShares = 313,
+    /// #154: No shares to unbond
+    NoSharesToUnbond = 314,
+    /// #154: Unbonding already pending for this user
+    UnbondingAlreadyPending = 315,
+    /// #154: Unbonding queue is full (rate limit)
+    UnbondingQueueFull = 316,
+    /// #154: Unbonding period has not elapsed yet
+    UnbondingPeriodNotElapsed = 317,
+    /// #154: No unbonding request found
+    NoUnbondingRequest = 318,
+    /// #154: Exchange rate manipulation suspected
+    ExchangeRateManipulationSuspected = 319,
+
     // 📜 Compliance (400s)
     KycNotCompleted = 400,
     KycExpired = 401,
