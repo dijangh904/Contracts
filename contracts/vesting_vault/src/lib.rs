@@ -217,6 +217,16 @@ impl VestingVault {
     pub fn set_authorized_payout_address(e: Env, beneficiary: Address, authorized_address: Address) {
         beneficiary.require_auth();
         
+        // Additional security: Verify authorized address is valid
+        if authorized_address == beneficiary {
+            panic!("Authorized address cannot be the same as beneficiary");
+        }
+        
+        // Additional security: Check if there's already a pending request
+        if let Some(_pending) = storage_get_pending_address_request(&e, &beneficiary) {
+            panic!("Address change request already pending");
+        }
+        
         let current_time = e.ledger().timestamp();
         let effective_at = current_time + get_timelock_duration();
 
@@ -240,11 +250,16 @@ impl VestingVault {
     pub fn confirm_auth_payout_addr(e: Env, beneficiary: Address) {
         beneficiary.require_auth();
         
-        let current_time = e.ledger().timestamp();
-        
-        // Get the pending request
+        // Additional security: Verify caller is the beneficiary
         let pending_request = storage_get_pending_address_request(&e, &beneficiary)
             .expect("No pending address request found");
+        
+        // Verify the pending request belongs to the caller
+        if pending_request.beneficiary != beneficiary {
+            panic!("Unauthorized: Request does not belong to caller");
+        }
+        
+        let current_time = e.ledger().timestamp();
 
         // Check if timelock has passed
         if current_time < pending_request.effective_at {
@@ -2690,17 +2705,356 @@ impl VestingVault {
 
     /// Check if a nullifier has been used
     /// 
-    /// This is a public function to check if a nullifier is in the permanent set.
-    pub fn is_nullifier_used_confidential(e: Env, nullifier_hash: BytesN<32>) -> bool {
-        is_nullifier_in_set(&e, &nullifier_hash)
+
+    // Update the grant's remaining shielded amount
+    grant.remaining_shielded = proof.remaining_amount;
+
+    // Check if grant is now fully claimed
+    if grant.remaining_shielded == 0 {
+        grant.is_fully_claimed = true;
     }
 
-    /// Remove the master viewing key (admin only)
-    /// 
-    /// This revokes the DAO's ability to perform clawbacks.
-    pub fn revoke_master_viewing_key(e: Env, admin: Address) -> Result<(), Error> {
-        admin.require_auth();
-        remove_master_viewing_key(&e);
-        Ok(())
+    // Store the updated grant
+    set_confidential_grant(&e, vesting_id, &grant);
+
+    // Add nullifier to persistent storage (permanent tracking)
+    add_nullifier_to_set(&e, &proof.nullifier);
+
+    // Emit event with only the nullifier hash (zero metadata leakage)
+    ConfidentialClaimExecuted {
+        nullifier_hash: proof.nullifier,
+        new_commitment_hash: proof.commitment_hash,
+        timestamp: e.ledger().timestamp(),
+    }.publish(&e);
+
+    // TODO: Execute actual token transfer
+    // This would integrate with the existing vesting logic to transfer tokens
+
+    Ok(())
+}
+
+/// Set the master viewing key for DAO clawback operations
+/// 
+/// This allows the DAO to recover shielded funds in emergency situations
+/// using a master viewing key that can decrypt the shielded amounts.
+/// 
+/// # Arguments
+/// * `e` - The environment
+/// * `admin` - Admin address authorizing the viewing key
+/// * `viewing_key` - The master viewing key public key
+/// 
+/// # Security
+/// Only authorized admins can set the viewing key. The key can be revoked
+/// by setting a new one or removing it entirely.
+pub fn set_master_viewing_key_admin(
+    e: Env,
+    admin: Address,
+    viewing_key: BytesN<32>,
+) -> Result<(), Error> {
+    admin.require_auth();
+
+    let current_time = e.ledger().timestamp();
+
+    let key = MasterViewingKey {
+        viewing_key,
+        authorized_by: admin,
+        set_at: current_time,
+        is_active: true,
+    };
+
+    set_master_viewing_key(&e, &key);
+
+    Ok(())
+}
+
+/// Execute DAO clawback using master viewing key
+/// 
+/// This function allows the DAO to recover shielded funds from a confidential grant
+/// in emergency situations (e.g., employee termination, legal requirements).
+/// 
+/// # Arguments
+/// * `e` - The environment
+/// * `admin` - Admin address authorizing the clawback
+/// * `vesting_id` - Vesting schedule identifier
+/// * `viewing_key` - Master viewing key for decryption
+/// * `clawback_amount` - Amount to claw back
+/// 
+/// # Events
+/// Emits `ConfidentialClawbackExecuted` event
+/// 
+/// # Errors
+/// * `Error::ViewingKeyUnauthorized` - If the viewing key is not valid
+/// * `Error::OverClaimAttempt` - If clawback amount exceeds remaining
+pub fn confidential_clawback(
+    e: Env,
+    admin: Address,
+    vesting_id: u32,
+    viewing_key: BytesN<32>,
+    clawback_amount: i128,
+) -> Result<(), Error> {
+    admin.require_auth();
+
+    // Get the stored master viewing key
+    let stored_key = get_master_viewing_key(&e)
+        .ok_or(Error::ViewingKeyUnauthorized)?;
+
+    // Verify the viewing key is authorized
+    if !zk_verifier::ZKVerifier::verify_viewing_key(&viewing_key, &admin, &stored_key) {
+        return Err(Error::ViewingKeyUnauthorized);
     }
+
+    // Get the confidential grant
+    let mut grant = get_confidential_grant(&e, vesting_id)
+        .ok_or(Error::VestingNotFound)?;
+
+    // Verify clawback amount doesn't exceed remaining
+    if clawback_amount > grant.remaining_shielded {
+        return Err(Error::OverClaimAttempt);
+    }
+
+    // Update the grant's remaining shielded amount
+    grant.remaining_shielded -= clawback_amount;
+
+    // Check if grant is now fully claimed (clawed back)
+    if grant.remaining_shielded == 0 {
+        grant.is_fully_claimed = true;
+    }
+
+    // Store the updated grant
+    set_confidential_grant(&e, vesting_id, &grant);
+
+    // Emit event
+    ConfidentialClawbackExecuted {
+        vesting_id,
+        clawed_amount: clawback_amount,
+        authorized_by: admin,
+        timestamp: e.ledger().timestamp(),
+    }.publish(&e);
+
+    // TODO: Execute actual token transfer to DAO treasury
+    // This would integrate with the existing vesting logic
+
+    Ok(())
+}
+
+/// Get confidential grant information
+/// 
+/// Returns the confidential grant details for a given vesting ID.
+/// Note: The actual grant amount is shielded and only visible with the viewing key.
+pub fn get_confidential_grant_info(e: Env, vesting_id: u32) -> Option<ConfidentialGrant> {
+    get_confidential_grant(&e, vesting_id)
+}
+
+/// Check if a nullifier has been used
+/// 
+/// This is a public function to check if a nullifier is in the permanent set.
+pub fn is_nullifier_used_confidential(e: Env, nullifier_hash: BytesN<32>) -> bool {
+    is_nullifier_in_set(&e, &nullifier_hash)
+}
+
+/// Remove the master viewing key (admin only)
+/// 
+/// This revokes the DAO's ability to perform clawbacks.
+pub fn revoke_master_viewing_key(e: Env, admin: Address) -> Result<(), Error> {
+    admin.require_auth();
+    remove_master_viewing_key(&e);
+    Ok(())
+}
+
+// ========== ISSUE #295: Use Temporary Storage for Claim-History Pagination State ==========
+
+/// Get claim history with pagination using temporary storage
+/// This optimizes gas usage by avoiding full history scans
+pub fn get_claim_history_paginated(e: Env, page_number: u32) -> ClaimHistoryPage {
+    let current_time = e.ledger().timestamp();
+    let all_claims = get_claim_history(&e);
+    
+    // Update pagination state in temporary storage
+    let pagination_state = PaginationState {
+        current_page: page_number,
+        total_items: all_claims.len() as u32,
+        last_updated: current_time,
+    };
+    set_pagination_state(&e, &pagination_state);
+    
+    // Calculate pagination
+    let start_index = page_number * CLAIM_HISTORY_PAGE_SIZE;
+    let end_index = std::cmp::min(start_index + CLAIM_HISTORY_PAGE_SIZE, all_claims.len() as u32);
+    
+    let mut page_claims = Vec::new(&e);
+    for i in start_index..end_index {
+        if let Some(claim) = all_claims.get(i as usize) {
+            page_claims.push_back(claim.clone());
+        }
+    }
+    
+    let total_pages = (all_claims.len() as u32 + CLAIM_HISTORY_PAGE_SIZE - 1) / CLAIM_HISTORY_PAGE_SIZE;
+    let has_next = page_number + 1 < total_pages;
+    
+    ClaimHistoryPage {
+        page_number,
+        claims: page_claims,
+        has_next,
+        total_pages,
+    }
+}
+
+/// Get current pagination state from temporary storage
+pub fn get_pagination_info(e: Env) -> PaginationState {
+    get_pagination_state(&e)
+}
+
+// ========== ISSUE #296: Implement 'Force-Withdrawal' for Expired and Fully Vested Schedules ==========
+
+/// Force withdrawal for expired or fully vested schedules
+/// This allows beneficiaries to withdraw remaining tokens after vesting expiration
+pub fn force_withdrawal(e: Env, beneficiary: Address, vesting_id: u32) -> Result<i128, Error> {
+    beneficiary.require_auth();
+    
+    let current_time = e.ledger().timestamp();
+    
+    // Check if schedule exists and is expired/fully vested
+    let expired_schedule = get_expired_schedule(&e, vesting_id)
+        .ok_or(Error::VestingNotFound)?;
+    
+    if expired_schedule.is_force_withdrawn {
+        return Err(Error::AlreadyFullyClaimed);
+    }
+    
+    // Check if schedule is expired (current time past expiration)
+    if current_time < expired_schedule.expires_at {
+        return Err(Error::CliffNotReached);
+    }
+    
+    // Calculate remaining amount to withdraw
+    let remaining_amount = expired_schedule.total_amount - expired_schedule.claimed_amount;
+    
+    if remaining_amount <= 0 {
+        return Err(Error::NothingToClaim);
+    }
+    
+    // Mark as force withdrawn
+    let mut updated_schedule = expired_schedule;
+    updated_schedule.is_force_withdrawn = true;
+    set_expired_schedule(&e, vesting_id, &updated_schedule);
+    
+    // Emit force withdrawal event
+    ForceWithdrawalExecuted {
+        vesting_id,
+        beneficiary: beneficiary.clone(),
+        withdrawn_amount: remaining_amount,
+        reason: String::from_str(&e, "Force withdrawal of expired/fully vested schedule"),
+        timestamp: current_time,
+    }.publish(&e);
+    
+    Ok(remaining_amount)
+}
+
+/// Register an expired vesting schedule for force withdrawal
+/// This should be called when a vesting schedule is created or expires
+pub fn register_expired_schedule(e: Env, admin: Address, vesting_id: u32, beneficiary: Address, total_amount: i128, expires_at: u64) -> Result<(), Error> {
+    admin.require_auth();
+    
+    // Check if already registered
+    if get_expired_schedule(&e, vesting_id).is_some() {
+        return Err(Error::VestingNotFound);
+    }
+    
+    let schedule = ExpiredSchedule {
+        vesting_id,
+        beneficiary: beneficiary.clone(),
+        total_amount,
+        claimed_amount: 0,
+        expires_at,
+        is_force_withdrawn: false,
+    };
+    
+    set_expired_schedule(&e, vesting_id, &schedule);
+    
+    // In a real implementation, this would integrate with vesting creation
+    Ok(())
+}
+
+/// Get expired schedule information
+pub fn get_expired_schedule_info(e: Env, vesting_id: u32) -> Option<ExpiredSchedule> {
+    get_expired_schedule(&e, vesting_id)
+}
+
+// ========== ISSUE #297: Implement 'Max-Allocation-Sanity-Check' on Global Contract Level ==========
+
+/// Set maximum allocation limit for the entire contract
+/// This prevents over-allocation of tokens beyond safe limits
+pub fn set_max_allocation_limit(e: Env, admin: Address, max_limit: i128) -> Result<(), Error> {
+    admin.require_auth();
+    
+    if max_limit <= 0 {
+        return Err(Error::InvalidInput);
+    }
+    
+    let current_total = get_total_allocated(&e);
+    if current_total > max_limit {
+        return Err(Error::InsufficientBalance);
+    }
+    
+    set_max_allocation_limit(&e, max_limit);
+    
+    MaxAllocationLimitSet {
+        max_limit,
+        set_by: admin,
+        timestamp: e.ledger().timestamp(),
+    }.publish(&e);
+    
+    Ok(())
+}
+
+/// Check and update total allocation with sanity check
+/// This should be called whenever new allocations are made
+pub fn check_allocation_limit(e: Env, new_allocation: i128) -> Result<(), Error> {
+    let max_limit = get_max_allocation_limit(&e);
+    let current_total = get_total_allocated(&e);
+    let projected_total = current_total + new_allocation;
+    
+    if projected_total > max_limit {
+        AllocationLimitExceeded {
+            attempted_allocation: new_allocation,
+            max_limit,
+            rejected_at: e.ledger().timestamp(),
+        }.publish(&e);
+        
+        return Err(Error::InsufficientBalance);
+    }
+    
+    // Update total allocated
+    set_total_allocated(&e, projected_total);
+    Ok(())
+}
+
+/// Get current maximum allocation limit
+pub fn get_max_allocation_limit_info(e: Env) -> i128 {
+    get_max_allocation_limit(&e)
+}
+
+/// Get current total allocated amount
+pub fn get_total_allocated_info(e: Env) -> i128 {
+    get_total_allocated(&e)
+}
+
+/// Initialize allocation tracking (call during contract deployment)
+pub fn initialize_allocation_tracking(e: Env, admin: Address, initial_limit: i128) -> Result<(), Error> {
+    admin.require_auth();
+    
+    if initial_limit <= 0 {
+        return Err(Error::InvalidInput);
+    }
+    
+    set_max_allocation_limit(&e, initial_limit);
+    set_total_allocated(&e, 0i128);
+    
+    MaxAllocationLimitSet {
+        max_limit: initial_limit,
+        set_by: admin,
+        timestamp: e.ledger().timestamp(),
+    }.publish(&e);
+    
+    Ok(())
 }

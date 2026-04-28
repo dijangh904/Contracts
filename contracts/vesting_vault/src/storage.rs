@@ -1,5 +1,5 @@
 use soroban_sdk::{Env, Vec, Address, Map, BytesN};
-use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, LockupConfig, BeneficiaryReassignment, VetoVote, TokenSupplyInfo, LSTConfig, TvlCapConfig, RateLimitConfig, RelayerConfig, ConfidentialGrant, MasterViewingKey};
+use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, LockupConfig, BeneficiaryReassignment, VetoVote, TokenSupplyInfo, LSTConfig, TvlCapConfig, RateLimitConfig, RelayerConfig, ConfidentialGrant, MasterViewingKey, PaginationState, ExpiredSchedule};
 
 pub const CLAIM_HISTORY: &str = "CLAIM_HISTORY";
 pub const AUTHORIZED_PAYOUT_ADDRESS: &str = "AUTHORIZED_PAYOUT_ADDRESS";
@@ -404,6 +404,17 @@ pub const CONFIDENTIAL_GRANTS: &str = "CONFIDENTIAL_GRANTS";
 pub const MASTER_VIEWING_KEY: &str = "MASTER_VIEWING_KEY";
 pub const NULLIFIER_SET: &str = "NULLIFIER_SET";
 
+// ========== ISSUE #295: Temporary Storage for Claim-History Pagination ==========
+pub const PAGINATION_STATE: &str = "PAGINATION_STATE";
+pub const CLAIM_HISTORY_PAGE_SIZE: u32 = 100;
+
+// ========== ISSUE #296: Force-Withdrawal for Expired Schedules ==========
+pub const EXPIRED_SCHEDULES: &str = "EXPIRED_SCHEDULES";
+
+// ========== ISSUE #297: Max-Allocation-Sanity-Check ==========
+pub const MAX_ALLOCATION_LIMIT: &str = "MAX_ALLOCATION_LIMIT";
+pub const TOTAL_ALLOCATED: &str = "TOTAL_ALLOCATED";
+
 // Confidential grant storage functions
 pub fn get_confidential_grant(e: &Env, vesting_id: u32) -> Option<ConfidentialGrant> {
     e.storage().instance().get(&(CONFIDENTIAL_GRANTS, vesting_id))
@@ -440,4 +451,78 @@ pub fn is_nullifier_in_set(e: &Env, nullifier_hash: &BytesN<32>) -> bool {
 
 pub fn add_nullifier_to_set(e: &Env, nullifier_hash: &BytesN<32>) {
     e.storage().persistent().set(&(NULLIFIER_SET, nullifier_hash), &true);
+}
+
+// ========== ISSUE #295: Temporary Storage for Claim-History Pagination ==========
+
+#[derive(Clone)]
+#[contracttype]
+pub struct PaginationState {
+    pub current_page: u32,
+    pub total_items: u32,
+    pub last_updated: u64,
+}
+
+pub fn get_pagination_state(e: &Env) -> PaginationState {
+    e.storage()
+        .temporary()
+        .get(&PAGINATION_STATE)
+        .unwrap_or(PaginationState {
+            current_page: 0,
+            total_items: 0,
+            last_updated: 0,
+        })
+}
+
+pub fn set_pagination_state(e: &Env, state: &PaginationState) {
+    e.storage().temporary().set(&PAGINATION_STATE, state);
+}
+
+// ========== ISSUE #296: Force-Withdrawal for Expired Schedules ==========
+
+#[derive(Clone)]
+#[contracttype]
+pub struct ExpiredSchedule {
+    pub vesting_id: u32,
+    pub beneficiary: Address,
+    pub total_amount: i128,
+    pub claimed_amount: i128,
+    pub expires_at: u64,
+    pub is_force_withdrawn: bool,
+}
+
+pub fn get_expired_schedule(e: &Env, vesting_id: u32) -> Option<ExpiredSchedule> {
+    e.storage().instance().get(&(EXPIRED_SCHEDULES, vesting_id))
+}
+
+pub fn set_expired_schedule(e: &Env, vesting_id: u32, schedule: &ExpiredSchedule) {
+    e.storage().instance().set(&(EXPIRED_SCHEDULES, vesting_id), schedule);
+}
+
+pub fn remove_expired_schedule(e: &Env, vesting_id: u32) {
+    e.storage().instance().remove(&(EXPIRED_SCHEDULES, vesting_id));
+}
+
+// ========== ISSUE #297: Max-Allocation-Sanity-Check ==========
+
+pub fn get_max_allocation_limit(e: &Env) -> i128 {
+    e.storage()
+        .instance()
+        .get(&MAX_ALLOCATION_LIMIT)
+        .unwrap_or(1000000000i128) // Default: 1 billion tokens
+}
+
+pub fn set_max_allocation_limit(e: &Env, limit: i128) {
+    e.storage().instance().set(&MAX_ALLOCATION_LIMIT, &limit);
+}
+
+pub fn get_total_allocated(e: &Env) -> i128 {
+    e.storage()
+        .instance()
+        .get(&TOTAL_ALLOCATED)
+        .unwrap_or(0i128)
+}
+
+pub fn set_total_allocated(e: &Env, total: i128) {
+    e.storage().instance().set(&TOTAL_ALLOCATED, &total);
 }
