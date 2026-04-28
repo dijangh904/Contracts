@@ -51,4 +51,14 @@ interface IVestingVault {
      * @dev Emitted when tokens are released from escrow
      */
     event TokensReleased(address indexed beneficiary, uint256 amount);
+
+    /**
+     * @dev Emitted when KPI multiplier is updated
+     */
+    event KPIMultiplierUpdated(
+        uint256 oldMultiplier,
+        uint256 oracleInput,
+        uint256 newMultiplier,
+        uint256 timestamp
+    );
 }

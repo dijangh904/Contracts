@@ -3,6 +3,7 @@ pragma solidity ^0.8.19;
 
 import "../../interfaces/IVestingVault.sol";
 import "../../interfaces/ISanctionsOracle.sol";
+import "../../interfaces/IRevenueOracle.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
@@ -17,6 +18,9 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
     
     // Sanctions oracle for compliance checks
     ISanctionsOracle public sanctionsOracle;
+    
+    // Revenue oracle for KPI-based vesting multipliers
+    IRevenueOracle public revenueOracle;
     
     // Mapping of beneficiary to grant
     mapping(address => Grant) public grants;
@@ -33,22 +37,40 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
     // Emergency pause flag
     bool public paused = false;
     
+    // KPI multiplier storage
+    uint256 public currentKPIMultiplier = 10000; // 1.0x in basis points (10000 = 1.0x)
+    
+    // Historical KPI metrics for temporary storage
+    struct KPIMetric {
+        uint256 multiplier;
+        uint256 oracleInput;
+        uint256 timestamp;
+    }
+    KPIMetric[] public kpiHistory;
+    
+    // Maximum number of KPI history entries to store
+    uint256 public constant MAX_KPI_HISTORY = 100;
+    
     /**
      * @dev Constructor
      * @param tokenAddress Address of the ERC20 token
      * @param sanctionsOracleAddress Address of the sanctions oracle
+     * @param revenueOracleAddress Address of the revenue oracle
      * @param initialOwner Initial owner of the contract
      */
     constructor(
         address tokenAddress,
         address sanctionsOracleAddress,
+        address revenueOracleAddress,
         address initialOwner
     ) Ownable() {
         require(tokenAddress != address(0), "Invalid token address");
-        require(sanctionsOracleAddress != address(0), "Invalid oracle address");
+        require(sanctionsOracleAddress != address(0), "Invalid sanctions oracle address");
+        require(revenueOracleAddress != address(0), "Invalid revenue oracle address");
         
         token = IERC20(tokenAddress);
         sanctionsOracle = ISanctionsOracle(sanctionsOracleAddress);
+        revenueOracle = IRevenueOracle(revenueOracleAddress);
         transferOwnership(initialOwner);
     }
     
@@ -147,6 +169,15 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
     }
     
     /**
+     * @dev Updates the revenue oracle address (owner only)
+     * @param newOracle New revenue oracle address
+     */
+    function updateRevenueOracle(address newOracle) external onlyOwner {
+        require(newOracle != address(0), "Invalid oracle address");
+        revenueOracle = IRevenueOracle(newOracle);
+    }
+    
+    /**
      * @dev Releases tokens from escrow if beneficiary is no longer sanctioned
      * @param beneficiary The beneficiary whose tokens should be released
      */
@@ -202,7 +233,7 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
     }
     
     /**
-     * @dev Calculates the claimable amount for a grant
+     * @dev Calculates the claimable amount for a grant with KPI multiplier
      * @param grant The grant to calculate for
      * @return The claimable amount
      */
@@ -218,7 +249,148 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
             vested = grant.amount;
         }
         
-        return vested - grant.claimed;
+        // Apply KPI multiplier
+        uint256 multiplier = _getKPIMultiplier();
+        uint256 adjustedVested = (vested * multiplier) / 10000;
+        
+        // Cap at maximum grant amount to prevent exceeding total allocation
+        if (adjustedVested > grant.amount) {
+            adjustedVested = grant.amount;
+        }
+        
+        return adjustedVested - grant.claimed;
+    }
+    
+    /**
+     * @dev Gets the current KPI multiplier based on oracle data
+     * @return multiplier The multiplier in basis points (10000 = 1.0x)
+     */
+    function _getKPIMultiplier() private view returns (uint256) {
+        // Default to 1.0x if oracle is unhealthy
+        if (!revenueOracle.isOracleHealthy()) {
+            return 10000;
+        }
+        
+        try revenueOracle.get30DayTWAP() returns (uint256 twapRevenue) {
+            uint256 targetRevenue = revenueOracle.getTargetRevenue();
+            
+            if (targetRevenue == 0) {
+                return 10000;
+            }
+            
+            // Calculate multiplier based on revenue vs target
+            // If revenue < target: multiplier < 1.0x (slower vesting)
+            // If revenue > target: multiplier > 1.0x (faster vesting)
+            // Multiplier range: 0.5x to 2.0x (5000 to 20000 basis points)
+            uint256 ratio = (twapRevenue * 10000) / targetRevenue;
+            
+            // Clamp ratio to 0.5x - 2.0x range
+            if (ratio < 5000) {
+                return 5000;
+            } else if (ratio > 20000) {
+                return 20000;
+            } else {
+                return ratio;
+            }
+        } catch {
+            // Oracle call failed, default to safe 1.0x
+            return 10000;
+        }
+    }
+    
+    /**
+     * @dev Updates the KPI multiplier and stores historical data
+     */
+    function updateKPIMultiplier() external onlyOwner {
+        uint256 oldMultiplier = currentKPIMultiplier;
+        uint256 oracleInput = 0;
+        
+        if (revenueOracle.isOracleHealthy()) {
+            try revenueOracle.get30DayTWAP() returns (uint256 twapRevenue) {
+                oracleInput = twapRevenue;
+                uint256 targetRevenue = revenueOracle.getTargetRevenue();
+                
+                if (targetRevenue > 0) {
+                    uint256 ratio = (twapRevenue * 10000) / targetRevenue;
+                    
+                    if (ratio < 5000) {
+                        currentKPIMultiplier = 5000;
+                    } else if (ratio > 20000) {
+                        currentKPIMultiplier = 20000;
+                    } else {
+                        currentKPIMultiplier = ratio;
+                    }
+                }
+            } catch {
+                currentKPIMultiplier = 10000;
+            }
+        } else {
+            currentKPIMultiplier = 10000;
+        }
+        
+        // Store historical metric
+        kpiHistory.push(KPIMetric({
+            multiplier: currentKPIMultiplier,
+            oracleInput: oracleInput,
+            timestamp: block.timestamp
+        }));
+        
+        // Prune old history if exceeds max
+        while (kpiHistory.length > MAX_KPI_HISTORY) {
+            for (uint256 i = 0; i < kpiHistory.length - 1; i++) {
+                kpiHistory[i] = kpiHistory[i + 1];
+            }
+            kpiHistory.pop();
+        }
+        
+        emit KPIMultiplierUpdated(oldMultiplier, oracleInput, currentKPIMultiplier, block.timestamp);
+    }
+    
+    /**
+     * @dev Gets the current KPI multiplier
+     * @return multiplier The current multiplier in basis points
+     */
+    function getCurrentKPIMultiplier() external view returns (uint256) {
+        return currentKPIMultiplier;
+    }
+    
+    /**
+     * @dev Gets historical KPI metrics (paginated)
+     * @param offset Starting index
+     * @param limit Maximum number of entries to return
+     * @return multipliers Array of multipliers
+     * @return oracleInputs Array of oracle inputs
+     * @return timestamps Array of timestamps
+     */
+    function getKPIHistory(uint256 offset, uint256 limit) external view returns (
+        uint256[] memory multipliers,
+        uint256[] memory oracleInputs,
+        uint256[] memory timestamps
+    ) {
+        uint256 end = offset + limit;
+        if (end > kpiHistory.length) {
+            end = kpiHistory.length;
+        }
+        
+        uint256[] memory multipliersArray = new uint256[](end - offset);
+        uint256[] memory oracleInputsArray = new uint256[](end - offset);
+        uint256[] memory timestampsArray = new uint256[](end - offset);
+        
+        for (uint256 i = offset; i < end; i++) {
+            multipliersArray[i - offset] = kpiHistory[i].multiplier;
+            oracleInputsArray[i - offset] = kpiHistory[i].oracleInput;
+            timestampsArray[i - offset] = kpiHistory[i].timestamp;
+        }
+        
+        return (multipliersArray, oracleInputsArray, timestampsArray);
+    }
+    
+    /**
+     * @dev Gets the number of KPI history entries
+     * @return count The number of entries
+     */
+    function getKPIHistoryCount() external view returns (uint256) {
+        return kpiHistory.length;
     }
     
     /**
