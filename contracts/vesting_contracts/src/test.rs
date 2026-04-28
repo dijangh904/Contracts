@@ -468,3 +468,89 @@ fn test_milestone_claim_before_trigger() {
     let result = client.claim_milestone_tokens(&vault_id);
     assert!(result.is_err());
 }
+
+// ===== Issue #293: Cliff-Jump Smoothness Check for Linear Ramps =====
+
+/// A linear ramp with no cliff (start_time == now) must always be accepted.
+#[test]
+fn test_cliff_jump_no_cliff_accepted() {
+    let (env, _, client, _, _) = setup();
+    let beneficiary = Address::generate(&env);
+    let now = env.ledger().timestamp();
+
+    // start_time == now → cliff_duration == 0 → no cliff-jump check triggered
+    let vault_id = client.create_vault_full(
+        &beneficiary,
+        &1000i128,
+        &now,
+        &(now + 1000),
+        &0i128,
+        &true,
+        &true,
+        &0u64, // linear
+    );
+    assert_eq!(vault_id, 1);
+}
+
+/// A linear ramp whose cliff is exactly 50 % of the total period must be accepted.
+#[test]
+fn test_cliff_jump_at_boundary_accepted() {
+    let (env, _, client, _, _) = setup();
+    let beneficiary = Address::generate(&env);
+    let now = env.ledger().timestamp();
+
+    // total = 2000, cliff = 1000 → ratio = 50 % = 5000 bps (≤ MAX → OK)
+    let vault_id = client.create_vault_full(
+        &beneficiary,
+        &1000i128,
+        &(now + 1000), // cliff end
+        &(now + 2000), // vesting end
+        &0i128,
+        &true,
+        &true,
+        &0u64, // linear
+    );
+    assert_eq!(vault_id, 1);
+}
+
+/// A linear ramp whose cliff exceeds 50 % of the total period must be rejected.
+#[test]
+#[should_panic(expected = "CliffJumpTooLarge")]
+fn test_cliff_jump_too_large_rejected() {
+    let (env, _, client, _, _) = setup();
+    let beneficiary = Address::generate(&env);
+    let now = env.ledger().timestamp();
+
+    // total = 2000, cliff = 1001 → ratio ≈ 50.05 % > 50 % → must panic
+    client.create_vault_full(
+        &beneficiary,
+        &1000i128,
+        &(now + 1001), // cliff end
+        &(now + 2000), // vesting end
+        &0i128,
+        &true,
+        &true,
+        &0u64, // linear
+    );
+}
+
+/// A stepped schedule (step_duration > 0) is exempt from the cliff-jump check.
+#[test]
+fn test_cliff_jump_check_skipped_for_stepped_schedule() {
+    let (env, _, client, _, _) = setup();
+    let beneficiary = Address::generate(&env);
+    let now = env.ledger().timestamp();
+
+    // cliff > 50 % but step_duration != 0 → check must NOT fire
+    let vault_id = client.create_vault_full(
+        &beneficiary,
+        &1000i128,
+        &(now + 1500), // cliff end (75 % of total)
+        &(now + 2000), // vesting end
+        &0i128,
+        &true,
+        &true,
+        &100u64, // stepped → exempt
+    );
+    assert_eq!(vault_id, 1);
+}
