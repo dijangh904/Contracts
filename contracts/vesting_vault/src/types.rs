@@ -588,137 +588,98 @@ pub struct UpgradeBlocked {
     pub blocked_at: u64,
 }
 
-// ========== ISSUE #268: Cross-Chain Vesting Synchronization via Wormhole ==========
+// ========== ISSUE #269: Zero-Knowledge Confidential Grant Amounts ==========
 
-/// Wormhole chain IDs for supported networks
-/// Reference: https://docs.wormhole.com/wormhole/reference/chain-ids
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ChainId {
-    Stellar = 1,
-    Ethereum = 2,
-    Solana = 3,
-    Bsc = 4,
-    Polygon = 5,
-    Avalanche = 6,
-    Optimism = 10,
-    Arbitrum = 11,
-    Base = 23,
-}
-
-/// Verified Action Approval (VAA) from Wormhole Guardians
-/// This is the signed message that proves cross-chain intent
+/// Confidential grant storing commitment instead of plaintext amount
 #[contracttype]
 #[derive(Clone)]
-pub struct VAA {
-    /// Version of the VAA format
-    pub version: u8,
-    /// Guardian set index that signed this VAA
-    pub guardian_set_index: u32,
-    /// Chain ID where the VAA was emitted
-    pub emitter_chain: ChainId,
-    /// Address of the emitter contract
-    pub emitter_address: BytesN<32>,
-    /// Sequence number for replay protection
-    pub sequence: u64,
-    /// Consistency level of the VAA
-    pub consistency_level: u8,
-    /// Timestamp when the VAA was created
-    pub timestamp: u64,
-    /// Signatures from the guardians
-    pub signatures: Vec<BytesN<65>>,
-    /// Payload data (contains the cross-chain message)
-    pub payload: Bytes,
-}
-
-/// Cross-chain claim payload embedded in VAA
-#[contracttype]
-#[derive(Clone)]
-pub struct CrossChainClaimPayload {
-    /// Original vesting ID on Soroban
+pub struct ConfidentialGrant {
+    /// Hash commitment of the total grant amount (Pedersen commitment)
+    pub commitment_hash: BytesN<32>,
+    /// Vesting schedule identifier
     pub vesting_id: u32,
-    /// Beneficiary address on Soroban
-    pub soroban_beneficiary: Address,
-    /// Amount to claim
-    pub amount: i128,
-    /// Destination chain ID
-    pub destination_chain: ChainId,
-    /// Recipient address on destination chain (encoded as bytes)
-    pub destination_address: Bytes,
-    /// Nonce for replay protection
-    pub nonce: u64,
+    /// Timestamp when grant was created
+    pub created_at: u64,
+    /// Whether this grant has been fully claimed
+    pub is_fully_claimed: bool,
+    /// Remaining shielded amount (encrypted, for internal tracking)
+    pub remaining_shielded: i128,
 }
 
-/// Bridge configuration for Wormhole integration
+/// Master viewing key for DAO clawback operations
 #[contracttype]
 #[derive(Clone)]
-pub struct BridgeConfig {
-    /// Whether the bridge is currently paused
-    pub is_paused: bool,
-    /// Wormhole core contract address on Stellar
-    pub wormhole_core_address: Address,
-    /// Supported destination chains
-    pub supported_chains: Vec<ChainId>,
-    /// Maximum amount that can be bridged per transaction
-    pub max_bridge_amount: i128,
-    /// Minimum delay between bridge operations (in seconds)
-    pub bridge_cooldown: u64,
+pub struct MasterViewingKey {
+    /// Public key for viewing shielded amounts
+    pub viewing_key: BytesN<32>,
+    /// Admin address that authorized this key
+    pub authorized_by: Address,
+    /// Timestamp when key was set
+    pub set_at: u64,
+    /// Whether key is currently active
+    pub is_active: bool,
 }
 
-/// Queued claim for when bridge is paused
+/// Enhanced ZK proof for confidential claims (Circom-compatible)
 #[contracttype]
 #[derive(Clone)]
-pub struct QueuedClaim {
-    /// Original vesting ID
-    pub vesting_id: u32,
-    /// Beneficiary address
-    pub beneficiary: Address,
-    /// Amount to claim
-    pub amount: i128,
-    /// Destination chain
-    pub destination_chain: ChainId,
-    /// Destination address
-    pub destination_address: Bytes,
-    /// Nonce for replay protection
-    pub nonce: u64,
-    /// Timestamp when the claim was queued
-    pub queued_at: u64,
-    /// VAA associated with this claim
-    pub vaa: VAA,
+pub struct ConfidentialClaimProof {
+    /// Public inputs for the ZK circuit
+    pub commitment_hash: BytesN<32>,
+    /// Nullifier to prevent double-spending
+    pub nullifier: BytesN<32>,
+    /// Merkle root of the commitment tree
+    pub merkle_root: BytesN<32>,
+    /// Claimed amount (public output)
+    pub claimed_amount: i128,
+    /// Remaining amount after claim (public output)
+    pub remaining_amount: i128,
+    /// The actual ZK-SNARK proof (Circom output)
+    pub proof_a: BytesN<32>,
+    pub proof_b: BytesN<32>,
+    pub proof_c: BytesN<32>,
 }
 
-/// Cross-chain claim event emitted when a claim is initiated
+/// Event emitted when a confidential claim is executed
 #[contractevent]
 #[derive(Clone)]
-pub struct CrossChainClaimInitiated {
+pub struct ConfidentialClaimExecuted {
+    /// Nullifier hash (leaks zero metadata about the claimer)
     #[topic]
-    pub soroban_beneficiary: Address,
+    pub nullifier_hash: BytesN<32>,
+    /// Updated commitment hash after claim
     #[topic]
-    pub vesting_id: u32,
-    pub amount: i128,
-    pub destination_chain: ChainId,
-    pub destination_address: Bytes,
-    pub nonce: u64,
+    pub new_commitment_hash: BytesN<32>,
+    /// Timestamp of the claim
     pub timestamp: u64,
 }
 
-/// Event emitted when a queued claim is processed after bridge unpause
+/// Event emitted when a confidential grant is created
 #[contractevent]
 #[derive(Clone)]
-pub struct QueuedClaimProcessed {
-    #[topic]
-    pub beneficiary: Address,
+pub struct ConfidentialGrantCreated {
+    /// Vesting ID
     #[topic]
     pub vesting_id: u32,
-    pub amount: i128,
-    pub processed_at: u64,
+    /// Commitment hash of the total grant
+    #[topic]
+    pub commitment_hash: BytesN<32>,
+    /// Timestamp of creation
+    pub timestamp: u64,
 }
 
-/// Event emitted when bridge is paused/unpaused
+/// Event emitted when DAO performs clawback using master viewing key
 #[contractevent]
 #[derive(Clone)]
-pub struct BridgePauseToggled {
-    pub is_paused: bool,
-    pub paused_by: Address,
+pub struct ConfidentialClawbackExecuted {
+    /// Vesting ID
+    #[topic]
+    pub vesting_id: u32,
+    /// Amount clawed back
+    pub clawed_amount: i128,
+    /// Admin who authorized the clawback
+    #[topic]
+    pub authorized_by: Address,
+    /// Timestamp of clawback
     pub timestamp: u64,
 }

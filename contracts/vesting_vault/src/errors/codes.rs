@@ -89,25 +89,11 @@ pub enum Error {
     /// #231: Cannot upgrade/delete contract while unvested balance > 0
     UpgradeBlockedByUnvestedFunds = 800,
 
-    // 🌉 Cross-Chain Bridge (1000s)
-    /// #268: Wormhole VAA signature verification failed
-    InvalidBridgeSignature = 1000,
-    /// #268: Bridge is currently paused
-    BridgePaused = 1001,
-    /// #268: Destination chain is not supported
-    UnsupportedChain = 1002,
-    /// #268: Bridge amount exceeds maximum limit
-    BridgeAmountExceedsLimit = 1003,
-    /// #268: Bridge cooldown period has not elapsed
-    BridgeCooldownNotElapsed = 1004,
-    /// #268: Replay attack detected - nonce already used
-    NonceAlreadyUsed = 1005,
-    /// #268: VAA payload is malformed or invalid
-    InvalidVaaPayload = 1006,
-    /// #268: VAA sequence number is invalid or out of order
-    InvalidVaaSequence = 1007,
-    /// #268: Destination address cannot be altered during transit
-    DestinationAddressMismatch = 1008,
-    /// #268: Bridge not configured
-    BridgeNotConfigured = 1009,
+    // 🔐 Zero-Knowledge Privacy (1000s)
+    /// #269: ZK proof verification failed
+    InvalidZKProof = 1000,
+    /// #269: Attempted to claim more than the shielded amount
+    OverClaimAttempt = 1001,
+    /// #269: Master viewing key not authorized for clawback
+    ViewingKeyUnauthorized = 1002,
 }
