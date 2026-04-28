@@ -1,5 +1,5 @@
-use soroban_sdk::{Env, Vec, Address, Map, BytesN};
-use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, LockupConfig, BeneficiaryReassignment, VetoVote, TokenSupplyInfo, LSTConfig, TvlCapConfig, RateLimitConfig, RelayerConfig};
+use soroban_sdk::{Env, Vec, Address, Map, BytesN, Bytes};
+use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, LockupConfig, BeneficiaryReassignment, VetoVote, TokenSupplyInfo, LSTConfig, TvlCapConfig, RateLimitConfig, RelayerConfig, BridgeConfig, QueuedClaim, ChainId, VAA};
 
 pub const CLAIM_HISTORY: &str = "CLAIM_HISTORY";
 pub const AUTHORIZED_PAYOUT_ADDRESS: &str = "AUTHORIZED_PAYOUT_ADDRESS";
@@ -391,4 +391,93 @@ pub fn get_contract_total_unvested(e: &Env) -> i128 {
 
 pub fn set_contract_total_unvested(e: &Env, total: i128) {
     e.storage().instance().set(&CONTRACT_TOTAL_UNVESTED, &total);
+}
+
+// ========== ISSUE #268: Cross-Chain Vesting Synchronization via Wormhole ==========
+
+// Bridge storage keys
+pub const BRIDGE_CONFIG: &str = "BRIDGE_CONFIG";
+pub const BRIDGE_NONCES: &str = "BRIDGE_NONCES";
+pub const BRIDGE_LAST_SEQUENCE: &str = "BRIDGE_LAST_SEQUENCE";
+pub const QUEUED_CLAIMS: &str = "QUEUED_CLAIMS";
+pub const BRIDGE_LAST_OPERATION: &str = "BRIDGE_LAST_OPERATION";
+
+// Bridge configuration functions
+pub fn get_bridge_config(e: &Env) -> Option<BridgeConfig> {
+    e.storage().instance().get(&BRIDGE_CONFIG)
+}
+
+pub fn set_bridge_config(e: &Env, config: &BridgeConfig) {
+    e.storage().instance().set(&BRIDGE_CONFIG, config);
+}
+
+// Nonce management using Temporary storage for replay attack prevention
+// Nonces are stored in temporary storage to minimize ledger rent costs
+pub fn get_bridge_nonce(e: &Env, nonce: u64) -> bool {
+    e.storage()
+        .temporary()
+        .get(&nonce)
+        .unwrap_or(false)
+}
+
+pub fn set_bridge_nonce(e: &Env, nonce: u64) {
+    e.storage().temporary().set(&nonce, &true);
+}
+
+// VAA sequence number tracking to prevent replay attacks
+pub fn get_bridge_last_sequence(e: &Env) -> u64 {
+    e.storage()
+        .instance()
+        .get(&BRIDGE_LAST_SEQUENCE)
+        .unwrap_or(0u64)
+}
+
+pub fn set_bridge_last_sequence(e: &Env, sequence: u64) {
+    e.storage().instance().set(&BRIDGE_LAST_SEQUENCE, &sequence);
+}
+
+// Check if a chain is supported by the bridge
+pub fn is_chain_supported(e: &Env, chain: ChainId) -> bool {
+    if let Some(config) = get_bridge_config(e) {
+        return config.supported_chains.contains(chain);
+    }
+    false
+}
+
+// Bridge cooldown tracking
+pub fn get_bridge_last_operation(e: &Env) -> u64 {
+    e.storage()
+        .instance()
+        .get(&BRIDGE_LAST_OPERATION)
+        .unwrap_or(0u64)
+}
+
+pub fn set_bridge_last_operation(e: &Env, timestamp: u64) {
+    e.storage().instance().set(&BRIDGE_LAST_OPERATION, &timestamp);
+}
+
+// Queued claims management for when bridge is paused
+pub fn get_queued_claims(e: &Env) -> Vec<QueuedClaim> {
+    e.storage()
+        .instance()
+        .get(&QUEUED_CLAIMS)
+        .unwrap_or(Vec::new(e))
+}
+
+pub fn add_queued_claim(e: &Env, claim: &QueuedClaim) {
+    let mut queue = get_queued_claims(e);
+    queue.push_back(claim.clone());
+    e.storage().instance().set(&QUEUED_CLAIMS, &queue);
+}
+
+pub fn remove_queued_claim(e: &Env, index: u32) {
+    let mut queue = get_queued_claims(e);
+    if (index as usize) < queue.len() {
+        queue.remove(index as u32);
+        e.storage().instance().set(&QUEUED_CLAIMS, &queue);
+    }
+}
+
+pub fn clear_queued_claims(e: &Env) {
+    e.storage().instance().set(&QUEUED_CLAIMS, &Vec::new(e));
 }

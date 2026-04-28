@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, Env, Address, Vec, Map, String, BytesN, IntoVal};
+use soroban_sdk::{contract, contractimpl, Env, Address, Vec, Map, String, BytesN, Bytes, IntoVal};
 
 mod storage;
 pub mod types;
@@ -10,7 +10,7 @@ pub mod errors;
 
 pub use types::*;
 use errors::Error;
-use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_lst_config, set_lst_config, get_unvested_balance, set_unvested_balance, get_admin_dead_man_switch, set_admin_dead_man_switch, get_oracle_price_record, set_oracle_price_record, get_contract_total_unvested, set_contract_total_unvested};
+use storage::{get_claim_history, set_claim_history, get_authorized_payout_address as storage_get_authorized_payout_address, set_authorized_payout_address as storage_set_authorized_payout_address, get_pending_address_request as storage_get_pending_address_request, set_pending_address_request as storage_set_pending_address_request, remove_pending_address_request as storage_remove_pending_address_request, get_timelock_duration, get_auditors, set_auditors, get_auditor_pause_requests, set_auditor_pause_requests, get_emergency_pause, set_emergency_pause, remove_emergency_pause, get_reputation_bridge_contract, set_reputation_bridge_contract, has_reputation_bonus_applied, set_reputation_bonus_applied, get_milestone_configs, set_milestone_configs, get_milestone_status, set_milestone_status, get_emergency_pause_duration, is_nullifier_used, set_nullifier_used, get_commitment, set_commitment, mark_commitment_used, add_privacy_claim_event, add_merkle_root, get_merkle_roots, is_valid_merkle_root, get_path_payment_config, set_path_payment_config, get_path_payment_claim_history, add_path_payment_claim_event, get_lst_config, set_lst_config, get_unvested_balance, set_unvested_balance, get_admin_dead_man_switch, set_admin_dead_man_switch, get_oracle_price_record, set_oracle_price_record, get_contract_total_unvested, set_contract_total_unvested, get_bridge_config, set_bridge_config, get_bridge_nonce, set_bridge_nonce, get_bridge_last_sequence, set_bridge_last_sequence, is_chain_supported, get_bridge_last_operation, set_bridge_last_operation, get_queued_claims, add_queued_claim, remove_queued_claim, clear_queued_claims};
 use emergency::{AuditorPauseRequest, EmergencyPause, EmergencyPauseTriggered};
 
 #[contract]
@@ -2090,5 +2090,315 @@ impl VestingVault {
         }
         set_contract_total_unvested(&e, new_total);
         Ok(())
+    }
+
+    // ========== ISSUE #268: Cross-Chain Vesting Synchronization via Wormhole ==========
+
+    /// Initialize the Wormhole bridge configuration
+    /// This must be called before any cross-chain operations
+    pub fn initialize_bridge(e: Env, admin: Address, wormhole_core_address: Address, supported_chains: Vec<ChainId>, max_bridge_amount: i128, bridge_cooldown: u64) -> Result<(), Error> {
+        admin.require_auth();
+
+        // Validate inputs
+        if max_bridge_amount <= 0 {
+            return Err(Error::InvalidInput);
+        }
+
+        if supported_chains.is_empty() {
+            return Err(Error::InvalidInput);
+        }
+
+        let config = BridgeConfig {
+            is_paused: false,
+            wormhole_core_address,
+            supported_chains,
+            max_bridge_amount,
+            bridge_cooldown,
+        };
+
+        set_bridge_config(&e, &config);
+
+        Ok(())
+    }
+
+    /// Toggle bridge pause state (admin only)
+    /// When paused, claims are queued instead of executed immediately
+    pub fn toggle_bridge_pause(e: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+
+        let mut config = get_bridge_config(&e)
+            .ok_or(Error::BridgeNotConfigured)?;
+
+        config.is_paused = !config.is_paused;
+        set_bridge_config(&e, &config);
+
+        BridgePauseToggled {
+            is_paused: config.is_paused,
+            paused_by: admin,
+            timestamp: e.ledger().timestamp(),
+        }.publish(&e);
+
+        Ok(())
+    }
+
+    /// Verify VAA signature from Wormhole guardians
+    /// This is a simplified verification - in production, this would integrate
+    /// with the actual Wormhole core contract for signature verification
+    fn verify_vaa_signature(_e: &Env, vaa: &VAA) -> Result<(), Error> {
+        // Check VAA version
+        if vaa.version != 1 {
+            return Err(Error::InvalidVaaPayload);
+        }
+
+        // Check that we have guardian signatures
+        if vaa.signatures.is_empty() {
+            return Err(Error::InvalidBridgeSignature);
+        }
+
+        // TODO: In production, this would:
+        // 1. Call the Wormhole core contract to verify guardian signatures
+        // 2. Verify the guardian set index is current
+        // 3. Verify the signature threshold is met (typically 13/19 guardians)
+        // 4. Verify the signature data is valid
+
+        // For now, we'll do basic validation
+        // In a real implementation, you'd call:
+        // let wormhole = ContractClient::new(&e, &config.wormhole_core_address);
+        // wormhole.verify_vaa(&vaa);
+
+        Ok(())
+    }
+
+    /// Parse VAA payload to extract cross-chain claim data
+    fn parse_vaa_payload(e: &Env, payload: &Bytes) -> Result<CrossChainClaimPayload, Error> {
+        // TODO: In production, this would properly deserialize the payload
+        // according to the Wormhole payload format
+        // For now, this is a placeholder for the deserialization logic
+
+        // The payload format would be:
+        // - vesting_id (4 bytes)
+        // - soroban_beneficiary (32 bytes)
+        // - amount (16 bytes)
+        // - destination_chain (1 byte)
+        // - destination_address (variable)
+        // - nonce (8 bytes)
+
+        // Placeholder - in real implementation, parse the bytes
+        Err(Error::InvalidVaaPayload)
+    }
+
+    /// Initiate a cross-chain claim with VAA verification
+    /// This function accepts a signed VAA and routes the claim payload
+    pub fn cross_chain_claim(e: Env, user: Address, vaa: VAA) -> Result<(), Error> {
+        user.require_auth();
+
+        // Check if bridge is configured
+        let config = get_bridge_config(&e)
+            .ok_or(Error::BridgeNotConfigured)?;
+
+        // Check if bridge is paused
+        if config.is_paused {
+            return Err(Error::BridgePaused);
+        }
+
+        // Verify VAA signature
+        Self::verify_vaa_signature(&e, &vaa)?;
+
+        // Parse the VAA payload
+        let payload = Self::parse_vaa_payload(&e, &vaa.payload)?;
+
+        // Verify the beneficiary matches the caller
+        if payload.soroban_beneficiary != user {
+            return Err(Error::Unauthorized);
+        }
+
+        // Check if destination chain is supported
+        if !is_chain_supported(&e, payload.destination_chain) {
+            return Err(Error::UnsupportedChain);
+        }
+
+        // Check if amount exceeds bridge limit
+        if payload.amount > config.max_bridge_amount {
+            return Err(Error::BridgeAmountExceedsLimit);
+        }
+
+        // Check bridge cooldown
+        let current_time = e.ledger().timestamp();
+        let last_operation = get_bridge_last_operation(&e);
+        if current_time < last_operation + config.bridge_cooldown {
+            return Err(Error::BridgeCooldownNotElapsed);
+        }
+
+        // Check for replay attack using nonce
+        if get_bridge_nonce(&e, payload.nonce) {
+            return Err(Error::NonceAlreadyUsed);
+        }
+
+        // Check VAA sequence number is strictly incremented
+        let last_sequence = get_bridge_last_sequence(&e);
+        if vaa.sequence <= last_sequence {
+            return Err(Error::InvalidVaaSequence);
+        }
+
+        // TODO: Calculate vested amount on Soroban
+        // This would integrate with the existing vesting logic
+        let vested_amount = payload.amount; // Placeholder
+
+        // TODO: Lock the native asset
+        // This would involve transferring tokens to a locked state
+
+        // Mark nonce as used (stored in Temporary storage to minimize rent)
+        set_bridge_nonce(&e, payload.nonce);
+
+        // Update sequence number
+        set_bridge_last_sequence(&e, vaa.sequence);
+
+        // Update last operation timestamp
+        set_bridge_last_operation(&e, current_time);
+
+        // Emit CrossChainClaimInitiated event
+        CrossChainClaimInitiated {
+            soroban_beneficiary: user.clone(),
+            vesting_id: payload.vesting_id,
+            amount: vested_amount,
+            destination_chain: payload.destination_chain,
+            destination_address: payload.destination_address,
+            nonce: payload.nonce,
+            timestamp: current_time,
+        }.publish(&e);
+
+        // TODO: Emit burn/mint message to Wormhole
+        // This would call the Wormhole core contract to emit the message
+
+        Ok(())
+    }
+
+    /// Queue a cross-chain claim when bridge is paused
+    /// The claim will be processed when the bridge is unpaused
+    pub fn queue_cross_chain_claim(e: Env, user: Address, vaa: VAA) -> Result<(), Error> {
+        user.require_auth();
+
+        // Check if bridge is configured
+        let _config = get_bridge_config(&e)
+            .ok_or(Error::BridgeNotConfigured)?;
+
+        // Verify VAA signature
+        Self::verify_vaa_signature(&e, &vaa)?;
+
+        // Parse the VAA payload
+        let payload = Self::parse_vaa_payload(&e, &vaa.payload)?;
+
+        // Verify the beneficiary matches the caller
+        if payload.soroban_beneficiary != user {
+            return Err(Error::Unauthorized);
+        }
+
+        // Create queued claim
+        let queued_claim = QueuedClaim {
+            vesting_id: payload.vesting_id,
+            beneficiary: user.clone(),
+            amount: payload.amount,
+            destination_chain: payload.destination_chain,
+            destination_address: payload.destination_address,
+            nonce: payload.nonce,
+            queued_at: e.ledger().timestamp(),
+            vaa,
+        };
+
+        // Add to queue
+        add_queued_claim(&e, &queued_claim);
+
+        Ok(())
+    }
+
+    /// Process queued claims after bridge is unpaused
+    /// This can be called by anyone to process the queue
+    pub fn process_queued_claims(e: Env, max_claims: u32) -> Result<u32, Error> {
+        let config = get_bridge_config(&e)
+            .ok_or(Error::BridgeNotConfigured)?;
+
+        // Don't process if bridge is still paused
+        if config.is_paused {
+            return Err(Error::BridgePaused);
+        }
+
+        let queue = get_queued_claims(&e);
+        let queue_len = queue.len() as u32;
+
+        let to_process = if max_claims == 0 || max_claims > queue_len {
+            queue_len
+        } else {
+            max_claims
+        };
+
+        let mut processed = 0u32;
+
+        for i in 0..to_process {
+            let queue = get_queued_claims(&e);
+            if queue.is_empty() {
+                break;
+            }
+
+            let claim = queue.get(0).unwrap(); // Get first claim
+
+            // Re-verify the claim is still valid
+            if get_bridge_nonce(&e, claim.nonce) {
+                // Already processed, skip
+                remove_queued_claim(&e, 0);
+                continue;
+            }
+
+            // Check bridge cooldown
+            let current_time = e.ledger().timestamp();
+            let last_operation = get_bridge_last_operation(&e);
+            if current_time < last_operation + config.bridge_cooldown {
+                // Cooldown not elapsed, stop processing
+                break;
+            }
+
+            // Check amount still within limits
+            if claim.amount > config.max_bridge_amount {
+                // Amount exceeds limit, skip this claim
+                remove_queued_claim(&e, 0);
+                continue;
+            }
+
+            // Process the claim
+            // Mark nonce as used
+            set_bridge_nonce(&e, claim.nonce);
+
+            // Update last operation timestamp
+            set_bridge_last_operation(&e, current_time);
+
+            // Emit event
+            QueuedClaimProcessed {
+                beneficiary: claim.beneficiary.clone(),
+                vesting_id: claim.vesting_id,
+                amount: claim.amount,
+                processed_at: current_time,
+            }.publish(&e);
+
+            // Remove from queue
+            remove_queued_claim(&e, 0);
+
+            processed += 1;
+        }
+
+        Ok(processed)
+    }
+
+    /// Get the current bridge configuration
+    pub fn get_bridge_config_public(e: Env) -> Option<BridgeConfig> {
+        get_bridge_config(&e)
+    }
+
+    /// Get the number of queued claims
+    pub fn get_queued_claims_count(e: Env) -> u32 {
+        get_queued_claims(&e).len() as u32
+    }
+
+    /// Get the last processed VAA sequence number
+    pub fn get_bridge_last_sequence_public(e: Env) -> u64 {
+        get_bridge_last_sequence(&e)
     }
 }
