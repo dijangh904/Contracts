@@ -1,9 +1,13 @@
 use soroban_sdk::{Env, Vec, Address, Map, BytesN};
-use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, LockupConfig, BeneficiaryReassignment, VetoVote, TokenSupplyInfo, LSTConfig, TvlCapConfig, RateLimitConfig, RelayerConfig};
+use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, LockupConfig, BeneficiaryReassignment, VetoVote, TokenSupplyInfo, LSTConfig, TvlCapConfig, RateLimitConfig, RelayerConfig, ConfidentialGrant, MasterViewingKey, StreamPause};
 
 pub const CLAIM_HISTORY: &str = "CLAIM_HISTORY";
 pub const AUTHORIZED_PAYOUT_ADDRESS: &str = "AUTHORIZED_PAYOUT_ADDRESS";
 pub const PENDING_ADDRESS_REQUEST: &str = "PENDING_ADDRESS_REQUEST";
+
+// Stream pause storage keys for suspicious activity detection
+pub const STREAM_PAUSES: &str = "STREAM_PAUSES";
+pub const STREAM_PAUSE_HISTORY: &str = "STREAM_PAUSE_HISTORY";
 
 // Emergency pause storage keys
 pub const AUDITORS: &str = "AUDITORS";
@@ -38,6 +42,12 @@ pub const TOKEN_SUPPLY_INFO: &str = "TOKEN_SUPPLY_INFO";
 pub const REASSIGNMENT_COUNTER: &str = "REASSIGNMENT_COUNTER";
 pub const GOVERNANCE_VETO_THRESHOLD: &str = "GOVERNANCE_VETO_THRESHOLD"; // Percentage (e.g., 5 for 5%)
 pub const LST_CONFIGS: &str = "LST_CONFIGS";
+
+// LST Auto-Compounding storage keys (Issue #154)
+pub const LST_POOL_SHARES: &str = "LST_POOL_SHARES";
+pub const USER_LST_SHARES: &str = "USER_LST_SHARES";
+pub const UNBONDING_REQUESTS: &str = "UNBONDING_REQUESTS";
+pub const UNBONDING_QUEUE: &str = "UNBONDING_QUEUE";
 
 // 48 hours in seconds
 const TIMELOCK_DURATION: u64 = 172_800;
@@ -261,6 +271,30 @@ pub fn remove_lockup_config(e: &Env, vesting_id: u32) {
     e.storage().instance().remove(&(LOCKUP_CONFIGS, vesting_id));
 }
 
+// ========== TAX CONFIGURATION STORAGE ==========
+pub const TAX_CONFIGS: &str = "TAX_CONFIGS"; // keyed by vesting_id
+pub const CUMULATIVE_TAXES: &str = "CUMULATIVE_TAXES"; // keyed by (vesting_id, authority)
+
+pub fn get_tax_config(e: &Env, vesting_id: u32) -> Option<crate::types::TaxConfig> {
+    e.storage().instance().get(&(TAX_CONFIGS, vesting_id))
+}
+
+pub fn set_tax_config(e: &Env, vesting_id: u32, cfg: &crate::types::TaxConfig) {
+    e.storage().instance().set(&(TAX_CONFIGS, vesting_id), cfg);
+}
+
+pub fn get_cumulative_taxes(e: &Env, vesting_id: u32, authority: &Address) -> i128 {
+    e.storage()
+        .instance()
+        .get(&(CUMULATIVE_TAXES, vesting_id, authority.clone()))
+        .unwrap_or(0i128)
+}
+
+pub fn add_cumulative_taxes(e: &Env, vesting_id: u32, authority: &Address, amount: i128) {
+    let prev = get_cumulative_taxes(e, vesting_id, authority);
+    e.storage().instance().set(&(CUMULATIVE_TAXES, vesting_id, authority.clone()), &(prev + amount));
+}
+
 // Beneficiary reassignment and governance veto storage functions
 pub fn get_reassignment_counter(e: &Env) -> u32 {
     e.storage()
@@ -343,6 +377,50 @@ pub fn set_lst_config(e: &Env, vesting_id: u32, config: &LSTConfig) {
     e.storage().instance().set(&(LST_CONFIGS, vesting_id), config);
 }
 
+// --- Tax withholding backwards-compatible wrappers ---
+pub const TAX_WITHHOLDING_CONFIG: &str = "TAX_WITHHOLDING_CONFIG";
+
+pub fn set_tax_withholding_config(e: &Env, cfg: &crate::types::TaxWithholdingConfig) {
+    e.storage().instance().set(&TAX_WITHHOLDING_CONFIG, cfg);
+}
+
+pub fn get_tax_withholding_config(e: &Env) -> Option<crate::types::TaxWithholdingConfig> {
+    e.storage().instance().get(&TAX_WITHHOLDING_CONFIG)
+}
+
+// --- SEP-12 oracle config storage ---
+pub const SEP12_ORACLE: &str = "SEP12_ORACLE";
+
+pub fn set_sep12_identity_oracle(e: &Env, oracle: &crate::types::SEP12IdentityOracle) {
+    e.storage().instance().set(&SEP12_ORACLE, oracle);
+}
+
+pub fn get_sep12_identity_oracle(e: &Env) -> Option<crate::types::SEP12IdentityOracle> {
+    e.storage().instance().get(&SEP12_ORACLE)
+}
+
+// --- Token metadata storage ---
+pub const TOKEN_METADATA: &str = "TOKEN_METADATA";
+
+pub fn set_token_metadata(e: &Env, asset: &Address, metadata: &crate::types::TokenMetadata) {
+    e.storage().instance().set(&(TOKEN_METADATA, asset.clone()), metadata);
+}
+
+pub fn get_token_metadata(e: &Env, asset: &Address) -> Option<crate::types::TokenMetadata> {
+    e.storage().instance().get(&(TOKEN_METADATA, asset.clone()))
+}
+
+// --- Vesting grant storage ---
+pub const VESTING_GRANT: &str = "VESTING_GRANT"; // keyed by vesting_id
+
+pub fn set_vesting_grant(e: &Env, vesting_id: u32, grant: &crate::types::VestingGrant) {
+    e.storage().instance().set(&(VESTING_GRANT, vesting_id), grant);
+}
+
+pub fn get_vesting_grant(e: &Env, vesting_id: u32) -> Option<crate::types::VestingGrant> {
+    e.storage().instance().get(&(VESTING_GRANT, vesting_id))
+}
+
 // ========== ISSUE #223: Voting Power (Total Unvested Balance per address) ==========
 pub const TOTAL_UNVESTED_BALANCE: &str = "TOTAL_UNVESTED_BALANCE";
 
@@ -391,4 +469,97 @@ pub fn get_contract_total_unvested(e: &Env) -> i128 {
 
 pub fn set_contract_total_unvested(e: &Env, total: i128) {
     e.storage().instance().set(&CONTRACT_TOTAL_UNVESTED, &total);
+}
+
+// ========== ISSUE #269: Zero-Knowledge Confidential Grant Amounts ==========
+pub const CONFIDENTIAL_GRANTS: &str = "CONFIDENTIAL_GRANTS";
+pub const MASTER_VIEWING_KEY: &str = "MASTER_VIEWING_KEY";
+pub const NULLIFIER_SET: &str = "NULLIFIER_SET";
+
+// ========== ISSUE #295: Temporary Storage for Claim-History Pagination ==========
+pub const PAGINATION_STATE: &str = "PAGINATION_STATE";
+pub const CLAIM_HISTORY_PAGE_SIZE: u32 = 100;
+
+// ========== ISSUE #296: Force-Withdrawal for Expired Schedules ==========
+pub const EXPIRED_SCHEDULES: &str = "EXPIRED_SCHEDULES";
+
+// ========== ISSUE #297: Max-Allocation-Sanity-Check ==========
+pub const MAX_ALLOCATION_LIMIT: &str = "MAX_ALLOCATION_LIMIT";
+pub const TOTAL_ALLOCATED: &str = "TOTAL_ALLOCATED";
+
+// Confidential grant storage functions
+pub fn get_confidential_grant(e: &Env, vesting_id: u32) -> Option<ConfidentialGrant> {
+    e.storage().instance().get(&(CONFIDENTIAL_GRANTS, vesting_id))
+}
+
+pub fn set_confidential_grant(e: &Env, vesting_id: u32, grant: &ConfidentialGrant) {
+    e.storage().instance().set(&(CONFIDENTIAL_GRANTS, vesting_id), grant);
+}
+
+pub fn remove_confidential_grant(e: &Env, vesting_id: u32) {
+    e.storage().instance().remove(&(CONFIDENTIAL_GRANTS, vesting_id));
+}
+
+// Master viewing key storage functions
+pub fn get_master_viewing_key(e: &Env) -> Option<MasterViewingKey> {
+    e.storage().instance().get(&MASTER_VIEWING_KEY)
+}
+
+pub fn set_master_viewing_key(e: &Env, key: &MasterViewingKey) {
+    e.storage().instance().set(&MASTER_VIEWING_KEY, key);
+}
+
+pub fn remove_master_viewing_key(e: &Env) {
+    e.storage().instance().remove(&MASTER_VIEWING_KEY);
+}
+
+// Nullifier set in Persistent storage (for permanent tracking)
+pub fn is_nullifier_in_set(e: &Env, nullifier_hash: &BytesN<32>) -> bool {
+    e.storage()
+        .persistent()
+        .get(&(NULLIFIER_SET, nullifier_hash))
+        .unwrap_or(false)
+}
+
+pub fn add_nullifier_to_set(e: &Env, nullifier_hash: &BytesN<32>) {
+    e.storage().persistent().set(&(NULLIFIER_SET, nullifier_hash), &true);
+}
+
+// Stream pause functions for suspicious activity detection
+pub fn get_stream_pause(e: &Env, vesting_id: u32, beneficiary: &Address) -> Option<StreamPause> {
+    e.storage()
+        .instance()
+        .get(&(STREAM_PAUSES, vesting_id, beneficiary))
+}
+
+pub fn set_stream_pause(e: &Env, vesting_id: u32, beneficiary: &Address, pause: &StreamPause) {
+    e.storage()
+        .instance()
+        .set(&(STREAM_PAUSES, vesting_id, beneficiary), pause);
+}
+
+pub fn remove_stream_pause(e: &Env, vesting_id: u32, beneficiary: &Address) {
+    e.storage()
+        .instance()
+        .remove(&(STREAM_PAUSES, vesting_id, beneficiary));
+}
+
+pub fn is_stream_paused(e: &Env, vesting_id: u32, beneficiary: &Address) -> bool {
+    if let Some(pause) = get_stream_pause(e, vesting_id, beneficiary) {
+        return pause.is_active;
+    }
+    false
+}
+
+pub fn get_stream_pause_history(e: &Env) -> Vec<StreamPause> {
+    e.storage()
+        .instance()
+        .get(&STREAM_PAUSE_HISTORY)
+        .unwrap_or(Vec::new(e))
+}
+
+pub fn add_stream_pause_to_history(e: &Env, pause: &StreamPause) {
+    let mut history = get_stream_pause_history(e);
+    history.push_back(pause.clone());
+    e.storage().instance().set(&STREAM_PAUSE_HISTORY, &history);
 }

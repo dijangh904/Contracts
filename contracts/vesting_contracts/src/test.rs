@@ -341,3 +341,216 @@ fn test_batch_claim_with_frozen_vault() {
     assert_eq!(*claimed_token, token_address);
     assert_eq!(*claimed_amount, 1000); // Only from active vault
 }
+
+#[test]
+#[should_panic(expected = "Cannot trigger milestone 2 - previous milestone 1 must be triggered first")]
+fn test_milestone_leap_frogging_prevention() {
+    let (env, admin, client, _, _) = setup();
+    let beneficiary = Address::generate(&env);
+    let now = env.ledger().timestamp();
+
+    // Create a milestone vault with 3 milestones: 25%, 50%, 25% (sums to 10000 basis points)
+    let mut milestones = vec![&env];
+    milestones.push_back(2500u32); // Milestone 0: 25%
+    milestones.push_back(5000u32); // Milestone 1: 50%
+    milestones.push_back(2500u32); // Milestone 2: 25%
+
+    let vault_id = client.create_milestone_vault(
+        &beneficiary,
+        &10000i128,
+        &now,
+        &(now + 10000),
+        &0i128,
+        &true,
+        &true,
+        &0u64,
+        milestones,
+    );
+
+    // Verify milestone data is stored correctly
+    let milestone_data = client.get_milestone_data(&vault_id).unwrap();
+    assert_eq!(milestone_data.milestones.len(), 3);
+    assert_eq!(milestone_data.current_milestone, 0);
+    assert_eq!(milestone_data.triggered_milestones.len(), 0);
+
+    // ATTEMPT TO LEAP-FROG: Try to trigger milestone 2 before milestones 0 and 1
+    // This should FAIL because milestone 1 must be triggered first
+    client.trigger_milestone(&vault_id, &2u32, &admin);
+}
+
+#[test]
+fn test_milestone_sequential_triggering() {
+    let (env, admin, client, token_address, token) = setup();
+    let beneficiary = Address::generate(&env);
+    let now = env.ledger().timestamp();
+
+    // Create a milestone vault with 3 milestones: 25%, 50%, 25%
+    let mut milestones = vec![&env];
+    milestones.push_back(2500u32); // Milestone 0: 25%
+    milestones.push_back(5000u32); // Milestone 1: 50%
+    milestones.push_back(2500u32); // Milestone 2: 25%
+
+    let vault_id = client.create_milestone_vault(
+        &beneficiary,
+        &10000i128,
+        &now,
+        &(now + 10000),
+        &0i128,
+        &true,
+        &true,
+        &0u64,
+        milestones,
+    );
+
+    // Step 1: Trigger milestone 0 (first milestone - should always succeed)
+    client.trigger_milestone(&vault_id, &0u32, &admin);
+    
+    let milestone_data = client.get_milestone_data(&vault_id).unwrap();
+    assert_eq!(milestone_data.current_milestone, 0);
+    assert_eq!(milestone_data.triggered_milestones.len(), 1);
+    assert!(milestone_data.triggered_milestones.contains(&0u32));
+
+    // Step 2: Try to trigger milestone 2 before milestone 1 - should fail
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.trigger_milestone(&vault_id, &2u32, &admin);
+    }));
+    assert!(result.is_err());
+
+    // Step 3: Trigger milestone 1 (sequential - should succeed)
+    client.trigger_milestone(&vault_id, &1u32, &admin);
+    
+    let milestone_data = client.get_milestone_data(&vault_id).unwrap();
+    assert_eq!(milestone_data.current_milestone, 1);
+    assert_eq!(milestone_data.triggered_milestones.len(), 2);
+    assert!(milestone_data.triggered_milestones.contains(&0u32));
+    assert!(milestone_data.triggered_milestones.contains(&1u32));
+
+    // Step 4: Now milestone 2 can be triggered (sequential - should succeed)
+    client.trigger_milestone(&vault_id, &2u32, &admin);
+    
+    let milestone_data = client.get_milestone_data(&vault_id).unwrap();
+    assert_eq!(milestone_data.current_milestone, 2);
+    assert_eq!(milestone_data.triggered_milestones.len(), 3);
+    assert!(milestone_data.triggered_milestones.contains(&0u32));
+    assert!(milestone_data.triggered_milestones.contains(&1u32));
+    assert!(milestone_data.triggered_milestones.contains(&2u32));
+
+    // Step 5: Claim tokens after all milestones triggered
+    let claimed = client.claim_milestone_tokens(&vault_id).unwrap();
+    assert_eq!(claimed, 10000); // Full amount (25% + 50% + 25% = 100%)
+    assert_eq!(token.balance(&beneficiary), 10000);
+}
+
+#[test]
+fn test_milestone_claim_before_trigger() {
+    let (env, _admin, client, _, _) = setup();
+    let beneficiary = Address::generate(&env);
+    let now = env.ledger().timestamp();
+
+    // Create a milestone vault
+    let mut milestones = vec![&env];
+    milestones.push_back(5000u32); // Milestone 0: 50%
+    milestones.push_back(5000u32); // Milestone 1: 50%
+
+    let vault_id = client.create_milestone_vault(
+        &beneficiary,
+        &10000i128,
+        &now,
+        &(now + 10000),
+        &0i128,
+        &true,
+        &true,
+        &0u64,
+        milestones,
+    );
+
+    // Try to claim before any milestone is triggered - should fail
+    let result = client.claim_milestone_tokens(&vault_id);
+    assert!(result.is_err());
+}
+
+// ===== Issue #293: Cliff-Jump Smoothness Check for Linear Ramps =====
+
+/// A linear ramp with no cliff (start_time == now) must always be accepted.
+#[test]
+fn test_cliff_jump_no_cliff_accepted() {
+    let (env, _, client, _, _) = setup();
+    let beneficiary = Address::generate(&env);
+    let now = env.ledger().timestamp();
+
+    // start_time == now → cliff_duration == 0 → no cliff-jump check triggered
+    let vault_id = client.create_vault_full(
+        &beneficiary,
+        &1000i128,
+        &now,
+        &(now + 1000),
+        &0i128,
+        &true,
+        &true,
+        &0u64, // linear
+    );
+    assert_eq!(vault_id, 1);
+}
+
+/// A linear ramp whose cliff is exactly 50 % of the total period must be accepted.
+#[test]
+fn test_cliff_jump_at_boundary_accepted() {
+    let (env, _, client, _, _) = setup();
+    let beneficiary = Address::generate(&env);
+    let now = env.ledger().timestamp();
+
+    // total = 2000, cliff = 1000 → ratio = 50 % = 5000 bps (≤ MAX → OK)
+    let vault_id = client.create_vault_full(
+        &beneficiary,
+        &1000i128,
+        &(now + 1000), // cliff end
+        &(now + 2000), // vesting end
+        &0i128,
+        &true,
+        &true,
+        &0u64, // linear
+    );
+    assert_eq!(vault_id, 1);
+}
+
+/// A linear ramp whose cliff exceeds 50 % of the total period must be rejected.
+#[test]
+#[should_panic(expected = "CliffJumpTooLarge")]
+fn test_cliff_jump_too_large_rejected() {
+    let (env, _, client, _, _) = setup();
+    let beneficiary = Address::generate(&env);
+    let now = env.ledger().timestamp();
+
+    // total = 2000, cliff = 1001 → ratio ≈ 50.05 % > 50 % → must panic
+    client.create_vault_full(
+        &beneficiary,
+        &1000i128,
+        &(now + 1001), // cliff end
+        &(now + 2000), // vesting end
+        &0i128,
+        &true,
+        &true,
+        &0u64, // linear
+    );
+}
+
+/// A stepped schedule (step_duration > 0) is exempt from the cliff-jump check.
+#[test]
+fn test_cliff_jump_check_skipped_for_stepped_schedule() {
+    let (env, _, client, _, _) = setup();
+    let beneficiary = Address::generate(&env);
+    let now = env.ledger().timestamp();
+
+    // cliff > 50 % but step_duration != 0 → check must NOT fire
+    let vault_id = client.create_vault_full(
+        &beneficiary,
+        &1000i128,
+        &(now + 1500), // cliff end (75 % of total)
+        &(now + 2000), // vesting end
+        &0i128,
+        &true,
+        &true,
+        &100u64, // stepped → exempt
+    );
+    assert_eq!(vault_id, 1);
+}

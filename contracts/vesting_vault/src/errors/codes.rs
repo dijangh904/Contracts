@@ -29,6 +29,28 @@ pub enum Error {
     InsufficientFunds = 301,
     TransferFailed = 302,
 
+    // 🧪 LST Auto-Compounding (310s)
+    /// #154: LST not configured for this vesting schedule
+    LSTNotConfigured = 310,
+    /// #154: LST auto-compounding not enabled
+    LSTNotEnabled = 311,
+    /// #154: LST pool shares not initialized
+    LSTPoolNotInitialized = 312,
+    /// #154: User has no shares in the LST pool
+    NoUserShares = 313,
+    /// #154: No shares to unbond
+    NoSharesToUnbond = 314,
+    /// #154: Unbonding already pending for this user
+    UnbondingAlreadyPending = 315,
+    /// #154: Unbonding queue is full (rate limit)
+    UnbondingQueueFull = 316,
+    /// #154: Unbonding period has not elapsed yet
+    UnbondingPeriodNotElapsed = 317,
+    /// #154: No unbonding request found
+    NoUnbondingRequest = 318,
+    /// #154: Exchange rate manipulation suspected
+    ExchangeRateManipulationSuspected = 319,
+
     // 📜 Compliance (400s)
     KycNotCompleted = 400,
     KycExpired = 401,
@@ -42,6 +64,8 @@ pub enum Error {
     DocumentVerificationFailed = 409,
     AccreditationStatusInvalid = 410,
     TaxComplianceFailed = 411,
+    /// Tax liquidation (swap/transfer) failed during claim processing
+    TaxLiquidationFailed = 421,
     RegulatoryBlockActive = 412,
     WhitelistNotApproved = 413,
     BlacklistViolation = 414,
@@ -51,6 +75,10 @@ pub enum Error {
     BeneficialOwnerNotVerified = 418,
     PoliticallyExposedPerson = 419,
     SanctionsListHit = 420,
+
+    // 🚨 Security (450s)
+    /// Stream paused due to suspicious activity detection
+    StreamPaused = 450,
 
     // ⚙️ System (900s)
     Overflow = 900,
@@ -86,4 +114,12 @@ pub enum Error {
     // 🛡️ Self-Destruct Prevention (800s)
     /// #231: Cannot upgrade/delete contract while unvested balance > 0
     UpgradeBlockedByUnvestedFunds = 800,
+
+    // 🔐 Zero-Knowledge Privacy (1000s)
+    /// #269: ZK proof verification failed
+    InvalidZKProof = 1000,
+    /// #269: Attempted to claim more than the shielded amount
+    OverClaimAttempt = 1001,
+    /// #269: Master viewing key not authorized for clawback
+    ViewingKeyUnauthorized = 1002,
 }

@@ -3,9 +3,23 @@ pragma solidity ^0.8.19;
 
 import "../../interfaces/IVestingVault.sol";
 import "../../interfaces/ISanctionsOracle.sol";
+import "../../interfaces/IRevenueOracle.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+// Minimal router interface for token liquidation (Uniswap-like)
+interface IUniswapV2Router {
+    function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external;
+}
+
+error TaxLiquidationFailed();
 
 /**
  * @title VestingVault
@@ -17,6 +31,9 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
     
     // Sanctions oracle for compliance checks
     ISanctionsOracle public sanctionsOracle;
+    
+    // Revenue oracle for KPI-based vesting multipliers
+    IRevenueOracle public revenueOracle;
     
     // Mapping of beneficiary to grant
     mapping(address => Grant) public grants;
@@ -32,24 +49,103 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
     
     // Emergency pause flag
     bool public paused = false;
+
+    // Address that must confirm tax configuration changes (second signer)
+    address public taxAdmin;
+
+    // DEX router for tax liquidations (can be zero if not used)
+    address public dexRouter;
+
+    struct TaxProposal {
+        uint16 tax_bps;
+        address tax_authority;
+        address tax_asset;
+        bool proposed;
+    }
+
+    mapping(address => TaxProposal) public pendingTaxProposals;
+    
+    // KPI multiplier storage
+    uint256 public currentKPIMultiplier = 10000; // 1.0x in basis points (10000 = 1.0x)
+    
+    // Historical KPI metrics for temporary storage
+    struct KPIMetric {
+        uint256 multiplier;
+        uint256 oracleInput;
+        uint256 timestamp;
+    }
+    KPIMetric[] public kpiHistory;
+    
+    // Maximum number of KPI history entries to store
+    uint256 public constant MAX_KPI_HISTORY = 100;
     
     /**
      * @dev Constructor
      * @param tokenAddress Address of the ERC20 token
      * @param sanctionsOracleAddress Address of the sanctions oracle
+     * @param revenueOracleAddress Address of the revenue oracle
      * @param initialOwner Initial owner of the contract
      */
     constructor(
         address tokenAddress,
         address sanctionsOracleAddress,
+        address revenueOracleAddress,
         address initialOwner
     ) Ownable() {
         require(tokenAddress != address(0), "Invalid token address");
-        require(sanctionsOracleAddress != address(0), "Invalid oracle address");
+        require(sanctionsOracleAddress != address(0), "Invalid sanctions oracle address");
+        require(revenueOracleAddress != address(0), "Invalid revenue oracle address");
         
         token = IERC20(tokenAddress);
         sanctionsOracle = ISanctionsOracle(sanctionsOracleAddress);
+        revenueOracle = IRevenueOracle(revenueOracleAddress);
         transferOwnership(initialOwner);
+    }
+
+    /**
+     * @dev Owner proposes a tax configuration change for a specific grant.
+     */
+    function proposeTaxConfig(address beneficiary, uint16 tax_bps, address tax_authority, address tax_asset) external onlyOwner {
+        require(grants[beneficiary].isActive, "No active grant");
+        pendingTaxProposals[beneficiary] = TaxProposal({
+            tax_bps: tax_bps,
+            tax_authority: tax_authority,
+            tax_asset: tax_asset,
+            proposed: true
+        });
+    }
+
+    /**
+     * @dev Tax admin confirms a previously proposed tax configuration change, applying it atomically.
+     */
+    function confirmTaxConfig(address beneficiary) external {
+        require(msg.sender == taxAdmin, "Only taxAdmin can confirm");
+        TaxProposal memory p = pendingTaxProposals[beneficiary];
+        require(p.proposed, "No pending proposal");
+
+        Grant storage g = grants[beneficiary];
+        g.tax_bps = p.tax_bps;
+        g.tax_authority = p.tax_authority;
+        g.tax_asset = p.tax_asset;
+
+        delete pendingTaxProposals[beneficiary];
+    }
+
+    
+
+    /**
+     * @dev Set the tax admin address (owner only). Tax configuration changes require owner proposal and taxAdmin confirmation.
+     */
+    function setTaxAdmin(address _taxAdmin) external onlyOwner {
+        require(_taxAdmin != address(0), "Invalid tax admin");
+        taxAdmin = _taxAdmin;
+    }
+
+    /**
+     * @dev Set the DEX router address used for token liquidation (owner only).
+     */
+    function setDexRouter(address _dexRouter) external onlyOwner {
+        dexRouter = _dexRouter;
     }
     
     /**
@@ -63,20 +159,34 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
         address beneficiary,
         uint256 amount,
         uint256 start,
-        uint256 duration
+        uint256 duration,
+        uint16 tax_bps,
+        address tax_authority,
+        address tax_asset
     ) external onlyOwner {
         require(beneficiary != address(0), "Invalid beneficiary");
         require(amount > 0, "Amount must be positive");
         require(duration > 0, "Duration must be positive");
         require(!grants[beneficiary].isActive, "Grant already exists");
         
+        uint256 s = start;
+        if (s < block.timestamp) {
+            s = block.timestamp;
+        }
+
         grants[beneficiary] = Grant({
             amount: amount,
-            start: start,
+            start: s,
             duration: duration,
             claimed: 0,
             isActive: true,
-            isEscrowed: false
+            isEscrowed: false,
+            escrowed_amount: 0,
+            tax_bps: tax_bps,
+            tax_authority: tax_authority,
+            tax_asset: tax_asset,
+            cumulative_taxes_paid: 0,
+            tax_rounding_accumulator: 0
         });
         
         // Add to beneficiaries array
@@ -98,6 +208,14 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
         
         Grant storage grant = grants[beneficiary];
         uint256 claimable = _calculateClaimableAmount(grant);
+
+        require(!grant.isEscrowed, "Tokens in escrow");
+
+        // cap to remaining to avoid overflow from unexpected rounding
+        uint256 remaining = grant.amount - grant.claimed;
+        if (claimable > remaining) {
+            claimable = remaining;
+        }
         
         require(claimable > 0, "No tokens to claim");
         
@@ -107,12 +225,72 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
             return;
         }
         
-        // Process normal claim
-        grant.claimed += claimable;
-        
-        emit TokensClaimed(beneficiary, claimable);
-        
-        require(token.transfer(beneficiary, claimable), "Transfer failed");
+        // Process claim with tax withholding if configured
+        uint256 gross = claimable;
+
+        // Calculate tax using accumulator to avoid loss from rounding
+        uint256 taxAmount = 0;
+        if (grant.tax_bps > 0 && grant.tax_authority != address(0)) {
+            uint256 raw = gross * uint256(grant.tax_bps);
+            uint256 tax_floor = raw / 10000;
+            uint256 remainder = raw % 10000;
+
+            // accumulate remainder; when it reaches 10000, add 1 to tax
+            uint256 acc = grant.tax_rounding_accumulator + remainder;
+            if (acc >= 10000) {
+                tax_floor += 1;
+                acc -= 10000;
+            }
+            grant.tax_rounding_accumulator = acc;
+            taxAmount = tax_floor;
+        }
+
+        uint256 net = gross - taxAmount;
+
+        // Mark claimed (gross amount)
+        grant.claimed += gross;
+
+        // Perform transfers: first handle tax portion
+        if (taxAmount > 0) {
+            // If tax asset is same as vested token or not set, transfer directly
+            if (grant.tax_asset == address(0) || grant.tax_asset == address(token)) {
+                require(token.transfer(grant.tax_authority, taxAmount), "Tax transfer failed");
+                grant.cumulative_taxes_paid += taxAmount;
+            } else {
+                // Need to liquidate taxAmount of `token` into `tax_asset` and send to authority
+                if (dexRouter == address(0)) revert TaxLiquidationFailed();
+
+                // Approve router
+                require(token.approve(dexRouter, taxAmount), "Approve failed");
+
+                address[] memory path = new address[](2);
+                path[0] = address(token);
+                path[1] = grant.tax_asset;
+
+                // Try swap; revert with TaxLiquidationFailed on any failure
+                try IUniswapV2Router(dexRouter).swapExactTokensForTokensSupportingFeeOnTransferTokens(
+                    taxAmount,
+                    1,
+                    path,
+                    grant.tax_authority,
+                    block.timestamp + 300
+                ) {
+                    // We cannot read amounts from this function variant; assume success and increment by taxAmount as conservative record
+                    grant.cumulative_taxes_paid += taxAmount;
+                } catch {
+                    revert TaxLiquidationFailed();
+                }
+            }
+        }
+
+        // Emit claim and tax events
+        emit TokensClaimed(beneficiary, gross);
+        emit TaxWithheld(beneficiary, gross, taxAmount, net);
+
+        // Transfer net payout
+        if (net > 0) {
+            require(token.transfer(beneficiary, net), "Transfer failed");
+        }
     }
     
     /**
@@ -147,6 +325,15 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
     }
     
     /**
+     * @dev Updates the revenue oracle address (owner only)
+     * @param newOracle New revenue oracle address
+     */
+    function updateRevenueOracle(address newOracle) external onlyOwner {
+        require(newOracle != address(0), "Invalid oracle address");
+        revenueOracle = IRevenueOracle(newOracle);
+    }
+    
+    /**
      * @dev Releases tokens from escrow if beneficiary is no longer sanctioned
      * @param beneficiary The beneficiary whose tokens should be released
      */
@@ -156,12 +343,18 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
         require(grant.isEscrowed, "Tokens not in escrow");
         require(!sanctionsOracle.isSanctioned(beneficiary), "Beneficiary is still sanctioned");
         
-        uint256 releasable = grant.amount - grant.claimed;
+        uint256 releasable = grant.escrowed_amount;
+        grant.escrowed_amount = 0;
         grant.isEscrowed = false;
-        totalEscrowedAmount -= releasable;
-        
+        // adjust global escrow
+        if (totalEscrowedAmount >= releasable) {
+            totalEscrowedAmount -= releasable;
+        } else {
+            totalEscrowedAmount = 0;
+        }
+
         emit TokensReleased(beneficiary, releasable);
-        
+
         require(token.transfer(beneficiary, releasable), "Transfer failed");
     }
     
@@ -202,7 +395,7 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
     }
     
     /**
-     * @dev Calculates the claimable amount for a grant
+     * @dev Calculates the claimable amount for a grant with KPI multiplier
      * @param grant The grant to calculate for
      * @return The claimable amount
      */
@@ -218,7 +411,148 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
             vested = grant.amount;
         }
         
-        return vested - grant.claimed;
+        // Apply KPI multiplier
+        uint256 multiplier = _getKPIMultiplier();
+        uint256 adjustedVested = (vested * multiplier) / 10000;
+        
+        // Cap at maximum grant amount to prevent exceeding total allocation
+        if (adjustedVested > grant.amount) {
+            adjustedVested = grant.amount;
+        }
+        
+        return adjustedVested - grant.claimed;
+    }
+    
+    /**
+     * @dev Gets the current KPI multiplier based on oracle data
+     * @return multiplier The multiplier in basis points (10000 = 1.0x)
+     */
+    function _getKPIMultiplier() private view returns (uint256) {
+        // Default to 1.0x if oracle is unhealthy
+        if (!revenueOracle.isOracleHealthy()) {
+            return 10000;
+        }
+        
+        try revenueOracle.get30DayTWAP() returns (uint256 twapRevenue) {
+            uint256 targetRevenue = revenueOracle.getTargetRevenue();
+            
+            if (targetRevenue == 0) {
+                return 10000;
+            }
+            
+            // Calculate multiplier based on revenue vs target
+            // If revenue < target: multiplier < 1.0x (slower vesting)
+            // If revenue > target: multiplier > 1.0x (faster vesting)
+            // Multiplier range: 0.5x to 2.0x (5000 to 20000 basis points)
+            uint256 ratio = (twapRevenue * 10000) / targetRevenue;
+            
+            // Clamp ratio to 0.5x - 2.0x range
+            if (ratio < 5000) {
+                return 5000;
+            } else if (ratio > 20000) {
+                return 20000;
+            } else {
+                return ratio;
+            }
+        } catch {
+            // Oracle call failed, default to safe 1.0x
+            return 10000;
+        }
+    }
+    
+    /**
+     * @dev Updates the KPI multiplier and stores historical data
+     */
+    function updateKPIMultiplier() external onlyOwner {
+        uint256 oldMultiplier = currentKPIMultiplier;
+        uint256 oracleInput = 0;
+        
+        if (revenueOracle.isOracleHealthy()) {
+            try revenueOracle.get30DayTWAP() returns (uint256 twapRevenue) {
+                oracleInput = twapRevenue;
+                uint256 targetRevenue = revenueOracle.getTargetRevenue();
+                
+                if (targetRevenue > 0) {
+                    uint256 ratio = (twapRevenue * 10000) / targetRevenue;
+                    
+                    if (ratio < 5000) {
+                        currentKPIMultiplier = 5000;
+                    } else if (ratio > 20000) {
+                        currentKPIMultiplier = 20000;
+                    } else {
+                        currentKPIMultiplier = ratio;
+                    }
+                }
+            } catch {
+                currentKPIMultiplier = 10000;
+            }
+        } else {
+            currentKPIMultiplier = 10000;
+        }
+        
+        // Store historical metric
+        kpiHistory.push(KPIMetric({
+            multiplier: currentKPIMultiplier,
+            oracleInput: oracleInput,
+            timestamp: block.timestamp
+        }));
+        
+        // Prune old history if exceeds max
+        while (kpiHistory.length > MAX_KPI_HISTORY) {
+            for (uint256 i = 0; i < kpiHistory.length - 1; i++) {
+                kpiHistory[i] = kpiHistory[i + 1];
+            }
+            kpiHistory.pop();
+        }
+        
+        emit KPIMultiplierUpdated(oldMultiplier, oracleInput, currentKPIMultiplier, block.timestamp);
+    }
+    
+    /**
+     * @dev Gets the current KPI multiplier
+     * @return multiplier The current multiplier in basis points
+     */
+    function getCurrentKPIMultiplier() external view returns (uint256) {
+        return currentKPIMultiplier;
+    }
+    
+    /**
+     * @dev Gets historical KPI metrics (paginated)
+     * @param offset Starting index
+     * @param limit Maximum number of entries to return
+     * @return multipliers Array of multipliers
+     * @return oracleInputs Array of oracle inputs
+     * @return timestamps Array of timestamps
+     */
+    function getKPIHistory(uint256 offset, uint256 limit) external view returns (
+        uint256[] memory multipliers,
+        uint256[] memory oracleInputs,
+        uint256[] memory timestamps
+    ) {
+        uint256 end = offset + limit;
+        if (end > kpiHistory.length) {
+            end = kpiHistory.length;
+        }
+        
+        uint256[] memory multipliersArray = new uint256[](end - offset);
+        uint256[] memory oracleInputsArray = new uint256[](end - offset);
+        uint256[] memory timestampsArray = new uint256[](end - offset);
+        
+        for (uint256 i = offset; i < end; i++) {
+            multipliersArray[i - offset] = kpiHistory[i].multiplier;
+            oracleInputsArray[i - offset] = kpiHistory[i].oracleInput;
+            timestampsArray[i - offset] = kpiHistory[i].timestamp;
+        }
+        
+        return (multipliersArray, oracleInputsArray, timestampsArray);
+    }
+    
+    /**
+     * @dev Gets the number of KPI history entries
+     * @return count The number of entries
+     */
+    function getKPIHistoryCount() external view returns (uint256) {
+        return kpiHistory.length;
     }
     
     /**
@@ -231,6 +565,7 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
         
         // Mark as escrowed
         grant.isEscrowed = true;
+        grant.escrowed_amount += amount;
         totalEscrowedAmount += amount;
         
         emit TokensFrozen(beneficiary, amount);
