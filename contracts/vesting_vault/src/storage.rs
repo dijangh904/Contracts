@@ -1,5 +1,5 @@
 use soroban_sdk::{Env, Vec, Address, Map, BytesN};
-use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, LockupConfig, BeneficiaryReassignment, VetoVote, TokenSupplyInfo, LSTConfig, TvlCapConfig, RateLimitConfig, RelayerConfig};
+use crate::types::{ClaimEvent, AuthorizedPayoutAddress, AddressWhitelistRequest, Nullifier, Commitment, PathPaymentConfig, PathPaymentClaimEvent, LockupConfig, BeneficiaryReassignment, VetoVote, TokenSupplyInfo, LSTConfig, TvlCapConfig, RateLimitConfig, RelayerConfig, LSTPoolShares, UserLSTShares, UnbondingRequest};
 
 pub const CLAIM_HISTORY: &str = "CLAIM_HISTORY";
 pub const AUTHORIZED_PAYOUT_ADDRESS: &str = "AUTHORIZED_PAYOUT_ADDRESS";
@@ -38,6 +38,12 @@ pub const TOKEN_SUPPLY_INFO: &str = "TOKEN_SUPPLY_INFO";
 pub const REASSIGNMENT_COUNTER: &str = "REASSIGNMENT_COUNTER";
 pub const GOVERNANCE_VETO_THRESHOLD: &str = "GOVERNANCE_VETO_THRESHOLD"; // Percentage (e.g., 5 for 5%)
 pub const LST_CONFIGS: &str = "LST_CONFIGS";
+
+// LST Auto-Compounding storage keys (Issue #154)
+pub const LST_POOL_SHARES: &str = "LST_POOL_SHARES";
+pub const USER_LST_SHARES: &str = "USER_LST_SHARES";
+pub const UNBONDING_REQUESTS: &str = "UNBONDING_REQUESTS";
+pub const UNBONDING_QUEUE: &str = "UNBONDING_QUEUE";
 
 // 48 hours in seconds
 const TIMELOCK_DURATION: u64 = 172_800;
@@ -391,4 +397,66 @@ pub fn get_contract_total_unvested(e: &Env) -> i128 {
 
 pub fn set_contract_total_unvested(e: &Env, total: i128) {
     e.storage().instance().set(&CONTRACT_TOTAL_UNVESTED, &total);
+}
+
+// ========== LST Auto-Compounding storage functions (Issue #154) ==========
+
+// Pool shares management
+pub fn get_lst_pool_shares(e: &Env, vesting_id: u32) -> Option<LSTPoolShares> {
+    e.storage().instance().get(&(LST_POOL_SHARES, vesting_id))
+}
+
+pub fn set_lst_pool_shares(e: &Env, vesting_id: u32, pool_shares: &LSTPoolShares) {
+    e.storage().instance().set(&(LST_POOL_SHARES, vesting_id), pool_shares);
+}
+
+// User shares management
+pub fn get_user_lst_shares(e: &Env, user: &Address, vesting_id: u32) -> Option<UserLSTShares> {
+    e.storage().instance().get(&(USER_LST_SHARES, user, vesting_id))
+}
+
+pub fn set_user_lst_shares(e: &Env, user: &Address, vesting_id: u32, user_shares: &UserLSTShares) {
+    e.storage().instance().set(&(USER_LST_SHARES, user, vesting_id), user_shares);
+}
+
+// Unbonding request management
+pub fn get_unbonding_request(e: &Env, user: &Address, vesting_id: u32) -> Option<UnbondingRequest> {
+    e.storage().instance().get(&(UNBONDING_REQUESTS, user, vesting_id))
+}
+
+pub fn set_unbonding_request(e: &Env, user: &Address, vesting_id: u32, request: &UnbondingRequest) {
+    e.storage().instance().set(&(UNBONDING_REQUESTS, user, vesting_id), request);
+}
+
+pub fn remove_unbonding_request(e: &Env, user: &Address, vesting_id: u32) {
+    e.storage().instance().remove(&(UNBONDING_REQUESTS, user, vesting_id));
+}
+
+// Unbonding queue (for rate limiting)
+pub fn get_unbonding_queue(e: &Env) -> Vec<UnbondingRequest> {
+    e.storage()
+        .instance()
+        .get(&UNBONDING_QUEUE)
+        .unwrap_or(Vec::new(e))
+}
+
+pub fn set_unbonding_queue(e: &Env, queue: &Vec<UnbondingRequest>) {
+    e.storage().instance().set(&UNBONDING_QUEUE, queue);
+}
+
+pub fn add_to_unbonding_queue(e: &Env, request: &UnbondingRequest) {
+    let mut queue = get_unbonding_queue(e);
+    queue.push_back(request.clone());
+    set_unbonding_queue(e, &queue);
+}
+
+pub fn remove_from_unbonding_queue(e: &Env, user: &Address, vesting_id: u32) {
+    let mut queue = get_unbonding_queue(e);
+    let mut new_queue = Vec::new(e);
+    for req in queue.iter() {
+        if req.user != *user || req.vesting_id != vesting_id {
+            new_queue.push_back(req.clone());
+        }
+    }
+    set_unbonding_queue(e, &new_queue);
 }
