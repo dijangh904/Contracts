@@ -8,6 +8,19 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
+// Minimal router interface for token liquidation (Uniswap-like)
+interface IUniswapV2Router {
+    function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external;
+}
+
+error TaxLiquidationFailed();
+
 /**
  * @title VestingVault
  * @dev Vesting vault with real-time sanctions screening
@@ -36,6 +49,21 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
     
     // Emergency pause flag
     bool public paused = false;
+
+    // Address that must confirm tax configuration changes (second signer)
+    address public taxAdmin;
+
+    // DEX router for tax liquidations (can be zero if not used)
+    address public dexRouter;
+
+    struct TaxProposal {
+        uint16 tax_bps;
+        address tax_authority;
+        address tax_asset;
+        bool proposed;
+    }
+
+    mapping(address => TaxProposal) public pendingTaxProposals;
     
     // KPI multiplier storage
     uint256 public currentKPIMultiplier = 10000; // 1.0x in basis points (10000 = 1.0x)
@@ -73,6 +101,52 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
         revenueOracle = IRevenueOracle(revenueOracleAddress);
         transferOwnership(initialOwner);
     }
+
+    /**
+     * @dev Owner proposes a tax configuration change for a specific grant.
+     */
+    function proposeTaxConfig(address beneficiary, uint16 tax_bps, address tax_authority, address tax_asset) external onlyOwner {
+        require(grants[beneficiary].isActive, "No active grant");
+        pendingTaxProposals[beneficiary] = TaxProposal({
+            tax_bps: tax_bps,
+            tax_authority: tax_authority,
+            tax_asset: tax_asset,
+            proposed: true
+        });
+    }
+
+    /**
+     * @dev Tax admin confirms a previously proposed tax configuration change, applying it atomically.
+     */
+    function confirmTaxConfig(address beneficiary) external {
+        require(msg.sender == taxAdmin, "Only taxAdmin can confirm");
+        TaxProposal memory p = pendingTaxProposals[beneficiary];
+        require(p.proposed, "No pending proposal");
+
+        Grant storage g = grants[beneficiary];
+        g.tax_bps = p.tax_bps;
+        g.tax_authority = p.tax_authority;
+        g.tax_asset = p.tax_asset;
+
+        delete pendingTaxProposals[beneficiary];
+    }
+
+    
+
+    /**
+     * @dev Set the tax admin address (owner only). Tax configuration changes require owner proposal and taxAdmin confirmation.
+     */
+    function setTaxAdmin(address _taxAdmin) external onlyOwner {
+        require(_taxAdmin != address(0), "Invalid tax admin");
+        taxAdmin = _taxAdmin;
+    }
+
+    /**
+     * @dev Set the DEX router address used for token liquidation (owner only).
+     */
+    function setDexRouter(address _dexRouter) external onlyOwner {
+        dexRouter = _dexRouter;
+    }
     
     /**
      * @dev Creates a new vesting grant
@@ -85,20 +159,34 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
         address beneficiary,
         uint256 amount,
         uint256 start,
-        uint256 duration
+        uint256 duration,
+        uint16 tax_bps,
+        address tax_authority,
+        address tax_asset
     ) external onlyOwner {
         require(beneficiary != address(0), "Invalid beneficiary");
         require(amount > 0, "Amount must be positive");
         require(duration > 0, "Duration must be positive");
         require(!grants[beneficiary].isActive, "Grant already exists");
         
+        uint256 s = start;
+        if (s < block.timestamp) {
+            s = block.timestamp;
+        }
+
         grants[beneficiary] = Grant({
             amount: amount,
-            start: start,
+            start: s,
             duration: duration,
             claimed: 0,
             isActive: true,
-            isEscrowed: false
+            isEscrowed: false,
+            escrowed_amount: 0,
+            tax_bps: tax_bps,
+            tax_authority: tax_authority,
+            tax_asset: tax_asset,
+            cumulative_taxes_paid: 0,
+            tax_rounding_accumulator: 0
         });
         
         // Add to beneficiaries array
@@ -120,6 +208,14 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
         
         Grant storage grant = grants[beneficiary];
         uint256 claimable = _calculateClaimableAmount(grant);
+
+        require(!grant.isEscrowed, "Tokens in escrow");
+
+        // cap to remaining to avoid overflow from unexpected rounding
+        uint256 remaining = grant.amount - grant.claimed;
+        if (claimable > remaining) {
+            claimable = remaining;
+        }
         
         require(claimable > 0, "No tokens to claim");
         
@@ -129,12 +225,72 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
             return;
         }
         
-        // Process normal claim
-        grant.claimed += claimable;
-        
-        emit TokensClaimed(beneficiary, claimable);
-        
-        require(token.transfer(beneficiary, claimable), "Transfer failed");
+        // Process claim with tax withholding if configured
+        uint256 gross = claimable;
+
+        // Calculate tax using accumulator to avoid loss from rounding
+        uint256 taxAmount = 0;
+        if (grant.tax_bps > 0 && grant.tax_authority != address(0)) {
+            uint256 raw = gross * uint256(grant.tax_bps);
+            uint256 tax_floor = raw / 10000;
+            uint256 remainder = raw % 10000;
+
+            // accumulate remainder; when it reaches 10000, add 1 to tax
+            uint256 acc = grant.tax_rounding_accumulator + remainder;
+            if (acc >= 10000) {
+                tax_floor += 1;
+                acc -= 10000;
+            }
+            grant.tax_rounding_accumulator = acc;
+            taxAmount = tax_floor;
+        }
+
+        uint256 net = gross - taxAmount;
+
+        // Mark claimed (gross amount)
+        grant.claimed += gross;
+
+        // Perform transfers: first handle tax portion
+        if (taxAmount > 0) {
+            // If tax asset is same as vested token or not set, transfer directly
+            if (grant.tax_asset == address(0) || grant.tax_asset == address(token)) {
+                require(token.transfer(grant.tax_authority, taxAmount), "Tax transfer failed");
+                grant.cumulative_taxes_paid += taxAmount;
+            } else {
+                // Need to liquidate taxAmount of `token` into `tax_asset` and send to authority
+                if (dexRouter == address(0)) revert TaxLiquidationFailed();
+
+                // Approve router
+                require(token.approve(dexRouter, taxAmount), "Approve failed");
+
+                address[] memory path = new address[](2);
+                path[0] = address(token);
+                path[1] = grant.tax_asset;
+
+                // Try swap; revert with TaxLiquidationFailed on any failure
+                try IUniswapV2Router(dexRouter).swapExactTokensForTokensSupportingFeeOnTransferTokens(
+                    taxAmount,
+                    1,
+                    path,
+                    grant.tax_authority,
+                    block.timestamp + 300
+                ) {
+                    // We cannot read amounts from this function variant; assume success and increment by taxAmount as conservative record
+                    grant.cumulative_taxes_paid += taxAmount;
+                } catch {
+                    revert TaxLiquidationFailed();
+                }
+            }
+        }
+
+        // Emit claim and tax events
+        emit TokensClaimed(beneficiary, gross);
+        emit TaxWithheld(beneficiary, gross, taxAmount, net);
+
+        // Transfer net payout
+        if (net > 0) {
+            require(token.transfer(beneficiary, net), "Transfer failed");
+        }
     }
     
     /**
@@ -187,12 +343,18 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
         require(grant.isEscrowed, "Tokens not in escrow");
         require(!sanctionsOracle.isSanctioned(beneficiary), "Beneficiary is still sanctioned");
         
-        uint256 releasable = grant.amount - grant.claimed;
+        uint256 releasable = grant.escrowed_amount;
+        grant.escrowed_amount = 0;
         grant.isEscrowed = false;
-        totalEscrowedAmount -= releasable;
-        
+        // adjust global escrow
+        if (totalEscrowedAmount >= releasable) {
+            totalEscrowedAmount -= releasable;
+        } else {
+            totalEscrowedAmount = 0;
+        }
+
         emit TokensReleased(beneficiary, releasable);
-        
+
         require(token.transfer(beneficiary, releasable), "Transfer failed");
     }
     
@@ -403,6 +565,7 @@ contract VestingVault is IVestingVault, Ownable, ReentrancyGuard {
         
         // Mark as escrowed
         grant.isEscrowed = true;
+        grant.escrowed_amount += amount;
         totalEscrowedAmount += amount;
         
         emit TokensFrozen(beneficiary, amount);

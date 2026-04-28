@@ -1,12 +1,13 @@
 #![cfg(test)]
 
-use soroban_sdk::{Address, Env};
+use soroban_sdk::{Address, Env, Bytes};
+use soroban_sdk::testutils::Ledger;
 use vesting_vault::VestingVault;
 
 #[test]
 fn test_initialize_token_supply() {
     let env = Env::default();
-    let admin = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
     
     let total_supply = 1_000_000i128;
     
@@ -20,7 +21,7 @@ fn test_initialize_token_supply() {
 #[test]
 fn test_update_token_supply() {
     let env = Env::default();
-    let admin = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
     
     let initial_supply = 1_000_000i128;
     let new_supply = 2_000_000i128;
@@ -35,7 +36,7 @@ fn test_update_token_supply() {
 #[test]
 fn test_set_governance_veto_threshold() {
     let env = Env::default();
-    let admin = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
     
     let threshold = 10u32; // 10%
     
@@ -49,7 +50,7 @@ fn test_set_governance_veto_threshold() {
 #[should_panic(expected = "Threshold cannot exceed 100%")]
 fn test_set_invalid_governance_veto_threshold() {
     let env = Env::default();
-    let admin = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
     
     VestingVault::set_governance_veto_threshold(env.clone(), admin.clone(), 150u32);
 }
@@ -57,9 +58,9 @@ fn test_set_invalid_governance_veto_threshold() {
 #[test]
 fn test_request_beneficiary_reassignment_small_amount() {
     let env = Env::default();
-    let admin = Address::random(&env);
-    let current_beneficiary = Address::random(&env);
-    let new_beneficiary = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
+    let current_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
+    let new_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
     
     let total_supply = 1_000_000i128;
     let reassignment_amount = 40_000i128; // 4% - below 5% threshold
@@ -90,9 +91,9 @@ fn test_request_beneficiary_reassignment_small_amount() {
 #[test]
 fn test_request_beneficiary_reassignment_large_amount() {
     let env = Env::default();
-    let admin = Address::random(&env);
-    let current_beneficiary = Address::random(&env);
-    let new_beneficiary = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
+    let current_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
+    let new_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
     
     let total_supply = 1_000_000i128;
     let reassignment_amount = 60_000i128; // 6% - above 5% threshold
@@ -120,9 +121,9 @@ fn test_request_beneficiary_reassignment_large_amount() {
 #[test]
 fn test_execute_beneficiary_reassignment_small_amount() {
     let env = Env::default();
-    let admin = Address::random(&env);
-    let current_beneficiary = Address::random(&env);
-    let new_beneficiary = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
+    let current_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
+    let new_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
     
     let total_supply = 1_000_000i128;
     let reassignment_amount = 40_000i128; // 4% - below 5% threshold
@@ -150,9 +151,9 @@ fn test_execute_beneficiary_reassignment_small_amount() {
 #[should_panic(expected = "Timelock period has not expired")]
 fn test_execute_beneficiary_reassignment_before_timelock() {
     let env = Env::default();
-    let admin = Address::random(&env);
-    let current_beneficiary = Address::random(&env);
-    let new_beneficiary = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
+    let current_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
+    let new_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
     
     let total_supply = 1_000_000i128;
     let reassignment_amount = 40_000i128; // 4% - below 5% threshold
@@ -160,7 +161,7 @@ fn test_execute_beneficiary_reassignment_before_timelock() {
     VestingVault::initialize_token_supply(env.clone(), admin.clone(), total_supply);
     
     VestingVault::request_beneficiary_reassignment(
-        env.clone,
+        env.clone(),
         current_beneficiary,
         new_beneficiary,
         1u32,
@@ -174,10 +175,10 @@ fn test_execute_beneficiary_reassignment_before_timelock() {
 #[test]
 fn test_cast_veto_vote() {
     let env = Env::default();
-    let admin = Address::random(&env);
-    let current_beneficiary = Address::random(&env);
-    let new_beneficiary = Address::random(&env);
-    let voter = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
+    let current_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
+    let new_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
+    let voter = Address::from_string_bytes(&Bytes::new(&env));
     
     let total_supply = 1_000_000i128;
     let reassignment_amount = 60_000i128; // 6% - above 5% threshold
@@ -186,7 +187,7 @@ fn test_cast_veto_vote() {
     VestingVault::initialize_token_supply(env.clone(), admin.clone(), total_supply);
     
     VestingVault::request_beneficiary_reassignment(
-        env.clone,
+        env.clone(),
         current_beneficiary,
         new_beneficiary,
         1u32,
@@ -194,7 +195,7 @@ fn test_cast_veto_vote() {
     );
     
     VestingVault::cast_veto_vote(
-        env.clone,
+        env.clone(),
         voter.clone(),
         1u32,
         true, // vote for veto
@@ -215,10 +216,10 @@ fn test_cast_veto_vote() {
 #[should_panic(expected = "This reassignment does not require governance veto")]
 fn test_cast_veto_vote_small_reassignment() {
     let env = Env::default();
-    let admin = Address::random(&env);
-    let current_beneficiary = Address::random(&env);
-    let new_beneficiary = Address::random(&env);
-    let voter = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
+    let current_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
+    let new_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
+    let voter = Address::from_string_bytes(&Bytes::new(&env));
     
     let total_supply = 1_000_000i128;
     let reassignment_amount = 40_000i128; // 4% - below 5% threshold
@@ -227,7 +228,7 @@ fn test_cast_veto_vote_small_reassignment() {
     VestingVault::initialize_token_supply(env.clone(), admin.clone(), total_supply);
     
     VestingVault::request_beneficiary_reassignment(
-        env.clone,
+        env.clone(),
         current_beneficiary,
         new_beneficiary,
         1u32,
@@ -236,7 +237,7 @@ fn test_cast_veto_vote_small_reassignment() {
     
     // Try to cast veto vote on small reassignment
     VestingVault::cast_veto_vote(
-        env.clone,
+        env.clone(),
         voter,
         1u32,
         true,
@@ -248,10 +249,10 @@ fn test_cast_veto_vote_small_reassignment() {
 #[should_panic(expected = "Voter has already cast a vote")]
 fn test_cast_duplicate_veto_vote() {
     let env = Env::default();
-    let admin = Address::random(&env);
-    let current_beneficiary = Address::random(&env);
-    let new_beneficiary = Address::random(&env);
-    let voter = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
+    let current_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
+    let new_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
+    let voter = Address::from_string_bytes(&Bytes::new(&env));
     
     let total_supply = 1_000_000i128;
     let reassignment_amount = 60_000i128; // 6% - above 5% threshold
@@ -260,7 +261,7 @@ fn test_cast_duplicate_veto_vote() {
     VestingVault::initialize_token_supply(env.clone(), admin.clone(), total_supply);
     
     VestingVault::request_beneficiary_reassignment(
-        env.clone,
+        env.clone(),
         current_beneficiary,
         new_beneficiary,
         1u32,
@@ -277,7 +278,7 @@ fn test_cast_duplicate_veto_vote() {
     
     // Try to vote again
     VestingVault::cast_veto_vote(
-        env.clone,
+        env.clone(),
         voter,
         1u32,
         false, // vote against veto
@@ -288,11 +289,11 @@ fn test_cast_duplicate_veto_vote() {
 #[test]
 fn test_successful_governance_veto() {
     let env = Env::default();
-    let admin = Address::random(&env);
-    let current_beneficiary = Address::random(&env);
-    let new_beneficiary = Address::random(&env);
-    let voter1 = Address::random(&env);
-    let voter2 = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
+    let current_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
+    let new_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
+    let voter1 = Address::from_string_bytes(&Bytes::new(&env));
+    let voter2 = Address::from_string_bytes(&Bytes::new(&env));
     
     let total_supply = 1_000_000i128;
     let reassignment_amount = 60_000i128; // 6% - above 5% threshold
@@ -300,7 +301,7 @@ fn test_successful_governance_veto() {
     VestingVault::initialize_token_supply(env.clone(), admin.clone(), total_supply);
     
     VestingVault::request_beneficiary_reassignment(
-        env.clone,
+        env.clone(),
         current_beneficiary,
         new_beneficiary,
         1u32,
@@ -319,10 +320,10 @@ fn test_successful_governance_veto() {
 #[test]
 fn test_failed_governance_veto() {
     let env = Env::default();
-    let admin = Address::random(&env);
-    let current_beneficiary = Address::random(&env);
-    let new_beneficiary = Address::random(&env);
-    let voter = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
+    let current_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
+    let new_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
+    let voter = Address::from_string_bytes(&Bytes::new(&env));
     
     let total_supply = 1_000_000i128;
     let reassignment_amount = 60_000i128; // 6% - above 5% threshold
@@ -330,7 +331,7 @@ fn test_failed_governance_veto() {
     VestingVault::initialize_token_supply(env.clone(), admin.clone(), total_supply);
     
     VestingVault::request_beneficiary_reassignment(
-        env.clone,
+        env.clone(),
         current_beneficiary,
         new_beneficiary,
         1u32,
@@ -353,7 +354,7 @@ fn test_failed_governance_veto() {
 #[test]
 fn test_requires_governance_veto_helper() {
     let env = Env::default();
-    let admin = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
     
     let total_supply = 1_000_000i128;
     
@@ -372,10 +373,10 @@ fn test_requires_governance_veto_helper() {
 #[test]
 fn test_get_veto_status() {
     let env = Env::default();
-    let admin = Address::random(&env);
-    let current_beneficiary = Address::random(&env);
-    let new_beneficiary = Address::random(&env);
-    let voter = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
+    let current_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
+    let new_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
+    let voter = Address::from_string_bytes(&Bytes::new(&env));
     
     let total_supply = 1_000_000i128;
     let reassignment_amount = 60_000i128; // 6% - above 5% threshold
@@ -383,7 +384,7 @@ fn test_get_veto_status() {
     VestingVault::initialize_token_supply(env.clone(), admin.clone(), total_supply);
     
     VestingVault::request_beneficiary_reassignment(
-        env.clone,
+        env.clone(),
         current_beneficiary,
         new_beneficiary,
         1u32,
@@ -409,11 +410,11 @@ fn test_get_veto_status() {
 #[test]
 fn test_multiple_reassignments() {
     let env = Env::default();
-    let admin = Address::random(&env);
-    let beneficiary1 = Address::random(&env);
-    let beneficiary2 = Address::random(&env);
-    let new_beneficiary1 = Address::random(&env);
-    let new_beneficiary2 = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
+    let beneficiary1 = Address::from_string_bytes(&Bytes::new(&env));
+    let beneficiary2 = Address::from_string_bytes(&Bytes::new(&env));
+    let new_beneficiary1 = Address::from_string_bytes(&Bytes::new(&env));
+    let new_beneficiary2 = Address::from_string_bytes(&Bytes::new(&env));
     
     let total_supply = 1_000_000i128;
     
@@ -450,10 +451,10 @@ fn test_multiple_reassignments() {
 #[should_panic(expected = "Veto period has expired")]
 fn test_cast_vote_after_deadline() {
     let env = Env::default();
-    let admin = Address::random(&env);
-    let current_beneficiary = Address::random(&env);
-    let new_beneficiary = Address::random(&env);
-    let voter = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
+    let current_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
+    let new_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
+    let voter = Address::from_string_bytes(&Bytes::new(&env));
     
     let total_supply = 1_000_000i128;
     let reassignment_amount = 60_000i128; // 6% - above 5% threshold
@@ -461,7 +462,7 @@ fn test_cast_vote_after_deadline() {
     VestingVault::initialize_token_supply(env.clone(), admin.clone(), total_supply);
     
     VestingVault::request_beneficiary_reassignment(
-        env.clone,
+        env.clone(),
         current_beneficiary,
         new_beneficiary,
         1u32,
@@ -472,18 +473,18 @@ fn test_cast_vote_after_deadline() {
     env.ledger().set_timestamp(env.ledger().timestamp() + 604_801);
     
     // Try to vote after deadline
-    VestingVault::cast_veto_vote(env.clone, voter, 1u32, true, 30_000i128);
+    VestingVault::cast_veto_vote(env.clone(), voter, 1u32, true, 30_000i128);
 }
 
 #[test]
 #[should_panic(expected = "Reassignment vetoed by governance")]
 fn test_execute_vetoed_reassignment() {
     let env = Env::default();
-    let admin = Address::random(&env);
-    let current_beneficiary = Address::random(&env);
-    let new_beneficiary = Address::random(&env);
-    let voter1 = Address::random(&env);
-    let voter2 = Address::random(&env);
+    let admin = Address::from_string_bytes(&Bytes::new(&env));
+    let current_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
+    let new_beneficiary = Address::from_string_bytes(&Bytes::new(&env));
+    let voter1 = Address::from_string_bytes(&Bytes::new(&env));
+    let voter2 = Address::from_string_bytes(&Bytes::new(&env));
     
     let total_supply = 1_000_000i128;
     let reassignment_amount = 60_000i128; // 6% - above 5% threshold
@@ -491,7 +492,7 @@ fn test_execute_vetoed_reassignment() {
     VestingVault::initialize_token_supply(env.clone(), admin.clone(), total_supply);
     
     VestingVault::request_beneficiary_reassignment(
-        env.clone,
+        env.clone(),
         current_beneficiary,
         new_beneficiary,
         1u32,
